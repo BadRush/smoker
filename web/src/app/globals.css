@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-canvas: #09090b;
+  --bg-surface: #111114;
+  --bg-elevated: #18181b;
+  --border-subtle: #27272a;
+  --fg-primary: #f4f4f5;
+  --fg-muted: #a1a1aa;
+  --accent-emerald: #10b981;
+  --accent-cyan: #06b6d4;
+  --accent-amber: #f59e0b;
+  --accent-rose: #f43f5e;
+}
+
+html,
+body {
+  background-color: var(--bg-canvas);
+  color: var(--fg-primary);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* uPlot dark NOC overrides */
+.uplot {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace !important;
+  color: #a1a1aa;
+}
+
+.u-legend {
+  display: none !important;
+}
+
+/* Custom subtle scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #09090b;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}

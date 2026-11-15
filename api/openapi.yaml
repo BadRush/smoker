@@ -1,0 +1,940 @@
+openapi: 3.1.0
+info:
+  title: Smoker Central API
+  version: 1.0.0
+  description: Distributed real-time latency, packet loss, and MTR observability API.
+servers:
+  - url: /
+paths:
+  /api/auth/login:
+    post:
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionInfo'
+  /api/auth/logout:
+    post:
+      operationId: logout
+      responses:
+        '204':
+          description: Logged out
+  /api/auth/me:
+    get:
+      operationId: getSession
+      responses:
+        '200':
+          description: Current session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionInfo'
+  /api/auth/password:
+    put:
+      operationId: updatePassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePasswordRequest'
+      responses:
+        '204':
+          description: Updated
+  /api/matrix:
+    get:
+      operationId: getMatrix
+      responses:
+        '200':
+          description: NOC Matrix state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatrixSnapshot'
+  /api/tv/matrix:
+    get:
+      operationId: getTvMatrix
+      summary: Read-only NOC TV wallboard matrix snapshot (enabled targets only)
+      responses:
+        '200':
+          description: Wallboard matrix snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatrixSnapshot'
+  /api/tv/series:
+    get:
+      operationId: getTvSeries
+      summary: Read-only NOC TV batch quantile time-series across enabled targets
+      parameters:
+        - name: range
+          in: query
+          schema:
+            type: string
+            enum: [15m, 1h, 3h, 6h, 12h, 24h, 7d]
+        - name: ids
+          in: query
+          description: Comma-separated enabled target UUIDs (max 24)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Batch quantile series keyed by target UUID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchSeriesResponse'
+  /api/probes:
+    get:
+      operationId: listProbes
+      responses:
+        '200':
+          description: Probe list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Probe'
+    post:
+      operationId: createProbe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProbeRequest'
+      responses:
+        '201':
+          description: Created probe with one-time token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateProbeResponse'
+  /api/probes/{id}:
+    put:
+      operationId: updateProbe
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProbeRequest'
+      responses:
+        '200':
+          description: Updated probe
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Probe'
+    delete:
+      operationId: deleteProbe
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Deleted
+  /api/probes/{id}/rotate-token:
+    post:
+      operationId: rotateProbeToken
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Rotated token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateProbeResponse'
+  /api/groups:
+    get:
+      operationId: listGroups
+      responses:
+        '200':
+          description: Target groups
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TargetGroup'
+    post:
+      operationId: createGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupInput'
+      responses:
+        '201':
+          description: Created group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TargetGroup'
+  /api/groups/{id}:
+    put:
+      operationId: updateGroup
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupInput'
+      responses:
+        '200':
+          description: Updated group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TargetGroup'
+    delete:
+      operationId: deleteGroup
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Deleted
+  /api/targets:
+    get:
+      operationId: listTargets
+      responses:
+        '200':
+          description: Targets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Target'
+    post:
+      operationId: createTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TargetInput'
+      responses:
+        '201':
+          description: Created target
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Target'
+  /api/targets/presets:
+    post:
+      operationId: seedPublicPresets
+      responses:
+        '200':
+          description: Seeded public DNS & application monitors idempotently
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeedResult'
+  /api/targets/{id}:
+    get:
+      operationId: getTarget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Target detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Target'
+    put:
+      operationId: updateTarget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TargetInput'
+      responses:
+        '200':
+          description: Updated target
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Target'
+    delete:
+      operationId: deleteTarget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Deleted
+  /api/targets/{id}/series:
+    get:
+      operationId: getTargetSeries
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: range
+          in: query
+          schema:
+            type: string
+            enum: [5m, 15m, 1h, 3h, 6h, 12h, 24h, 7d, 30d, 1y]
+      responses:
+        '200':
+          description: Multi-probe quantile series
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TargetSeriesResponse'
+  /api/targets/{id}/mtr:
+    get:
+      operationId: listTargetMTR
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: MTR snapshots
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MTRSnapshot'
+  /api/targets/{id}/mtr/run:
+    post:
+      operationId: triggerTargetMTR
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                probe_id:
+                  type: string
+                  format: uuid
+      responses:
+        '202':
+          description: MTR triggered
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [request_ids]
+                properties:
+                  request_ids:
+                    type: array
+                    items:
+                      type: string
+  /api/targets/{id}/simulate:
+    post:
+      operationId: simulateTargetAnomaly
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [high_latency, intermittent_loss, down, clear]
+                duration_sec:
+                  type: integer
+                probe_id:
+                  type: string
+                  format: uuid
+      responses:
+        '200':
+          description: Simulated anomaly applied in rolling cache
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [target_id, mode, duration_sec, until]
+                properties:
+                  target_id:
+                    type: string
+                    format: uuid
+                  mode:
+                    type: string
+                  duration_sec:
+                    type: integer
+                  until:
+                    type: string
+                    format: date-time
+  /api/alerts/rules:
+    get:
+      operationId: listAlertRules
+      responses:
+        '200':
+          description: Rules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AlertRule'
+    post:
+      operationId: createAlertRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertRuleInput'
+      responses:
+        '201':
+          description: Created rule
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+  /api/alerts/rules/{id}:
+    put:
+      operationId: updateAlertRule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertRuleInput'
+      responses:
+        '200':
+          description: Updated rule
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+    delete:
+      operationId: deleteAlertRule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Deleted
+  /api/alerts/channels:
+    get:
+      operationId: listAlertChannels
+      responses:
+        '200':
+          description: Channels
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AlertChannel'
+    post:
+      operationId: createAlertChannel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertChannelInput'
+      responses:
+        '201':
+          description: Created channel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertChannel'
+  /api/alerts/channels/{id}:
+    delete:
+      operationId: deleteAlertChannel
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Deleted
+  /api/alerts/channels/{id}/test:
+    post:
+      operationId: testAlertChannel
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Test sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, message]
+                properties:
+                  ok:
+                    type: boolean
+                  message:
+                    type: string
+  /api/alerts/incidents:
+    get:
+      operationId: listIncidents
+      responses:
+        '200':
+          description: Incidents
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Incident'
+  /api/settings:
+    get:
+      operationId: getSettings
+      responses:
+        '200':
+          description: System settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemSettings'
+    put:
+      operationId: updateSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SystemSettingsInput'
+      responses:
+        '200':
+          description: Updated settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemSettings'
+
+components:
+  schemas:
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string }
+    UpdatePasswordRequest:
+      type: object
+      required: [current_password, new_password]
+      properties:
+        current_password: { type: string }
+        new_password: { type: string }
+    SessionInfo:
+      type: object
+      required: [username]
+      properties:
+        username: { type: string }
+    Probe:
+      type: object
+      required: [id, name, location_label, isp_asn, is_local, status, pending_backlog_count, clock_offset_ms, agent_version, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        location_label: { type: string }
+        isp_asn: { type: string }
+        is_local: { type: boolean }
+        status: { type: string, enum: [online, buffering, syncing, offline] }
+        pending_backlog_count: { type: integer }
+        clock_offset_ms: { type: number }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        agent_version: { type: string }
+        created_at: { type: string, format: date-time }
+    CreateProbeRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        location_label: { type: string }
+        isp_asn: { type: string }
+    UpdateProbeRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        location_label: { type: string }
+        isp_asn: { type: string }
+    CreateProbeResponse:
+      type: object
+      required: [probe, token]
+      properties:
+        probe:
+          $ref: '#/components/schemas/Probe'
+        token: { type: string }
+    TargetGroup:
+      type: object
+      required: [id, name, description, sort_order, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        parent_id: { type: string, format: uuid, nullable: true }
+        description: { type: string }
+        sort_order: { type: integer }
+        created_at: { type: string, format: date-time }
+    GroupInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        parent_id: { type: string, format: uuid, nullable: true }
+        description: { type: string }
+        sort_order: { type: integer }
+    Target:
+      type: object
+      required: [id, name, host, probe_type, port_or_path, interval_sec, timeout_ms, enabled, auto_mtr_on_loss, mtr_loss_threshold, pinned_on_tv, latency_warn_ms, probe_latency_overrides, assign_all_probes, probe_ids, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid, nullable: true }
+        name: { type: string }
+        host: { type: string }
+        probe_type: { type: string, enum: [icmp, tcp, http, dns] }
+        port_or_path: { type: string }
+        interval_sec: { type: integer }
+        timeout_ms: { type: integer }
+        enabled: { type: boolean }
+        auto_mtr_on_loss: { type: boolean }
+        mtr_loss_threshold: { type: integer }
+        pinned_on_tv: { type: boolean }
+        latency_warn_ms: { type: integer }
+        probe_latency_overrides:
+          type: object
+          additionalProperties: { type: integer }
+        assign_all_probes: { type: boolean }
+        probe_ids:
+          type: array
+          items: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    TargetInput:
+      type: object
+      required: [name, host, probe_type]
+      properties:
+        group_id: { type: string, format: uuid, nullable: true }
+        name: { type: string }
+        host: { type: string }
+        probe_type: { type: string, enum: [icmp, tcp, http, dns] }
+        port_or_path: { type: string }
+        interval_sec: { type: integer }
+        timeout_ms: { type: integer }
+        enabled: { type: boolean }
+        auto_mtr_on_loss: { type: boolean }
+        mtr_loss_threshold: { type: integer }
+        pinned_on_tv: { type: boolean }
+        latency_warn_ms: { type: integer }
+        probe_latency_overrides:
+          type: object
+          additionalProperties: { type: integer }
+        assign_all_probes: { type: boolean }
+        probe_ids:
+          type: array
+          items: { type: string, format: uuid }
+    SparkPoint:
+      type: object
+      required: [ts, min, p50, p95, loss]
+      properties:
+        ts: { type: integer }
+        min: { type: number, nullable: true }
+        p50: { type: number, nullable: true }
+        p95: { type: number, nullable: true }
+        loss: { type: number }
+    MatrixCell:
+      type: object
+      required: [target_id, probe_id, p50_ms, p95_ms, jitter_ms, loss_pct, sample_count, status, sparkline]
+      properties:
+        target_id: { type: string, format: uuid }
+        probe_id: { type: string, format: uuid }
+        p50_ms: { type: number, nullable: true }
+        p95_ms: { type: number, nullable: true }
+        baseline_ms: { type: number, nullable: true }
+        warn_ms: { type: number, nullable: true }
+        jitter_ms: { type: number }
+        loss_pct: { type: number }
+        sample_count: { type: integer }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        status: { type: string, enum: [healthy, degraded, loss, down, unknown] }
+        sparkline:
+          type: array
+          items: { $ref: '#/components/schemas/SparkPoint' }
+    MatrixSnapshot:
+      type: object
+      required: [probes, groups, targets, cells, active_incidents, generated_at]
+      properties:
+        probes:
+          type: array
+          items: { $ref: '#/components/schemas/Probe' }
+        groups:
+          type: array
+          items: { $ref: '#/components/schemas/TargetGroup' }
+        targets:
+          type: array
+          items: { $ref: '#/components/schemas/Target' }
+        cells:
+          type: array
+          items: { $ref: '#/components/schemas/MatrixCell' }
+        active_incidents: { type: integer }
+        generated_at: { type: string, format: date-time }
+    ProbeSeries:
+      type: object
+      required: [probe_id, probe_name, location_label, timestamps, min_ms, p25_ms, p50_ms, p75_ms, p95_ms, max_ms, jitter_ms, loss_pct]
+      properties:
+        probe_id: { type: string, format: uuid }
+        probe_name: { type: string }
+        location_label: { type: string }
+        baseline_ms: { type: number, nullable: true }
+        warn_ms: { type: number, nullable: true }
+        timestamps:
+          type: array
+          items: { type: number }
+        min_ms:
+          type: array
+          items: { type: number, nullable: true }
+        p25_ms:
+          type: array
+          items: { type: number, nullable: true }
+        p50_ms:
+          type: array
+          items: { type: number, nullable: true }
+        p75_ms:
+          type: array
+          items: { type: number, nullable: true }
+        p95_ms:
+          type: array
+          items: { type: number, nullable: true }
+        max_ms:
+          type: array
+          items: { type: number, nullable: true }
+        jitter_ms:
+          type: array
+          items: { type: number, nullable: true }
+        loss_pct:
+          type: array
+          items: { type: number }
+    TargetSeriesResponse:
+      type: object
+      required: [target, range, bucket_sec, series]
+      properties:
+        target: { $ref: '#/components/schemas/Target' }
+        range: { type: string }
+        bucket_sec: { type: integer }
+        series:
+          type: array
+          items: { $ref: '#/components/schemas/ProbeSeries' }
+    BatchSeriesResponse:
+      type: object
+      required: [range, bucket_sec, targets]
+      properties:
+        range: { type: string }
+        bucket_sec: { type: integer }
+        targets:
+          type: object
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/ProbeSeries' }
+    MTRHop:
+      type: object
+      required: [hop, ip, sent, recv, loss_pct, best_us, avg_us, worst_us, stdev_us]
+      properties:
+        hop: { type: integer }
+        ip: { type: string }
+        host: { type: string }
+        sent: { type: integer }
+        recv: { type: integer }
+        loss_pct: { type: number }
+        best_us: { type: integer }
+        avg_us: { type: integer }
+        worst_us: { type: integer }
+        stdev_us: { type: integer }
+    MTRSnapshot:
+      type: object
+      required: [id, probe_id, probe_name, target_id, captured_at, trigger_reason, hops]
+      properties:
+        id: { type: string, format: uuid }
+        probe_id: { type: string, format: uuid }
+        probe_name: { type: string }
+        target_id: { type: string, format: uuid }
+        captured_at: { type: string, format: date-time }
+        trigger_reason: { type: string, enum: [auto_loss, manual] }
+        hops:
+          type: array
+          items: { $ref: '#/components/schemas/MTRHop' }
+    AlertRule:
+      type: object
+      required: [id, name, metric, threshold_value, duration_sec, quorum_min_probes, cooldown_sec, enabled, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        target_id: { type: string, format: uuid, nullable: true }
+        group_id: { type: string, format: uuid, nullable: true }
+        metric: { type: string, enum: [latency_p95, loss_pct, jitter, probe_offline, baseline_spike_pct] }
+        threshold_value: { type: number }
+        duration_sec: { type: integer }
+        quorum_min_probes: { type: integer }
+        cooldown_sec: { type: integer }
+        enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+    AlertRuleInput:
+      type: object
+      required: [name, metric, threshold_value, duration_sec, quorum_min_probes, cooldown_sec]
+      properties:
+        name: { type: string }
+        target_id: { type: string, format: uuid, nullable: true }
+        group_id: { type: string, format: uuid, nullable: true }
+        metric: { type: string, enum: [latency_p95, loss_pct, jitter, probe_offline, baseline_spike_pct] }
+        threshold_value: { type: number }
+        duration_sec: { type: integer }
+        quorum_min_probes: { type: integer }
+        cooldown_sec: { type: integer }
+        enabled: { type: boolean }
+    AlertChannel:
+      type: object
+      required: [id, type, name, config_hint, enabled, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [telegram, webhook] }
+        name: { type: string }
+        config_hint: { type: string }
+        enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+    AlertChannelInput:
+      type: object
+      required: [type, name]
+      properties:
+        type: { type: string, enum: [telegram, webhook] }
+        name: { type: string }
+        bot_token: { type: string }
+        chat_id: { type: string }
+        webhook_url: { type: string }
+        enabled: { type: boolean }
+    Incident:
+      type: object
+      required: [id, rule_id, rule_name, status, affected_probes, peak_value, started_at, summary]
+      properties:
+        id: { type: string, format: uuid }
+        rule_id: { type: string, format: uuid }
+        rule_name: { type: string }
+        target_id: { type: string, format: uuid, nullable: true }
+        target_name: { type: string }
+        status: { type: string, enum: [open, resolved] }
+        affected_probes:
+          type: array
+          items: { type: string }
+        peak_value: { type: number }
+        started_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time, nullable: true }
+        summary: { type: string }
+    SystemSettings:
+      type: object
+      required: [raw_retention_days, agg_retention_days, default_quorum_min, updated_at]
+      properties:
+        raw_retention_days: { type: integer }
+        agg_retention_days: { type: integer }
+        default_quorum_min: { type: integer }
+        updated_at: { type: string, format: date-time }
+    SystemSettingsInput:
+      type: object
+      required: [raw_retention_days, agg_retention_days, default_quorum_min]
+      properties:
+        raw_retention_days: { type: integer }
+        agg_retention_days: { type: integer }
+        default_quorum_min: { type: integer }
+    SeedResult:
+      type: object
+      required: [groups_created, targets_created]
+      properties:
+        groups_created: { type: integer }
+        targets_created: { type: integer }

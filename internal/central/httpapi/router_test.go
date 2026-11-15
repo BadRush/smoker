@@ -1,0 +1,501 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"smoker/internal/central/auth"
+	"smoker/internal/central/config"
+	"smoker/internal/central/db"
+	"smoker/internal/central/ingest"
+	"smoker/internal/protocol"
+)
+
+type fakeHub struct {
+	updatedProbes []db.Probe
+}
+
+func (h *fakeHub) HandleProbeWS(http.ResponseWriter, *http.Request) {}
+func (h *fakeHub) HandleLiveWS(http.ResponseWriter, *http.Request)  {}
+func (h *fakeHub) SyncAllProbes(context.Context)                    {}
+func (h *fakeHub) UpdateProbeMeta(probe db.Probe) {
+	h.updatedProbes = append(h.updatedProbes, probe)
+}
+func (h *fakeHub) SendRunMTR(context.Context, db.Target, *uuid.UUID) ([]string, error) {
+	return nil, nil
+}
+func (h *fakeHub) BroadcastUI(string, protocol.LiveEvent) {}
+
+type fakeStore struct {
+	adminHash string
+	targets   []db.Target
+	probes    []db.Probe
+}
+
+func (f *fakeStore) Ping(context.Context) error { return nil }
+func (f *fakeStore) GetAdminByUsername(_ context.Context, u string) (db.AdminUser, error) {
+	if u != "admin" {
+		return db.AdminUser{}, db.ErrNotFound
+	}
+	return db.AdminUser{Username: "admin", PasswordHash: f.adminHash}, nil
+}
+func (f *fakeStore) UpdateAdminPassword(context.Context, string, string) error { return nil }
+func (f *fakeStore) ListProbes(context.Context) ([]db.Probe, error)           { return f.probes, nil }
+func (f *fakeStore) CreateProbe(_ context.Context, name, loc, isp, _ string) (db.Probe, error) {
+	p := db.Probe{
+		ID:            uuid.New(),
+		Name:          name,
+		LocationLabel: loc,
+		ISPAsn:        isp,
+		Status:        "offline",
+		CreatedAt:     time.Now().UTC(),
+	}
+	f.probes = append(f.probes, p)
+	return p, nil
+}
+func (f *fakeStore) UpdateProbe(_ context.Context, id uuid.UUID, name, loc, isp string) (db.Probe, error) {
+	for i, p := range f.probes {
+		if p.ID == id {
+			p.Name = name
+			p.LocationLabel = loc
+			p.ISPAsn = isp
+			f.probes[i] = p
+			return p, nil
+		}
+	}
+	return db.Probe{}, db.ErrNotFound
+}
+func (f *fakeStore) RotateProbeToken(context.Context, uuid.UUID, string) (db.Probe, error) {
+	return db.Probe{}, nil
+}
+func (f *fakeStore) DeleteProbe(context.Context, uuid.UUID) error             { return nil }
+func (f *fakeStore) ListGroups(context.Context) ([]db.TargetGroup, error)     { return []db.TargetGroup{}, nil }
+func (f *fakeStore) CreateGroup(context.Context, string, *uuid.UUID, string, int) (db.TargetGroup, error) {
+	return db.TargetGroup{}, nil
+}
+func (f *fakeStore) UpdateGroup(context.Context, uuid.UUID, string, *uuid.UUID, string, int) (db.TargetGroup, error) {
+	return db.TargetGroup{}, nil
+}
+func (f *fakeStore) DeleteGroup(context.Context, uuid.UUID) error { return nil }
+func (f *fakeStore) ListTargets(context.Context) ([]db.Target, error) {
+	return f.targets, nil
+}
+func (f *fakeStore) GetTarget(_ context.Context, id uuid.UUID) (db.Target, error) {
+	for _, t := range f.targets {
+		if t.ID == id {
+			return t, nil
+		}
+	}
+	return db.Target{}, db.ErrNotFound
+}
+func (f *fakeStore) CreateTarget(_ context.Context, in db.TargetInput) (db.Target, error) {
+	t := db.Target{
+		ID:              uuid.New(),
+		Name:            in.Name,
+		Host:            in.Host,
+		ProbeType:       in.ProbeType,
+		IntervalSec:     in.IntervalSec,
+		TimeoutMs:       in.TimeoutMs,
+		Enabled:         in.Enabled,
+		AssignAllProbes: in.AssignAllProbes,
+		ProbeIDs:        []uuid.UUID{},
+		CreatedAt:       time.Now().UTC(),
+		UpdatedAt:       time.Now().UTC(),
+	}
+	f.targets = append(f.targets, t)
+	return t, nil
+}
+func (f *fakeStore) UpdateTarget(context.Context, uuid.UUID, db.TargetInput) (db.Target, error) {
+	return db.Target{}, nil
+}
+func (f *fakeStore) DeleteTarget(context.Context, uuid.UUID) error { return nil }
+func (f *fakeStore) SeedPublicMonitors(context.Context, bool) (db.SeedResult, error) {
+	return db.SeedResult{GroupsCreated: 2, TargetsCreated: 18}, nil
+}
+func (f *fakeStore) QueryTargetSeries(_ context.Context, id uuid.UUID, rangeKey string) (db.TargetSeriesResponse, error) {
+	for _, tgt := range f.targets {
+		if tgt.ID == id {
+			series := make([]db.ProbeSeries, 0, len(f.probes))
+			for _, p := range f.probes {
+				series = append(series, db.ProbeSeries{
+					ProbeID:       p.ID,
+					ProbeName:     p.Name,
+					LocationLabel: p.LocationLabel,
+				})
+			}
+			return db.TargetSeriesResponse{
+				Target:    tgt,
+				Range:     rangeKey,
+				BucketSec: 1,
+				Series:    series,
+			}, nil
+		}
+	}
+	return db.TargetSeriesResponse{}, nil
+}
+func (f *fakeStore) QueryBatchTargetSeries(_ context.Context, ids []uuid.UUID, rangeKey string) (db.BatchSeriesResponse, error) {
+	if rangeKey == "" {
+		rangeKey = "3h"
+	}
+	want := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	out := make(map[string][]db.ProbeSeries)
+	for _, tgt := range f.targets {
+		if !tgt.Enabled {
+			continue
+		}
+		if len(want) > 0 && !want[tgt.ID] {
+			continue
+		}
+		out[tgt.ID.String()] = []db.ProbeSeries{}
+	}
+	return db.BatchSeriesResponse{
+		Range:     rangeKey,
+		BucketSec: 30,
+		Targets:   out,
+	}, nil
+}
+func (f *fakeStore) ListMTRSnapshots(context.Context, uuid.UUID, int) ([]db.MTRSnapshot, error) {
+	return []db.MTRSnapshot{}, nil
+}
+func (f *fakeStore) ListAlertRules(context.Context) ([]db.AlertRule, error) { return []db.AlertRule{}, nil }
+func (f *fakeStore) CreateAlertRule(context.Context, db.AlertRuleInput) (db.AlertRule, error) {
+	return db.AlertRule{}, nil
+}
+func (f *fakeStore) UpdateAlertRule(context.Context, uuid.UUID, db.AlertRuleInput) (db.AlertRule, error) {
+	return db.AlertRule{}, nil
+}
+func (f *fakeStore) DeleteAlertRule(context.Context, uuid.UUID) error             { return nil }
+func (f *fakeStore) ListAlertChannels(context.Context) ([]db.AlertChannel, error) { return []db.AlertChannel{}, nil }
+func (f *fakeStore) GetAlertChannel(context.Context, uuid.UUID) (db.AlertChannel, error) {
+	return db.AlertChannel{}, db.ErrNotFound
+}
+func (f *fakeStore) CreateAlertChannel(context.Context, string, string, []byte, string, bool) (db.AlertChannel, error) {
+	return db.AlertChannel{}, nil
+}
+func (f *fakeStore) DeleteAlertChannel(context.Context, uuid.UUID) error      { return nil }
+func (f *fakeStore) ListIncidents(context.Context, int) ([]db.Incident, error) { return []db.Incident{}, nil }
+func (f *fakeStore) CountOpenIncidents(context.Context) (int, error)           { return 0, nil }
+func (f *fakeStore) GetSettings(context.Context) (db.SystemSettings, error) {
+	return db.SystemSettings{RawRetentionDays: 14, AggRetentionDays: 730, DefaultQuorumMin: 2}, nil
+}
+func (f *fakeStore) UpdateSettingsAndRetention(context.Context, int, int, int) (db.SystemSettings, error) {
+	return db.SystemSettings{}, nil
+}
+
+func TestRouterAuthAndTargetValidation(t *testing.T) {
+	t.Parallel()
+	hash, err := auth.HashPassword("supersecret123")
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	store := &fakeStore{adminHash: hash}
+	cfg := config.CentralConfig{
+		JWTSecret:        "test-jwt-secret-at-least-32-chars!!",
+		AppEncryptionKey: "test-aes-secret-at-least-32-chars!!",
+		CookieSecure:     "false",
+	}
+	router := NewRouter(Dependencies{
+		Config: cfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		AESKey: auth.DeriveAESKey(cfg.AppEncryptionKey),
+	})
+
+	// 1. Unauthenticated protected route -> 401
+	req := httptest.NewRequest(http.MethodGet, "/api/targets", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/targets unauth = %d, want 401", rec.Code)
+	}
+
+	// 2. Wrong password -> 401
+	badLogin := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"username":"admin","password":"wrong"}`))
+	badRec := httptest.NewRecorder()
+	router.ServeHTTP(badRec, badLogin)
+	if badRec.Code != http.StatusUnauthorized {
+		t.Fatalf("bad login = %d, want 401", badRec.Code)
+	}
+
+	// 3. Valid login -> 200 + HttpOnly cookie
+	goodLogin := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"username":"admin","password":"supersecret123"}`))
+	goodRec := httptest.NewRecorder()
+	router.ServeHTTP(goodRec, goodLogin)
+	if goodRec.Code != http.StatusOK {
+		t.Fatalf("good login = %d, want 200", goodRec.Code)
+	}
+	cookies := goodRec.Result().Cookies()
+	if len(cookies) == 0 || !cookies[0].HttpOnly {
+		t.Fatalf("expected HttpOnly session cookie")
+	}
+
+	// 4. Validation error -> 400 Problem Details
+	invalidTarget := httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{"name":"Bad","host":"1.1.1.1","probe_type":"tcp","port_or_path":"notaport"}`))
+	invalidTarget.AddCookie(cookies[0])
+	invRec := httptest.NewRecorder()
+	router.ServeHTTP(invRec, invalidTarget)
+	if invRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid target = %d, want 400", invRec.Code)
+	}
+
+	// 5. Valid target creation -> 201
+	validTarget := httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{"name":"Cloudflare","host":"1.1.1.1","probe_type":"icmp"}`))
+	validTarget.AddCookie(cookies[0])
+	valRec := httptest.NewRecorder()
+	router.ServeHTTP(valRec, validTarget)
+	if valRec.Code != http.StatusCreated {
+		t.Fatalf("valid target = %d, want 201 (%s)", valRec.Code, valRec.Body.String())
+	}
+	var created db.Target
+	if err := json.Unmarshal(valRec.Body.Bytes(), &created); err != nil || created.Name != "Cloudflare" {
+		t.Fatalf("unexpected target json: %s", valRec.Body.String())
+	}
+
+	// 6. Seed public presets -> 200
+	presetReq := httptest.NewRequest(http.MethodPost, "/api/targets/presets", nil)
+	presetReq.AddCookie(cookies[0])
+	presetRec := httptest.NewRecorder()
+	router.ServeHTTP(presetRec, presetReq)
+	if presetRec.Code != http.StatusOK {
+		t.Fatalf("presets = %d, want 200 (%s)", presetRec.Code, presetRec.Body.String())
+	}
+	var seedRes db.SeedResult
+	if err := json.Unmarshal(presetRec.Body.Bytes(), &seedRes); err != nil || seedRes.TargetsCreated != 18 {
+		t.Fatalf("unexpected seed result: %s", presetRec.Body.String())
+	}
+}
+
+func TestTVMatrixEndpointAuthGuard(t *testing.T) {
+	hash, _ := auth.HashPassword("supersecret123")
+	store := &fakeStore{
+		adminHash: hash,
+		targets: []db.Target{
+			{ID: uuid.New(), Name: "Active Core", Host: "1.1.1.1", ProbeType: "icmp", Enabled: true},
+			{ID: uuid.New(), Name: "Paused Lab", Host: "192.0.2.1", ProbeType: "icmp", Enabled: false},
+		},
+	}
+
+	// Case 1: NocTVAllowUnauth = false rejects unauthenticated request
+	lockedCfg := config.CentralConfig{
+		JWTSecret:        "test-jwt-secret-min-32-characters",
+		AppEncryptionKey: "test-enc-secret-min-32-characters",
+		NocTVAllowUnauth: false,
+	}
+	lockedRouter := NewRouter(Dependencies{
+		Config: lockedCfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		AESKey: auth.DeriveAESKey(lockedCfg.AppEncryptionKey),
+	})
+
+	req1 := httptest.NewRequest(http.MethodGet, "/api/tv/matrix", nil)
+	rec1 := httptest.NewRecorder()
+	lockedRouter.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/tv/matrix when NocTVAllowUnauth=false got %d, want 401", rec1.Code)
+	}
+
+	// Case 2: NocTVAllowUnauth = true serves read-only snapshot with only enabled targets
+	openCfg := lockedCfg
+	openCfg.NocTVAllowUnauth = true
+	openRouter := NewRouter(Dependencies{
+		Config: openCfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		AESKey: auth.DeriveAESKey(openCfg.AppEncryptionKey),
+	})
+
+	req2 := httptest.NewRequest(http.MethodGet, "/api/tv/matrix", nil)
+	rec2 := httptest.NewRecorder()
+	openRouter.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("GET /api/tv/matrix when NocTVAllowUnauth=true got %d, want 200", rec2.Code)
+	}
+	var payload struct {
+		Targets []db.Target `json:"targets"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode tv matrix failed: %v", err)
+	}
+	if len(payload.Targets) != 1 || payload.Targets[0].Name != "Active Core" {
+		t.Fatalf("expected only 1 enabled target 'Active Core', got %+v", payload.Targets)
+	}
+
+	simReq := httptest.NewRequest(http.MethodPost, "/api/targets/"+payload.Targets[0].ID.String()+"/simulate", bytes.NewBufferString(`{"mode":"high_latency","duration_sec":30}`))
+	simRec := httptest.NewRecorder()
+	openRouter.ServeHTTP(simRec, simReq)
+	if simRec.Code != http.StatusOK {
+		t.Fatalf("POST /api/targets/{id}/simulate got %d, want 200", simRec.Code)
+	}
+
+	// Case 3: /api/tv/series follows the same NocTVAllowUnauth guard & enabled-target filter
+	serLockedReq := httptest.NewRequest(http.MethodGet, "/api/tv/series?range=3h", nil)
+	serLockedRec := httptest.NewRecorder()
+	lockedRouter.ServeHTTP(serLockedRec, serLockedReq)
+	if serLockedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/tv/series when NocTVAllowUnauth=false got %d, want 401", serLockedRec.Code)
+	}
+
+	serOpenReq := httptest.NewRequest(http.MethodGet, "/api/tv/series?range=3h&ids="+payload.Targets[0].ID.String()+","+store.targets[1].ID.String(), nil)
+	serOpenRec := httptest.NewRecorder()
+	openRouter.ServeHTTP(serOpenRec, serOpenReq)
+	if serOpenRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/tv/series when NocTVAllowUnauth=true got %d, want 200", serOpenRec.Code)
+	}
+	var batchPayload db.BatchSeriesResponse
+	if err := json.Unmarshal(serOpenRec.Body.Bytes(), &batchPayload); err != nil {
+		t.Fatalf("decode tv batch series failed: %v", err)
+	}
+	if batchPayload.Range != "3h" || len(batchPayload.Targets) != 1 {
+		t.Fatalf("expected range=3h and only 1 enabled target in /api/tv/series, got %+v", batchPayload)
+	}
+}
+
+func TestUpdateProbeEndpointAndHubSync(t *testing.T) {
+	t.Parallel()
+	hash, _ := auth.HashPassword("supersecret123")
+	localID := uuid.New()
+	store := &fakeStore{
+		adminHash: hash,
+		probes: []db.Probe{
+			{
+				ID:            localID,
+				Name:          "Local Central Probe",
+				LocationLabel: "Central Host",
+				ISPAsn:        "LOCAL",
+				IsLocal:       true,
+				Status:        "online",
+			},
+		},
+	}
+	hub := &fakeHub{}
+	cfg := config.CentralConfig{
+		JWTSecret:        "test-jwt-secret-at-least-32-chars!!",
+		AppEncryptionKey: "test-aes-secret-at-least-32-chars!!",
+		CookieSecure:     "false",
+	}
+	router := NewRouter(Dependencies{
+		Config: cfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		Hub:    hub,
+		AESKey: auth.DeriveAESKey(cfg.AppEncryptionKey),
+	})
+
+	// Unauthenticated -> 401
+	unauthReq := httptest.NewRequest(http.MethodPut, "/api/probes/"+localID.String(), bytes.NewBufferString(`{"name":"Renamed"}`))
+	unauthRec := httptest.NewRecorder()
+	router.ServeHTTP(unauthRec, unauthReq)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated PUT /api/probes/{id} = %d, want 401", unauthRec.Code)
+	}
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"username":"admin","password":"supersecret123"}`))
+	loginRec := httptest.NewRecorder()
+	router.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("login failed: %d", loginRec.Code)
+	}
+	sessionCookie := loginRec.Result().Cookies()[0]
+
+	// Short/empty name -> 400
+	badReq := httptest.NewRequest(http.MethodPut, "/api/probes/"+localID.String(), bytes.NewBufferString(`{"name":"A"}`))
+	badReq.AddCookie(sessionCookie)
+	badRec := httptest.NewRecorder()
+	router.ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("short probe name = %d, want 400", badRec.Code)
+	}
+
+	// Non-existent ID -> 404
+	missingReq := httptest.NewRequest(http.MethodPut, "/api/probes/"+uuid.NewString(), bytes.NewBufferString(`{"name":"Remote-SGP"}`))
+	missingReq.AddCookie(sessionCookie)
+	missingRec := httptest.NewRecorder()
+	router.ServeHTTP(missingRec, missingReq)
+	if missingRec.Code != http.StatusNotFound {
+		t.Fatalf("missing probe = %d, want 404", missingRec.Code)
+	}
+
+	// Valid update of local probe -> 200 and updates Hub metadata
+	okReq := httptest.NewRequest(http.MethodPut, "/api/probes/"+localID.String(), bytes.NewBufferString(`{"name":"  DC-Jakarta-01  ","location_label":" Cyber1 Jakarta ","isp_asn":"AS7713"}`))
+	okReq.AddCookie(sessionCookie)
+	okRec := httptest.NewRecorder()
+	router.ServeHTTP(okRec, okReq)
+	if okRec.Code != http.StatusOK {
+		t.Fatalf("PUT /api/probes/{id} = %d (%s), want 200", okRec.Code, okRec.Body.String())
+	}
+	var updated db.Probe
+	if err := json.Unmarshal(okRec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decode updated probe failed: %v", err)
+	}
+	if updated.Name != "DC-Jakarta-01" || updated.LocationLabel != "Cyber1 Jakarta" || updated.ISPAsn != "AS7713" || !updated.IsLocal {
+		t.Fatalf("unexpected updated probe: %+v", updated)
+	}
+	if len(hub.updatedProbes) != 1 || hub.updatedProbes[0].Name != "DC-Jakarta-01" {
+		t.Fatalf("expected Hub.UpdateProbeMeta called with DC-Jakarta-01, got %+v", hub.updatedProbes)
+	}
+}
+
+func TestTargetSeriesEnrichesWarnThreshold(t *testing.T) {
+	pwHash, _ := auth.HashPassword("supersecret123")
+	probeID := uuid.New()
+	targetID := uuid.New()
+	store := &fakeStore{
+		adminHash: pwHash,
+		probes: []db.Probe{
+			{ID: probeID, Name: "Probe-SGP", LocationLabel: "Singapore"},
+		},
+		targets: []db.Target{
+			{
+				ID:              targetID,
+				Name:            "Google DNS",
+				Host:            "8.8.8.8",
+				Enabled:         true,
+				AssignAllProbes: true,
+				LatencyWarnMs:   25,
+				TimeoutMs:       1000,
+			},
+		},
+	}
+	cfg := config.CentralConfig{
+		JWTSecret:        "test-jwt-secret-at-least-32-chars!!",
+		AppEncryptionKey: "test-aes-secret-at-least-32-chars!!",
+		CookieSecure:     "false",
+	}
+	router := NewRouter(Dependencies{
+		Config: cfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		Hub:    &fakeHub{},
+		AESKey: auth.DeriveAESKey(cfg.AppEncryptionKey),
+	})
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"username":"admin","password":"supersecret123"}`))
+	loginRec := httptest.NewRecorder()
+	router.ServeHTTP(loginRec, loginReq)
+	sessionCookie := loginRec.Result().Cookies()[0]
+
+	req := httptest.NewRequest(http.MethodGet, "/api/targets/"+targetID.String()+"/series?range=5m", nil)
+	req.AddCookie(sessionCookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/targets/{id}/series = %d, want 200", rec.Code)
+	}
+	var out db.TargetSeriesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode target series failed: %v", err)
+	}
+	if len(out.Series) != 1 || out.Series[0].WarnMs == nil || *out.Series[0].WarnMs != 25 {
+		t.Fatalf("expected series[0].warn_ms = 25, got %+v", out.Series)
+	}
+}

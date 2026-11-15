@@ -1,0 +1,29 @@
+# Environments & Secrets
+.env
+.env.local
+.env.*.local
+
+# Databases & Probe Local Buffer
+*.db
+*.db-wal
+*.db-shm
+probe-data/
+tsdb-data/
+
+# Go Build Artifacts
+bin/
+coverage.out
+
+# Node / Next.js
+web/node_modules/
+web/.next/
+web/out/
+web/coverage/
+web/.auth/
+web/playwright-report/
+web/test-results/
+
+# OS / Editor
+.DS_Store
+*.swp
+*.tsbuildinfo
