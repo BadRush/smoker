@@ -2,13 +2,14 @@ FROM golang:alpine AS builder
 WORKDIR /src
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN go mod download && rm -rf /go/pkg/mod/cache/download
 
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 
 RUN CGO_ENABLED=0 GOOS=linux \
-    go build -trimpath -ldflags="-s -w" -o /out/probe ./cmd/probe
+    go build -p 2 -trimpath -ldflags="-s -w" -o /out/probe ./cmd/probe \
+    && rm -rf /root/.cache/go-build /tmp/go-build*
 
 FROM alpine:latest AS runtime
 RUN apk add --no-cache ca-certificates tzdata libcap \

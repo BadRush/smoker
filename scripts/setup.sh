@@ -270,11 +270,18 @@ EOF
     log_info "Dry run enabled; skipping 'docker compose up'."
   else
     check_docker
+    export COMPOSE_BAKE=false
+    local -a profile_args=()
     if [[ "$ACCESS_MODE" == "tunnel" ]]; then
-      docker compose --profile tunnel up -d --build
-    else
-      docker compose up -d --build
+      profile_args=(--profile tunnel)
     fi
+    local svc
+    for svc in central probe-local web; do
+      log_info "Building service '${svc}'..."
+      docker compose ${profile_args[@]+"${profile_args[@]}"} build "$svc"
+      docker image prune -f >/dev/null 2>&1 || true
+    done
+    docker compose ${profile_args[@]+"${profile_args[@]}"} up -d --no-build
 
     log_info "Waiting for Central readiness check..."
     local ready="false"

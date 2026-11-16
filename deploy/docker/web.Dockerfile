@@ -1,14 +1,15 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
 COPY web/package.json web/package-lock.json* ./
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi \
+    && npm cache clean --force
 
 FROM node:22-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY web/ ./
 ENV NEXT_TELEMETRY_DISABLED=1
-RUN mkdir -p public && npm run build
+RUN mkdir -p public && npm run build && rm -rf .next/cache /root/.npm
 
 FROM node:22-alpine AS runner
 WORKDIR /app

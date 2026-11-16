@@ -3,6 +3,9 @@
 .env
 .env.*
 !.env.example
+.probe.env
+.probe.env.*
+backups/
 README.md
 Makefile
 *.db

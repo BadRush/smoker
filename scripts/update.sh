@@ -341,18 +341,33 @@ update_central() {
 
   backup_central_db "$ts"
   sync_proxy_and_profile
+  pre_build_cleanup
+
+  local -a build_order=()
+  if [[ ${#target_services[@]} -gt 0 ]]; then
+    build_order=("${target_services[@]}")
+  else
+    build_order=(central probe-local web)
+  fi
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    log_info "[dry-run] Would run: docker compose ${profile_args[*]:-} build ${build_flags[*]:-} ${target_services[*]:-}"
-    log_info "[dry-run] Would run: docker compose ${profile_args[*]:-} up -d ${target_services[*]:-}"
+    log_info "[dry-run] Would build sequentially (COMPOSE_BAKE=false): ${build_order[*]}"
+    log_info "[dry-run] Would run: docker compose ${profile_args[*]:-} up -d --no-build ${target_services[*]:-}"
     return
   fi
 
-  log_info "Building Central Docker images (${target_services[*]:-all services})..."
-  docker compose ${profile_args[@]+"${profile_args[@]}"} build ${build_flags[@]+"${build_flags[@]}"} ${target_services[@]+"${target_services[@]}"}
+  export COMPOSE_BAKE=false
+  local svc
+  for svc in "${build_order[@]}"; do
+    log_info "Building service '${svc}' sequentially..."
+    docker compose ${profile_args[@]+"${profile_args[@]}"} build ${build_flags[@]+"${build_flags[@]}"} "$svc"
+    if [[ "$DO_PRUNE" == "true" ]]; then
+      docker image prune -f >/dev/null 2>&1 || true
+    fi
+  done
 
   log_info "Updating and starting Central containers..."
-  docker compose ${profile_args[@]+"${profile_args[@]}"} up -d ${target_services[@]+"${target_services[@]}"}
+  docker compose ${profile_args[@]+"${profile_args[@]}"} up -d --no-build ${target_services[@]+"${target_services[@]}"}
 
   wait_central_healthy
 }
@@ -368,18 +383,60 @@ update_probe() {
     build_flags=(--no-cache)
   fi
 
+  pre_build_cleanup
+
   if [[ "$DRY_RUN" == "true" ]]; then
     log_info "[dry-run] Would rebuild & restart deploy/docker/probe-agent.compose.yml"
     return
   fi
 
+  export COMPOSE_BAKE=false
   log_info "Building Remote Probe image..."
   docker compose -f "${ROOT_DIR}/deploy/docker/probe-agent.compose.yml" --env-file "${ROOT_DIR}/.probe.env" build ${build_flags[@]+"${build_flags[@]}"}
 
   log_info "Restarting smoker-probe container (preserving SQLite WAL buffer)..."
-  docker compose -f "${ROOT_DIR}/deploy/docker/probe-agent.compose.yml" --env-file "${ROOT_DIR}/.probe.env" up -d
+  docker compose -f "${ROOT_DIR}/deploy/docker/probe-agent.compose.yml" --env-file "${ROOT_DIR}/.probe.env" up -d --no-build
   sleep 3
   docker logs --tail=10 smoker-probe || true
+}
+
+get_free_mb() {
+  local target_dir="/var/lib/docker"
+  if [[ ! -d "$target_dir" ]]; then
+    target_dir="${ROOT_DIR}"
+  fi
+  df -Pm "$target_dir" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0"
+}
+
+pre_build_cleanup() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[dry-run] Would check free disk space and prune stale Docker images/cache before building."
+    return
+  fi
+
+  local free_mb
+  free_mb="$(get_free_mb)"
+  log_info "Available disk before build: ${free_mb} MB"
+
+  if [[ "$DO_PRUNE" == "true" ]]; then
+    log_info "Pruning dangling images & old build cache before building..."
+    docker image prune -f >/dev/null 2>&1 || true
+    docker builder prune -f --filter "until=1h" >/dev/null 2>&1 || true
+    free_mb="$(get_free_mb)"
+    if [[ "$free_mb" =~ ^[0-9]+$ ]] && [[ "$free_mb" -lt 2560 ]]; then
+      log_warn "Free disk tight (${free_mb} MB < 2560 MB); clearing unused BuildKit cache (docker builder prune -af)..."
+      docker builder prune -af >/dev/null 2>&1 || true
+      free_mb="$(get_free_mb)"
+    fi
+    log_info "Available disk after pre-clean: ${free_mb} MB"
+  fi
+
+  if [[ "$free_mb" =~ ^[0-9]+$ ]] && [[ "$free_mb" -lt 1024 ]]; then
+    log_err "Insufficient disk space (${free_mb} MB free; require >= 1024 MB to build containers)."
+    df -h || true
+    docker system df || true
+    exit 1
+  fi
 }
 
 prune_images() {
@@ -388,11 +445,12 @@ prune_images() {
     return
   fi
   if [[ "$DRY_RUN" == "true" ]]; then
-    log_info "[dry-run] Would run: docker image prune -f"
+    log_info "[dry-run] Would run: docker image prune -f && docker builder prune -f --filter until=1h"
     return
   fi
-  log_info "Cleaning up dangling Docker images..."
-  docker image prune -f >/dev/null || true
+  log_info "Cleaning up dangling Docker images and expired build cache..."
+  docker image prune -f >/dev/null 2>&1 || true
+  docker builder prune -f --filter "until=1h" >/dev/null 2>&1 || true
 }
 
 main() {
