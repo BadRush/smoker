@@ -15,6 +15,7 @@ import {
 } from "@/lib/api";
 import {
   appendLiveTick,
+  rangeKeyToSeconds,
   resolveEffectiveWarnMs,
 } from "@/lib/smoke-math";
 import { useLiveSocket, type LiveEventMessage } from "@/lib/useLiveSocket";
@@ -303,6 +304,7 @@ export default function TargetDetailPage() {
                 targetName={data.target.name}
                 targetHost={data.target.host}
                 rangeLabel={rangeKey === "5m" ? "Live 5m" : rangeKey}
+                windowSec={rangeKeyToSeconds(rangeKey)}
                 baselineMs={s.baseline_ms ?? null}
                 warnMs={resolveEffectiveWarnMs({
                   seriesWarnMs: s.warn_ms,

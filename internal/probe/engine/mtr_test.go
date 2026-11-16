@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/binary"
 	"sync"
 	"testing"
@@ -104,5 +105,34 @@ func TestExtractOriginalICMPSeq(t *testing.T) {
 
 	if _, _, ok := ExtractOriginalICMPSeq([]byte{0x45, 0x00}); ok {
 		t.Fatalf("expected truncated packet to return ok=false")
+	}
+}
+
+func TestIPv6ProberFormattingAndResolution(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Bare IPv6 literal in HTTP target URL gets bracketed automatically
+	gotURL := formatHTTPTargetURL("2606:4700:4700::1111", "/cdn-cgi/trace")
+	if gotURL != "https://[2606:4700:4700::1111]/cdn-cgi/trace" {
+		t.Fatalf("formatHTTPTargetURL bare IPv6 = %q, want https://[2606:4700:4700::1111]/cdn-cgi/trace", gotURL)
+	}
+
+	// DNS6 server address resolution handles bare IPv6, bracketed IPv6, and rejects IPv4 literal
+	addr, proto, err := resolveDNSServerAddr(ctx, "2001:4860:4860::8888", true)
+	if err != nil || addr != "[2001:4860:4860::8888]:53" || proto != "udp6" {
+		t.Fatalf("resolveDNSServerAddr v6 = (%q, %q, %v), want ([2001:4860:4860::8888]:53, udp6, nil)", addr, proto, err)
+	}
+	if _, _, err := resolveDNSServerAddr(ctx, "8.8.8.8", true); err == nil {
+		t.Fatalf("expected resolveDNSServerAddr(8.8.8.8, forceV6=true) to fail")
+	}
+
+	// resolveHostIPWithFamily("ip6") accepts bracketed/bare IPv6 and rejects IPv4
+	ip6, err := resolveHostIPWithFamily(ctx, "[2606:4700:4700::1111]", "ip6")
+	if err != nil || ip6.String() != "2606:4700:4700::1111" {
+		t.Fatalf("resolveHostIPWithFamily ip6 = (%v, %v)", ip6, err)
+	}
+	if _, err := resolveHostIPWithFamily(ctx, "1.1.1.1", "ip6"); err == nil {
+		t.Fatalf("expected resolveHostIPWithFamily(1.1.1.1, ip6) to fail")
 	}
 }

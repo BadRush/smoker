@@ -1,6 +1,6 @@
 import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SmokeChartPanel } from "./SmokeChartPanel";
 
@@ -16,11 +16,21 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   };
 }
 
+const setScaleSpy = vi.fn();
+const setDataSpy = vi.fn();
+
 vi.mock("uplot", () => {
   class FakeUPlot {
+    scales = { x: { min: 0, max: 0 }, y: { min: 0, max: 100 } };
     destroy() {}
-    setData() {}
+    setData(...args: unknown[]) {
+      setDataSpy(...args);
+    }
     setSize() {}
+    setScale(key: string, val: { min: number; max: number }) {
+      setScaleSpy(key, val);
+    }
+    redraw() {}
   }
   (FakeUPlot as unknown as { sync: (k: string) => { key: string } }).sync = (
     key: string
@@ -111,5 +121,123 @@ describe("SmokeChartPanel", () => {
         warnMs: 20,
       })
     );
+  });
+
+  it("triggers onZoomClick from both header zoom button and empty telemetry placeholder", async () => {
+    const user = userEvent.setup();
+    const onZoom = vi.fn();
+
+    render(
+      <SmokeChartPanel
+        compact
+        fillHeight
+        syncKey="empty-zoom-sync"
+        targetName="Custom Target"
+        targetHost="192.0.2.10"
+        onZoomClick={onZoom}
+        series={{
+          probe_id: "p1",
+          probe_name: "probe-local",
+          location_label: "Jakarta",
+          timestamps: [],
+          min_ms: [],
+          p25_ms: [],
+          p50_ms: [],
+          p75_ms: [],
+          p95_ms: [],
+          max_ms: [],
+          jitter_ms: [],
+          loss_pct: [],
+        }}
+      />
+    );
+
+    const headerZoomBtn = screen.getByTestId("zoom-chart-btn");
+    const emptyZoomArea = screen.getByTestId("smoke-chart-empty-zoom");
+    expect(headerZoomBtn).toBeInTheDocument();
+    expect(emptyZoomArea).toBeInTheDocument();
+
+    await user.click(headerZoomBtn);
+    await user.click(emptyZoomArea);
+    expect(onZoom).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens zoom on short click but ignores horizontal drag zoom gestures on chart canvas", () => {
+    const onZoom = vi.fn();
+    const { container } = render(
+      <SmokeChartPanel
+        compact
+        syncKey="pointer-zoom-sync"
+        onZoomClick={onZoom}
+        series={{
+          probe_id: "p1",
+          probe_name: "probe-local",
+          location_label: "Jakarta",
+          timestamps: [1700000000, 1700000030],
+          min_ms: [4, 5],
+          p25_ms: [5, 6],
+          p50_ms: [6, 7],
+          p75_ms: [7, 8],
+          p95_ms: [8, 9],
+          max_ms: [9, 10],
+          jitter_ms: [0.5, 0.5],
+          loss_pct: [0, 0],
+        }}
+      />
+    );
+
+    const chartDiv = container.querySelector(".cursor-zoom-in") as HTMLElement;
+    expect(chartDiv).toBeTruthy();
+
+    // Short click (< 8px movement) -> opens zoom modal
+    fireEvent.mouseDown(chartDiv, { button: 0, clientX: 100, clientY: 50 });
+    fireEvent.mouseUp(chartDiv, { button: 0, clientX: 103, clientY: 52 });
+    fireEvent.click(chartDiv);
+    expect(onZoom).toHaveBeenCalledTimes(1);
+
+    // Wide horizontal drag (>= 8px) -> does not trigger zoom modal (reserved for uPlot time zoom)
+    fireEvent.mouseDown(chartDiv, { button: 0, clientX: 100, clientY: 50 });
+    fireEvent.mouseUp(chartDiv, { button: 0, clientX: 140, clientY: 50 });
+    fireEvent.click(chartDiv);
+    expect(onZoom).toHaveBeenCalledTimes(1);
+  });
+
+  it("updates uPlot X scale bounds immediately when rangeLabel changes", async () => {
+    setScaleSpy.mockClear();
+    const nowSec = Math.floor(Date.now() / 1000);
+    const props = {
+      compact: true,
+      syncKey: "range-sync",
+      targetName: "IFORTE CYBER-NAKULA",
+      series: {
+        probe_id: "p1",
+        probe_name: "Local Central Probe",
+        location_label: "Jakarta",
+        timestamps: [nowSec - 240, nowSec - 120, nowSec],
+        min_ms: [19, 19, 20],
+        p25_ms: [20, 20, 20],
+        p50_ms: [20.4, 20.1, 20.4],
+        p75_ms: [21, 21, 21],
+        p95_ms: [22, 22, 22],
+        max_ms: [23, 23, 23],
+        jitter_ms: [0.5, 0.5, 0.5],
+        loss_pct: [0, 0, 0],
+      },
+    };
+
+    const { rerender } = render(<SmokeChartPanel {...props} rangeLabel="3h" />);
+    await vi.waitFor(() => {
+      expect(setScaleSpy).toHaveBeenCalled();
+    });
+    const last3h = setScaleSpy.mock.calls.at(-1)?.[1] as { min: number; max: number };
+    expect(last3h.max - last3h.min).toBe(10800);
+
+    setScaleSpy.mockClear();
+    rerender(<SmokeChartPanel {...props} rangeLabel="15m" />);
+    await vi.waitFor(() => {
+      expect(setScaleSpy).toHaveBeenCalled();
+    });
+    const last15m = setScaleSpy.mock.calls.at(-1)?.[1] as { min: number; max: number };
+    expect(last15m.max - last15m.min).toBe(900);
   });
 });

@@ -28,8 +28,8 @@ func TestStarterCatalogIntegrity(t *testing.T) {
 			t.Fatalf("target %+v missing name or host", spec)
 		}
 		switch spec.ProbeType {
-		case "icmp", "http", "dns":
-		case "tcp":
+		case "icmp", "icmp6", "http", "http6", "dns", "dns6":
+		case "tcp", "tcp6":
 			p, err := strconv.Atoi(spec.PortOrPath)
 			if err != nil || p < 1 || p > 65535 {
 				t.Fatalf("tcp target %q invalid port %q", spec.Name, spec.PortOrPath)

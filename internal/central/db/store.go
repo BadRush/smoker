@@ -137,6 +137,12 @@ func (s *Store) EnsureBootstrap(ctx context.Context, cfg config.CentralConfig) e
 		if _, err := s.SeedPublicMonitors(ctx, true); err != nil {
 			return fmt.Errorf("seed public monitors: %w", err)
 		}
+		var hasIPv6Group bool
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM target_groups WHERE LOWER(name) = 'public ipv6')`).Scan(&hasIPv6Group); err == nil && !hasIPv6Group {
+			if _, err := s.SeedPublicMonitors(ctx, false); err != nil {
+				return fmt.Errorf("seed public ipv6 monitors: %w", err)
+			}
+		}
 	}
 
 	return nil

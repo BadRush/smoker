@@ -1,4 +1,10 @@
-.PHONY: up down logs build test-go test-int test-web codegen verify
+.PHONY: up down logs build setup update test-go test-int test-web codegen verify
+
+setup:
+	bash scripts/setup.sh
+
+update:
+	bash scripts/update.sh
 
 up:
 	docker compose up -d --build

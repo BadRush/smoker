@@ -260,6 +260,23 @@ func TestRouterAuthAndTargetValidation(t *testing.T) {
 		t.Fatalf("unexpected target json: %s", valRec.Body.String())
 	}
 
+	// 5b. Valid IPv6 target creation (icmp6) -> 201, and IPv4 literal with icmp6 -> 400
+	v6Target := httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{"name":"Google DNSv6","host":"2001:4860:4860::8888","probe_type":"icmp6"}`))
+	v6Target.AddCookie(cookies[0])
+	v6Rec := httptest.NewRecorder()
+	router.ServeHTTP(v6Rec, v6Target)
+	if v6Rec.Code != http.StatusCreated {
+		t.Fatalf("valid icmp6 target = %d, want 201 (%s)", v6Rec.Code, v6Rec.Body.String())
+	}
+
+	mismatchV6 := httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{"name":"Mismatch","host":"8.8.8.8","probe_type":"icmp6"}`))
+	mismatchV6.AddCookie(cookies[0])
+	mmRec := httptest.NewRecorder()
+	router.ServeHTTP(mmRec, mismatchV6)
+	if mmRec.Code != http.StatusBadRequest {
+		t.Fatalf("ipv4 literal with icmp6 = %d, want 400", mmRec.Code)
+	}
+
 	// 6. Seed public presets -> 200
 	presetReq := httptest.NewRequest(http.MethodPost, "/api/targets/presets", nil)
 	presetReq.AddCookie(cookies[0])
@@ -357,6 +374,21 @@ func TestTVMatrixEndpointAuthGuard(t *testing.T) {
 	}
 	if batchPayload.Range != "3h" || len(batchPayload.Targets) != 1 {
 		t.Fatalf("expected range=3h and only 1 enabled target in /api/tv/series, got %+v", batchPayload)
+	}
+
+	// Case 4: /api/tv/targets/{id}/mtr follows NocTVAllowUnauth guard
+	mtrLockedReq := httptest.NewRequest(http.MethodGet, "/api/tv/targets/"+payload.Targets[0].ID.String()+"/mtr?limit=5", nil)
+	mtrLockedRec := httptest.NewRecorder()
+	lockedRouter.ServeHTTP(mtrLockedRec, mtrLockedReq)
+	if mtrLockedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/tv/targets/{id}/mtr when NocTVAllowUnauth=false got %d, want 401", mtrLockedRec.Code)
+	}
+
+	mtrOpenReq := httptest.NewRequest(http.MethodGet, "/api/tv/targets/"+payload.Targets[0].ID.String()+"/mtr?limit=5", nil)
+	mtrOpenRec := httptest.NewRecorder()
+	openRouter.ServeHTTP(mtrOpenRec, mtrOpenReq)
+	if mtrOpenRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/tv/targets/{id}/mtr when NocTVAllowUnauth=true got %d, want 200", mtrOpenRec.Code)
 	}
 }
 

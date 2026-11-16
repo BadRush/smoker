@@ -155,6 +155,7 @@ func (s *icmpSocket) ping(ctx context.Context, ip net.IP, timeout time.Duration)
 }
 
 type ICMPProber struct {
+	mu sync.Mutex
 	v4 *icmpSocket
 	v6 *icmpSocket
 }
@@ -164,11 +165,13 @@ func NewICMPProber() (*ICMPProber, error) {
 	if err != nil {
 		return nil, err
 	}
-	v6, _ := openICMPSocket(true) // Best-effort IPv6
+	v6, _ := openICMPSocket(true) // Best-effort IPv6 at init; lazily retried on PingIPv6
 	return &ICMPProber{v4: v4, v6: v6}, nil
 }
 
 func (p *ICMPProber) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.v4 != nil {
 		_ = p.v4.Close()
 	}
@@ -177,27 +180,80 @@ func (p *ICMPProber) Close() {
 	}
 }
 
+func (p *ICMPProber) ensureV6() (*icmpSocket, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.v6 != nil {
+		return p.v6, nil
+	}
+	s, err := openICMPSocket(true)
+	if err != nil {
+		return nil, fmt.Errorf("ipv6 icmp unavailable: %w", err)
+	}
+	p.v6 = s
+	return s, nil
+}
+
 func (p *ICMPProber) Ping(ctx context.Context, host string, timeout time.Duration) (time.Duration, error) {
-	ip, err := resolveHostIP(ctx, host)
+	ip, err := resolveHostIPWithFamily(ctx, host, "ip")
 	if err != nil {
 		return 0, err
 	}
-	if ip.To4() != nil {
-		return p.v4.ping(ctx, ip.To4(), timeout)
+	if ip4 := ip.To4(); ip4 != nil {
+		return p.v4.ping(ctx, ip4, timeout)
 	}
-	if p.v6 == nil {
-		return 0, fmt.Errorf("ipv6 icmp unavailable")
+	v6, err := p.ensureV6()
+	if err != nil {
+		return 0, err
 	}
-	return p.v6.ping(ctx, ip, timeout)
+	return v6.ping(ctx, ip.To16(), timeout)
+}
+
+func (p *ICMPProber) PingIPv6(ctx context.Context, host string, timeout time.Duration) (time.Duration, error) {
+	ip, err := resolveHostIPWithFamily(ctx, host, "ip6")
+	if err != nil {
+		return 0, err
+	}
+	ip6 := ip.To16()
+	if ip6 == nil || ip.To4() != nil {
+		return 0, fmt.Errorf("expected ipv6 address for %s, got %s", host, ip.String())
+	}
+	v6, err := p.ensureV6()
+	if err != nil {
+		return 0, err
+	}
+	return v6.ping(ctx, ip6, timeout)
 }
 
 func resolveHostIP(ctx context.Context, host string) (net.IP, error) {
-	if ip := net.ParseIP(host); ip != nil {
+	return resolveHostIPWithFamily(ctx, host, "ip")
+}
+
+func resolveHostIPWithFamily(ctx context.Context, rawHost string, family string) (net.IP, error) {
+	clean, err := ExtractMTRHost(rawHost)
+	if err != nil {
+		return nil, err
+	}
+	if ip := net.ParseIP(clean); ip != nil {
+		if family == "ip6" && ip.To4() != nil {
+			return nil, fmt.Errorf("expected IPv6 address for %s, got IPv4 %s", rawHost, ip.String())
+		}
+		if family == "ip4" && ip.To4() == nil {
+			return nil, fmt.Errorf("expected IPv4 address for %s, got IPv6 %s", rawHost, ip.String())
+		}
 		return ip, nil
 	}
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	ips, err := net.DefaultResolver.LookupIP(ctx, family, clean)
 	if err != nil || len(ips) == 0 {
-		return nil, fmt.Errorf("resolve %s: %w", host, err)
+		return nil, fmt.Errorf("resolve %s (%s): %w", clean, family, err)
+	}
+	if family == "ip6" {
+		for _, candidate := range ips {
+			if candidate.To4() == nil && candidate.To16() != nil {
+				return candidate.To16(), nil
+			}
+		}
+		return nil, fmt.Errorf("no AAAA record found for %s", clean)
 	}
 	for _, candidate := range ips {
 		if candidate.To4() != nil {

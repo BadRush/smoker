@@ -39,6 +39,8 @@ export default function ProbesPage() {
   const [provisioned, setProvisioned] = useState<CreateProbeResponse | null>(
     null
   );
+  const [uplinkMode, setUplinkMode] = useState<"public" | "routed">("public");
+  const [routedAddr, setRoutedAddr] = useState("");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const loadProbes = useCallback(async () => {
@@ -169,7 +171,13 @@ export default function ProbesPage() {
   }
 
   function wsEndpoint(): string {
-    if (typeof window === "undefined") return "wss://your-smoker-host/ws/probe";
+    if (uplinkMode === "routed") {
+      const fallbackHost =
+        typeof window !== "undefined" ? window.location.host : "10.10.0.5:8080";
+      const clean = routedAddr.trim().replace(/^wss?:\/\//i, "").replace(/\/ws\/probe\/?$/i, "").replace(/\/+$/, "");
+      return `ws://${clean || fallbackHost}/ws/probe`;
+    }
+    if (typeof window === "undefined") return "wss://your-smoker-domain/ws/probe";
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     return `${proto}//${window.location.host}/ws/probe`;
   }
@@ -180,10 +188,16 @@ export default function ProbesPage() {
     setTimeout(() => setCopiedKey(null), 2000);
   }
 
+  const setupCmdSnippet = provisioned
+    ? `git clone https://github.com/BadRush/smoker.git && cd smoker && ./scripts/setup.sh --role probe --central-url "${wsEndpoint()}" --probe-token "${provisioned.token}" --yes`
+    : "";
+
   const composeSnippet = provisioned
     ? `services:
   smoker-probe:
-    image: ghcr.io/your-org/smoker-probe:latest
+    build:
+      context: https://github.com/BadRush/smoker.git
+      dockerfile: deploy/docker/probe.Dockerfile
     container_name: smoker-probe
     restart: unless-stopped
     network_mode: host
@@ -194,12 +208,20 @@ export default function ProbesPage() {
       PROBE_TOKEN: ${provisioned.token}
       DATA_DIR: /data
       MAX_BUFFER_MB: "1024"
+      MAX_BUFFER_HOURS: "168"
     volumes:
-      - ./probe-data:/data`
+      - probe_remote_data:/data
+
+volumes:
+  probe_remote_data:`
     : "";
 
-  const dockerRunSnippet = provisioned
-    ? `docker run -d --name smoker-probe --restart unless-stopped --network host --cap-add NET_RAW -v "$(pwd)/probe-data:/data" -e CENTRAL_URL="${wsEndpoint()}" -e PROBE_TOKEN="${provisioned.token}" ghcr.io/your-org/smoker-probe:latest`
+  const envSnippet = provisioned
+    ? `CENTRAL_URL=${wsEndpoint()}
+PROBE_TOKEN=${provisioned.token}
+PROBE_TLS_INSECURE_SKIP_VERIFY=false
+MAX_BUFFER_MB=1024
+MAX_BUFFER_HOURS=168`
     : "";
 
   return (
@@ -246,9 +268,71 @@ export default function ProbesPage() {
               </button>
             </div>
 
+            {/* Uplink Transport Selector: Public Cloudflared/Nginx WSS vs Direct Routed LAN/VPN WS */}
+            <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-canvas/60 p-2.5">
+              <span className="text-[11px] font-mono uppercase tracking-wide text-zinc-400 mr-1">
+                Uplink Path:
+              </span>
+              <button
+                type="button"
+                aria-pressed={uplinkMode === "public"}
+                onClick={() => setUplinkMode("public")}
+                className={`rounded border px-2.5 py-1 text-xs font-mono ${
+                  uplinkMode === "public"
+                    ? "border-emerald-500 bg-emerald-500 font-semibold text-zinc-950"
+                    : "border-border bg-elevated text-zinc-300"
+                }`}
+              >
+                Cloudflared / Nginx (WSS / Current Host)
+              </button>
+              <button
+                type="button"
+                aria-pressed={uplinkMode === "routed"}
+                onClick={() => setUplinkMode("routed")}
+                className={`rounded border px-2.5 py-1 text-xs font-mono ${
+                  uplinkMode === "routed"
+                    ? "border-emerald-500 bg-emerald-500 font-semibold text-zinc-950"
+                    : "border-border bg-elevated text-zinc-300"
+                }`}
+              >
+                Routed / LAN / VPN IP (Direct WS)
+              </button>
+              {uplinkMode === "routed" && (
+                <input
+                  type="text"
+                  aria-label="Routed Central IP and port"
+                  value={routedAddr}
+                  onChange={(e) => setRoutedAddr(e.target.value)}
+                  placeholder="e.g. 10.10.0.5:8080"
+                  className="ml-auto w-52 rounded border border-border bg-surface px-2.5 py-1 text-xs font-mono text-zinc-100"
+                />
+              )}
+            </div>
+
             <div>
               <div className="mb-1 flex items-center justify-between text-xs font-mono text-zinc-400">
-                <span>docker-compose.yml</span>
+                <span>One-Line Setup Script (Recommended)</span>
+                <button
+                  type="button"
+                  onClick={() => copyText("setup", setupCmdSnippet)}
+                  className="inline-flex items-center gap-1 text-cyan-400 hover:text-cyan-300"
+                >
+                  {copiedKey === "setup" ? (
+                    <Check className="h-3.5 w-3.5" />
+                  ) : (
+                    <Copy className="h-3.5 w-3.5" />
+                  )}
+                  <span>{copiedKey === "setup" ? "Copied" : "Copy"}</span>
+                </button>
+              </div>
+              <pre className="overflow-x-auto rounded border border-border bg-canvas p-3 text-xs font-mono text-zinc-200">
+                {setupCmdSnippet}
+              </pre>
+            </div>
+
+            <div>
+              <div className="mb-1 flex items-center justify-between text-xs font-mono text-zinc-400">
+                <span>docker-compose.yml (Remote Probe)</span>
                 <button
                   type="button"
                   onClick={() => copyText("compose", composeSnippet)}
@@ -269,22 +353,22 @@ export default function ProbesPage() {
 
             <div>
               <div className="mb-1 flex items-center justify-between text-xs font-mono text-zinc-400">
-                <span>docker run</span>
+                <span>.probe.env (for deploy/docker/probe-agent.compose.yml)</span>
                 <button
                   type="button"
-                  onClick={() => copyText("run", dockerRunSnippet)}
+                  onClick={() => copyText("env", envSnippet)}
                   className="inline-flex items-center gap-1 text-cyan-400 hover:text-cyan-300"
                 >
-                  {copiedKey === "run" ? (
+                  {copiedKey === "env" ? (
                     <Check className="h-3.5 w-3.5" />
                   ) : (
                     <Copy className="h-3.5 w-3.5" />
                   )}
-                  <span>{copiedKey === "run" ? "Copied" : "Copy"}</span>
+                  <span>{copiedKey === "env" ? "Copied" : "Copy"}</span>
                 </button>
               </div>
               <pre className="overflow-x-auto rounded border border-border bg-canvas p-3 text-xs font-mono text-zinc-200">
-                {dockerRunSnippet}
+                {envSnippet}
               </pre>
             </div>
           </div>

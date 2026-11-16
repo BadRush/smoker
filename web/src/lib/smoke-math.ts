@@ -1,4 +1,4 @@
-import type { SparkPoint } from "./api";
+import type { MatrixCell, ProbeSeries, SparkPoint } from "./api";
 
 export type CellStatus = "healthy" | "degraded" | "loss" | "down" | "unknown";
 
@@ -187,29 +187,29 @@ export function statusVisuals(status: CellStatus): {
     case "healthy":
       return {
         label: "OK",
-        badgeClass: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
+        badgeClass: "bg-emerald-950/85 text-emerald-300 border-emerald-500/35",
         cellClass: "bg-emerald-500/10 hover:bg-emerald-500/20 border-emerald-500/25",
         dotClass: "bg-emerald-400",
       };
     case "degraded":
       return {
         label: "HIGH RTT",
-        badgeClass: "bg-amber-500/15 text-amber-400 border-amber-500/30",
-        cellClass: "bg-amber-500/15 hover:bg-amber-500/25 border-amber-500/35",
+        badgeClass: "bg-amber-950/85 text-amber-300 border-amber-500/40",
+        cellClass: "bg-amber-500/10 hover:bg-amber-500/20 border-amber-500/35",
         dotClass: "bg-amber-400",
       };
     case "loss":
       return {
         label: "LOSS",
-        badgeClass: "bg-orange-500/20 text-orange-300 border-orange-500/40",
-        cellClass: "bg-orange-500/15 hover:bg-orange-500/25 border-orange-500/35",
+        badgeClass: "bg-orange-950/85 text-orange-200 border-orange-500/40",
+        cellClass: "bg-orange-500/10 hover:bg-orange-500/20 border-orange-500/35",
         dotClass: "bg-orange-400",
       };
     case "down":
       return {
         label: "DOWN",
-        badgeClass: "bg-rose-500/20 text-rose-400 border-rose-500/40",
-        cellClass: "bg-rose-500/20 hover:bg-rose-500/30 border-rose-500/45",
+        badgeClass: "bg-rose-950/85 text-rose-200 border-rose-500/45",
+        cellClass: "bg-rose-500/15 hover:bg-rose-500/25 border-rose-500/45",
         dotClass: "bg-rose-500",
       };
     default:
@@ -332,5 +332,137 @@ export function sparklineToProbeSeries(
     max_ms: maxMs,
     jitter_ms: jitterArr,
     loss_pct: lossPct,
+  };
+}
+
+/**
+ * Maps UI time-window labels (5m..1y, including "Live 5m" or "15m Live") to seconds.
+ */
+export function rangeKeyToSeconds(rangeKey?: string | null): number | null {
+  if (!rangeKey) return null;
+  const clean = rangeKey.trim().toLowerCase();
+  const match = clean.match(/(?:^|\s)(5m|15m|1h|3h|6h|12h|24h|7d|30d|1y)(?:\s|$)/);
+  const token = match ? match[1] : clean;
+  switch (token) {
+    case "5m":
+      return 5 * 60;
+    case "15m":
+      return 15 * 60;
+    case "1h":
+      return 3600;
+    case "3h":
+      return 3 * 3600;
+    case "6h":
+      return 6 * 3600;
+    case "12h":
+      return 12 * 3600;
+    case "24h":
+      return 24 * 3600;
+    case "7d":
+      return 7 * 86400;
+    case "30d":
+      return 30 * 86400;
+    case "1y":
+      return 365 * 86400;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Computes canonical X-axis [minSec, maxSec] bounds aligned to the active time window
+ * so new targets or partially populated histories preserve the selected horizon.
+ */
+export function computeChartXBounds(
+  timestamps: readonly number[],
+  windowSec?: number | null,
+  nowSec = Math.floor(Date.now() / 1000)
+): [number, number] | null {
+  if (timestamps.length === 0 && (!windowSec || windowSec <= 0)) {
+    return null;
+  }
+  const latestTs = timestamps.length > 0 ? timestamps[timestamps.length - 1] : nowSec;
+  const isHistoricalFixture = timestamps.length > 0 && nowSec - latestTs > 600;
+  const maxX = isHistoricalFixture ? latestTs : Math.max(latestTs, nowSec);
+  if (windowSec && windowSec > 0) {
+    return [maxX - windowSec, maxX];
+  }
+  const firstTs = timestamps[0] ?? maxX;
+  return firstTs < maxX ? [firstTs, maxX] : [maxX - 60, maxX];
+}
+
+/**
+ * Merges historical DB quantile series with the ultra-recent rolling cache sparkline
+ * so the trailing live edge advances smoothly on every active time range.
+ */
+export function mergeProbeSeriesWithCell(
+  dbSeries: ProbeSeries | undefined,
+  cell: MatrixCell,
+  probeName: string,
+  range: string
+): ProbeSeriesInput {
+  const wSec = rangeKeyToSeconds(range);
+  const rawSpark = cell.sparkline ?? [];
+  const latestSparkTs =
+    rawSpark.length > 0 ? rawSpark[rawSpark.length - 1].ts : 0;
+  const spark =
+    wSec && latestSparkTs > 0
+      ? rawSpark.filter((pt) => pt.ts >= latestSparkTs - wSec)
+      : rawSpark;
+  const warnMs = cell.warn_ms ?? dbSeries?.warn_ms ?? null;
+  const baselineMs = cell.baseline_ms ?? dbSeries?.baseline_ms ?? null;
+  if (!dbSeries || dbSeries.timestamps.length === 0) {
+    return sparklineToProbeSeries(
+      cell.probe_id,
+      probeName,
+      "",
+      spark,
+      cell.jitter_ms,
+      warnMs,
+      baselineMs
+    );
+  }
+
+  if (spark.length === 0) {
+    return {
+      ...dbSeries,
+      warn_ms: warnMs,
+      baseline_ms: baselineMs,
+    };
+  }
+
+  const lastTs = dbSeries.timestamps[dbSeries.timestamps.length - 1] ?? 0;
+  const trailing: SparkPoint[] = spark.filter((pt) => pt.ts > lastTs);
+  if (trailing.length === 0) {
+    return {
+      ...dbSeries,
+      warn_ms: warnMs,
+      baseline_ms: baselineMs,
+    };
+  }
+
+  const extra = sparklineToProbeSeries(
+    cell.probe_id,
+    probeName,
+    dbSeries.location_label,
+    trailing,
+    cell.jitter_ms,
+    warnMs,
+    baselineMs
+  );
+
+  return {
+    ...dbSeries,
+    warn_ms: warnMs,
+    baseline_ms: baselineMs,
+    timestamps: [...dbSeries.timestamps, ...extra.timestamps],
+    min_ms: [...dbSeries.min_ms, ...extra.min_ms],
+    p25_ms: [...dbSeries.p25_ms, ...extra.p25_ms],
+    p50_ms: [...dbSeries.p50_ms, ...extra.p50_ms],
+    p75_ms: [...dbSeries.p75_ms, ...extra.p75_ms],
+    p95_ms: [...dbSeries.p95_ms, ...extra.p95_ms],
+    max_ms: [...dbSeries.max_ms, ...extra.max_ms],
+    jitter_ms: [...dbSeries.jitter_ms, ...extra.jitter_ms],
+    loss_pct: [...dbSeries.loss_pct, ...extra.loss_pct],
   };
 }

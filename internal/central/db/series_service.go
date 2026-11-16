@@ -111,7 +111,74 @@ func seriesSQLQuery(spec rangeSpec, batch bool) string {
 			FROM buckets
 			ORDER BY target_id ASC, probe_id ASC, ts ASC
 		`, where)
-	case "agg_1m", "agg_5m", "agg_1h":
+	case "agg_1m", "agg_5m":
+		histWhere := fmt.Sprintf(targetFilter, 2) + " AND bucket >= $3"
+		rawWhere := fmt.Sprintf(targetFilter, 2) + " AND time >= $4"
+		return fmt.Sprintf(`
+			WITH hist AS (
+				SELECT
+					target_id,
+					probe_id,
+					bucket AS ts,
+					CASE WHEN min_us IS NOT NULL THEN min_us / 1000.0 END AS min_ms,
+					CASE WHEN pct_agg IS NOT NULL THEN approx_percentile(0.25, pct_agg) / 1000.0 END AS p25_ms,
+					CASE WHEN pct_agg IS NOT NULL THEN approx_percentile(0.50, pct_agg) / 1000.0 END AS p50_ms,
+					CASE WHEN pct_agg IS NOT NULL THEN approx_percentile(0.75, pct_agg) / 1000.0 END AS p75_ms,
+					CASE WHEN pct_agg IS NOT NULL THEN approx_percentile(0.95, pct_agg) / 1000.0 END AS p95_ms,
+					CASE WHEN max_us IS NOT NULL THEN max_us / 1000.0 END AS max_ms,
+					CASE WHEN (sample_count - loss_count) > 0 THEN (sum_jitter_us::DOUBLE PRECISION / (sample_count - loss_count)) / 1000.0 END AS jitter_ms,
+					CASE WHEN sample_count > 0 THEN (loss_count::DOUBLE PRECISION * 100.0) / sample_count ELSE 0 END AS loss_pct
+				FROM %s
+				WHERE %s
+			),
+			raw_buckets AS (
+				SELECT
+					target_id,
+					probe_id,
+					time_bucket($1::interval, time) AS ts,
+					MIN(rtt_us) FILTER (WHERE NOT is_loss AND rtt_us IS NOT NULL) AS min_us,
+					MAX(rtt_us) FILTER (WHERE NOT is_loss AND rtt_us IS NOT NULL) AS max_us,
+					AVG(jitter_us) FILTER (WHERE NOT is_loss) AS avg_jitter_us,
+					COUNT(*) AS sample_count,
+					COUNT(*) FILTER (WHERE is_loss) AS loss_count,
+					percentile_agg(rtt_us::DOUBLE PRECISION) FILTER (WHERE NOT is_loss AND rtt_us IS NOT NULL) AS pct
+				FROM ping_samples
+				WHERE %s
+				GROUP BY target_id, probe_id, ts
+			),
+			tail AS (
+				SELECT
+					r.target_id,
+					r.probe_id,
+					r.ts,
+					CASE WHEN r.min_us IS NOT NULL THEN r.min_us / 1000.0 END AS min_ms,
+					CASE WHEN r.pct IS NOT NULL THEN approx_percentile(0.25, r.pct) / 1000.0 END AS p25_ms,
+					CASE WHEN r.pct IS NOT NULL THEN approx_percentile(0.50, r.pct) / 1000.0 END AS p50_ms,
+					CASE WHEN r.pct IS NOT NULL THEN approx_percentile(0.75, r.pct) / 1000.0 END AS p75_ms,
+					CASE WHEN r.pct IS NOT NULL THEN approx_percentile(0.95, r.pct) / 1000.0 END AS p95_ms,
+					CASE WHEN r.max_us IS NOT NULL THEN r.max_us / 1000.0 END AS max_ms,
+					CASE WHEN r.avg_jitter_us IS NOT NULL THEN r.avg_jitter_us / 1000.0 END AS jitter_ms,
+					CASE WHEN r.sample_count > 0 THEN (r.loss_count::DOUBLE PRECISION * 100.0) / r.sample_count ELSE 0 END AS loss_pct
+				FROM raw_buckets r
+				WHERE NOT EXISTS (
+					SELECT 1 FROM hist h
+					WHERE h.target_id = r.target_id AND h.probe_id = r.probe_id AND h.ts = r.ts
+				)
+			),
+			merged AS (
+				SELECT * FROM hist
+				UNION ALL
+				SELECT * FROM tail
+			)
+			SELECT
+				target_id,
+				probe_id,
+				EXTRACT(EPOCH FROM ts)::BIGINT AS unix_sec,
+				min_ms, p25_ms, p50_ms, p75_ms, p95_ms, max_ms, jitter_ms, loss_pct
+			FROM merged
+			ORDER BY target_id ASC, probe_id ASC, ts ASC
+		`, spec.source, histWhere, rawWhere)
+	case "agg_1h":
 		where := fmt.Sprintf(targetFilter, 1) + " AND bucket >= $2"
 		return fmt.Sprintf(`
 			SELECT
@@ -183,13 +250,21 @@ func (s *Store) QueryTargetSeries(ctx context.Context, targetID uuid.UUID, range
 	}
 
 	ordered, seriesMap := initTargetProbeSeries(target, probes)
-	since := time.Now().UTC().Add(-spec.window)
+	nowUTC := time.Now().UTC()
+	since := nowUTC.Add(-spec.window)
 	query := seriesSQLQuery(spec, false)
 
 	var args []any
-	if spec.source == "raw" || spec.source == "agg_6h" {
+	switch spec.source {
+	case "raw", "agg_6h":
 		args = []any{fmt.Sprintf("%d seconds", spec.bucketSec), targetID, since}
-	} else {
+	case "agg_1m", "agg_5m":
+		tailSince := nowUTC.Add(-6 * time.Hour)
+		if since.After(tailSince) {
+			tailSince = since
+		}
+		args = []any{fmt.Sprintf("%d seconds", spec.bucketSec), targetID, since, tailSince}
+	default:
 		args = []any{targetID, since}
 	}
 
@@ -269,13 +344,21 @@ func (s *Store) QueryBatchTargetSeries(ctx context.Context, targetIDs []uuid.UUI
 		return result, nil
 	}
 
-	since := time.Now().UTC().Add(-spec.window)
+	nowUTC := time.Now().UTC()
+	since := nowUTC.Add(-spec.window)
 	query := seriesSQLQuery(spec, true)
 
 	var args []any
-	if spec.source == "raw" || spec.source == "agg_6h" {
+	switch spec.source {
+	case "raw", "agg_6h":
 		args = []any{fmt.Sprintf("%d seconds", spec.bucketSec), filteredIDs, since}
-	} else {
+	case "agg_1m", "agg_5m":
+		tailSince := nowUTC.Add(-6 * time.Hour)
+		if since.After(tailSince) {
+			tailSince = since
+		}
+		args = []any{fmt.Sprintf("%d seconds", spec.bucketSec), filteredIDs, since, tailSince}
+	default:
 		args = []any{filteredIDs, since}
 	}
 

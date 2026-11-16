@@ -3,9 +3,11 @@ import {
   appendLiveTick,
   appendSparkPoint,
   classifySampleSeverity,
+  computeChartXBounds,
   computeChartYUpper,
   formatLoss,
   formatMs,
+  rangeKeyToSeconds,
   resolveEffectiveWarnMs,
   sparklineToProbeSeries,
   statusVisuals,
@@ -112,5 +114,26 @@ describe("smoke-math helpers", () => {
     expect(computeChartYUpper(20, 25)).toBeCloseTo(27, 2);
     // Fallback 500ms does not flatten a 10ms chart
     expect(computeChartYUpper(10, 500)).toBe(10);
+  });
+
+  it("resolves range tokens to seconds and computes full horizon X-axis bounds", () => {
+    expect(rangeKeyToSeconds("15m")).toBe(900);
+    expect(rangeKeyToSeconds("Live 5m")).toBe(300);
+    expect(rangeKeyToSeconds("15m Live")).toBe(900);
+    expect(rangeKeyToSeconds("3h")).toBe(10800);
+    expect(rangeKeyToSeconds("7d")).toBe(604800);
+    expect(rangeKeyToSeconds("custom")).toBeNull();
+
+    // New target with only 4m of live samples on a 3h window still spans full 3h axis
+    const now = 1_794_800_000;
+    const partialLive = [now - 240, now - 120, now];
+    expect(computeChartXBounds(partialLive, 10800, now)).toEqual([
+      now - 10800,
+      now,
+    ]);
+    expect(computeChartXBounds(partialLive, 900, now)).toEqual([
+      now - 900,
+      now,
+    ]);
   });
 });

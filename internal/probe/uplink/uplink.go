@@ -2,10 +2,12 @@ package uplink
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,11 +61,11 @@ func (c *Client) EnqueueSample(rec protocol.SampleRecord) {
 	}
 }
 
-func (c *Client) TriggerAutoMTR(targetID, host string) error {
+func (c *Client) TriggerAutoMTR(targetID, host, probeType string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
-	hops, err := engine.RunMTR(ctx, host)
+	hops, err := engine.RunMTRWithFamily(ctx, host, strings.HasSuffix(probeType, "6"))
 	if err != nil {
 		slog.Warn("auto mtr failed", "target_id", targetID, "host", host, "err", err)
 		return err
@@ -123,10 +125,20 @@ func (c *Client) connectAndServe(parentCtx context.Context) error {
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+c.cfg.ProbeToken)
 
-	conn, _, err := websocket.Dial(dialCtx, c.cfg.CentralURL, &websocket.DialOptions{
+	dialOpts := &websocket.DialOptions{
 		HTTPHeader: headers,
-	})
+	}
+	if c.cfg.TLSSkipVerify {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- explicit opt-in for private internal TLS
+		dialOpts.HTTPClient = &http.Client{Transport: tr}
+	}
+
+	conn, resp, err := websocket.Dial(dialCtx, c.cfg.CentralURL, dialOpts)
 	if err != nil {
+		if resp != nil {
+			slog.Warn("uplink ws handshake rejected", "status", resp.StatusCode, "url", c.cfg.CentralURL)
+		}
 		return err
 	}
 	conn.SetReadLimit(8 << 20)
@@ -151,23 +163,37 @@ func (c *Client) connectAndServe(parentCtx context.Context) error {
 
 	go func() {
 		hbTicker := time.NewTicker(10 * time.Second)
+		pingTicker := time.NewTicker(20 * time.Second)
 		clkTicker := time.NewTicker(30 * time.Second)
 		defer hbTicker.Stop()
+		defer pingTicker.Stop()
 		defer clkTicker.Stop()
 
 		for {
 			select {
 			case <-subCtx.Done():
 				return
+			case <-pingTicker.C:
+				pCtx, pCancel := context.WithTimeout(subCtx, 8*time.Second)
+				pErr := conn.Ping(pCtx)
+				pCancel()
+				if pErr != nil {
+					slog.Warn("uplink websocket keepalive failed", "err", pErr)
+					cancelSub()
+					return
+				}
 			case <-clkTicker.C:
 				c.sendClockPing(subCtx, conn)
 			case <-hbTicker.C:
 				backlog, _ := c.buf.CountSamples(subCtx)
-				_ = c.writeFrame(subCtx, conn, protocol.MsgHeartbeat, protocol.HeartbeatPayload{
+				if err := c.writeFrame(subCtx, conn, protocol.MsgHeartbeat, protocol.HeartbeatPayload{
 					PendingBacklog: backlog,
 					ClockOffsetMs:  c.clk.OffsetMs(),
 					AgentVersion:   c.cfg.AgentVersion,
-				})
+				}); err != nil {
+					cancelSub()
+					return
+				}
 			}
 		}
 	}()
@@ -181,7 +207,7 @@ func (c *Client) connectAndServe(parentCtx context.Context) error {
 		if err := json.Unmarshal(data, &env); err != nil {
 			continue
 		}
-		c.handleCentralMessage(subCtx, env)
+		c.handleCentralMessage(parentCtx, env)
 	}
 }
 
@@ -229,7 +255,7 @@ func (c *Client) runOnDemandMTR(req protocol.RunMTRPayload) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	hops, err := engine.RunMTR(ctx, req.Host)
+	hops, err := engine.RunMTRWithFamily(ctx, req.Host, strings.HasSuffix(req.ProbeType, "6"))
 	if hops == nil {
 		hops = []protocol.MTRHop{}
 	}

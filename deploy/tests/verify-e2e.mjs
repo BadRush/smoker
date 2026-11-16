@@ -109,6 +109,16 @@ async function main() {
   await page.getByRole("button", { name: "Delete target E2E Loopback Edited (Copy)" }).click();
   await page.getByRole("link", { name: "E2E Loopback Edited (Copy)" }).waitFor({ state: "detached", timeout: 10000 });
 
+  // Create and delete an explicit IPv6 (icmp6) target via UI
+  await page.getByRole("button", { name: /^add target$/i }).click();
+  await page.getByLabel(/target name/i).fill("E2E IPv6 Loopback");
+  await page.getByLabel(/probe protocol/i).selectOption("icmp6");
+  await page.getByLabel(/host \/ ip/i).fill("::1");
+  await page.getByRole("button", { name: /save & sync to probes/i }).click();
+  await page.getByRole("link", { name: "E2E IPv6 Loopback" }).waitFor({ timeout: 10000 });
+  await page.getByRole("button", { name: "Delete target E2E IPv6 Loopback" }).click();
+  await page.getByRole("link", { name: "E2E IPv6 Loopback" }).waitFor({ state: "detached", timeout: 10000 });
+
   // 4. Open target detail and verify uPlot canvas, 3h/12h ranges, friendly terms, PNG export, and MTR
   await page.getByRole("link", { name: "E2E Loopback Edited" }).click();
   await page.waitForURL(/\/targets\/[0-9a-f-]+/, { timeout: 10000 });
@@ -322,6 +332,23 @@ async function main() {
     throw new Error("Landscape /tv overflowed viewport height");
   }
   await assertAccessible(tvPage, "/tv (Landscape 16:9 Regular Grid)");
+
+  // Verify Quick Search & Filter bar on /tv
+  await tvPage.locator('[data-testid="tv-search-toggle-btn"]').click();
+  await tvPage.locator('[data-testid="tv-search-bar"]').waitFor({ timeout: 5000 });
+  await tvPage.locator('[data-testid="tv-search-input"]').fill("Google");
+  await assertAccessible(tvPage, "/tv (Quick Search Bar)");
+  await tvPage.getByRole("button", { name: /^reset$/i }).click();
+  await tvPage.getByRole("button", { name: "Close search bar" }).click();
+
+  // Verify clicking Zoom on a TV card opens the full Target Zoom & MTR Inspector Modal
+  await tvPage.locator('[data-testid="zoom-chart-btn"]').first().click();
+  await tvPage.locator('[data-testid="tv-zoom-modal"]').waitFor({ timeout: 5000 });
+  await tvPage.locator('[data-testid="tv-zoom-range-selector"]').waitFor({ timeout: 5000 });
+  await tvPage.getByRole("heading", { name: /mtr \/ hop-by-hop diagnostics/i }).waitFor({ timeout: 5000 });
+  await assertAccessible(tvPage, "/tv (Target Zoom Modal)");
+  await tvPage.locator('[data-testid="tv-zoom-close-btn"]').click();
+  await tvPage.locator('[data-testid="tv-zoom-modal"]').waitFor({ state: "detached", timeout: 5000 });
 
   // Trigger 30s High-Latency Simulation from TV Display Config Drawer and verify Event-Driven Auto-Switch to Highlight Page
   await tvPage.getByRole("button", { name: "Configure TV Display" }).click();

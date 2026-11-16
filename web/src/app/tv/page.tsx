@@ -12,30 +12,39 @@ import {
   Pause,
   Pin,
   Play,
+  Search,
   Settings2,
   Volume2,
   VolumeX,
   X,
 } from "lucide-react";
 import { SmokeChartPanel } from "@/components/charts/SmokeChartPanel";
+import { TargetZoomModal } from "@/components/charts/TargetZoomModal";
+import { ProtocolFilterChips } from "@/components/targets/ProtocolFilterChips";
 import {
   apiRequest,
   type BatchSeriesResponse,
-  type MatrixCell,
   type MatrixSnapshot,
   type ProbeSeries,
-  type SparkPoint,
 } from "@/lib/api";
 import { formatDateTime24 } from "@/lib/date-format";
+import {
+  formatCleanTargetTitle,
+  getProtocolFamily,
+  getProtocolFamilyMeta,
+  PROTOCOL_FAMILIES,
+  type IpFamilyFilter,
+  type ProtocolFamily,
+} from "@/lib/protocol-filters";
 import {
   appendSparkPoint,
   formatLoss,
   formatMs,
+  mergeProbeSeriesWithCell,
+  rangeKeyToSeconds,
   resolveEffectiveWarnMs,
-  sparklineToProbeSeries,
   statusVisuals,
   type CellStatus,
-  type ProbeSeriesInput,
 } from "@/lib/smoke-math";
 import {
   computeBestFitGrid,
@@ -46,6 +55,7 @@ import {
   selectFocalProbeCell,
   serializeTvConfig,
   TV_RANGES,
+  UNGROUPED_GROUP_TOKEN,
   type TargetHealthSummary,
   type TvGridLayout,
   type TvOrientation,
@@ -53,74 +63,6 @@ import {
   type TvWallConfig,
 } from "@/lib/tv-config";
 import { useLiveSocket, type LiveEventMessage } from "@/lib/useLiveSocket";
-
-function mergeProbeSeriesWithCell(
-  dbSeries: ProbeSeries | undefined,
-  cell: MatrixCell,
-  probeName: string,
-  range: TvRange
-): ProbeSeriesInput {
-  const spark = cell.sparkline ?? [];
-  const warnMs = cell.warn_ms ?? dbSeries?.warn_ms ?? null;
-  const baselineMs = cell.baseline_ms ?? dbSeries?.baseline_ms ?? null;
-  if (!dbSeries || dbSeries.timestamps.length === 0) {
-    return sparklineToProbeSeries(
-      cell.probe_id,
-      probeName,
-      "",
-      spark,
-      cell.jitter_ms,
-      warnMs,
-      baselineMs
-    );
-  }
-
-  // Only merge ultra-recent rolling cache points on live/short ranges
-  const isShortRange =
-    range === "15m" || range === "1h" || range === "3h" || range === "6h";
-  if (!isShortRange || spark.length === 0) {
-    return {
-      ...dbSeries,
-      warn_ms: warnMs,
-      baseline_ms: baselineMs,
-    };
-  }
-
-  const lastTs = dbSeries.timestamps[dbSeries.timestamps.length - 1] ?? 0;
-  const trailing: SparkPoint[] = spark.filter((pt) => pt.ts > lastTs);
-  if (trailing.length === 0) {
-    return {
-      ...dbSeries,
-      warn_ms: warnMs,
-      baseline_ms: baselineMs,
-    };
-  }
-
-  const extra = sparklineToProbeSeries(
-    cell.probe_id,
-    probeName,
-    dbSeries.location_label,
-    trailing,
-    cell.jitter_ms,
-    warnMs,
-    baselineMs
-  );
-
-  return {
-    ...dbSeries,
-    warn_ms: warnMs,
-    baseline_ms: baselineMs,
-    timestamps: [...dbSeries.timestamps, ...extra.timestamps],
-    min_ms: [...dbSeries.min_ms, ...extra.min_ms],
-    p25_ms: [...dbSeries.p25_ms, ...extra.p25_ms],
-    p50_ms: [...dbSeries.p50_ms, ...extra.p50_ms],
-    p75_ms: [...dbSeries.p75_ms, ...extra.p75_ms],
-    p95_ms: [...dbSeries.p95_ms, ...extra.p95_ms],
-    max_ms: [...dbSeries.max_ms, ...extra.max_ms],
-    jitter_ms: [...dbSeries.jitter_ms, ...extra.jitter_ms],
-    loss_pct: [...dbSeries.loss_pct, ...extra.loss_pct],
-  };
-}
 
 function playAlertChime() {
   if (typeof window === "undefined") return;
@@ -156,6 +98,7 @@ interface FocalTargetCardProps {
   seriesByTarget: Record<string, ProbeSeries[]>;
   selectedProbeId?: string;
   onSelectProbe: (targetId: string, probeId: string) => void;
+  onZoomTarget: (targetId: string) => void;
   isHighlight?: boolean;
 }
 
@@ -168,11 +111,14 @@ function FocalTargetCard({
   seriesByTarget,
   selectedProbeId,
   onSelectProbe,
+  onZoomTarget,
   isHighlight = false,
 }: FocalTargetCardProps) {
   const { target, worstStatus, cells, isPinnedVip, isImpaired } = item;
   const vis = statusVisuals(worstStatus);
   const groupName = target.group_id ? groupMap.get(target.group_id) : null;
+  const protoMeta = getProtocolFamilyMeta(target.probe_type);
+  const cleanTitle = formatCleanTargetTitle(target.name, target.probe_type);
   const targetSeries = seriesByTarget[target.id] ?? [];
   const seriesMap = new Map(targetSeries.map((s) => [s.probe_id, s]));
   const focalCell = selectFocalProbeCell(cells, selectedProbeId);
@@ -202,14 +148,21 @@ function FocalTargetCard({
         layout.cols === 1 ? "mx-auto" : ""
       } ${cardBorderClass}`}
     >
-      {/* Compact Header (2 tight rows: Target + Status, Host + Clickable Probe Chips) */}
+      {/* Compact Header (2 tight rows: Target + Status, Host + Multi-Probe Switcher) */}
       <div className="flex shrink-0 flex-col gap-0.5">
         <div className="flex h-5 items-center justify-between gap-1.5 min-w-0">
           <div className="flex items-center gap-1.5 min-w-0">
-            <h2 className="truncate text-[13px] font-bold leading-tight text-zinc-100">
-              {target.name}
-            </h2>
-            <span className="shrink-0 rounded border border-border bg-elevated px-1.5 py-0 text-[10px] font-mono uppercase text-emerald-400">
+            <button
+              type="button"
+              onClick={() => onZoomTarget(target.id)}
+              title="Click to zoom & inspect target graphs and MTR"
+              className="truncate text-left text-[13px] font-bold leading-tight text-zinc-100 hover:text-emerald-300 transition-colors"
+            >
+              <h2>{cleanTitle}</h2>
+            </button>
+            <span
+              className={`shrink-0 rounded border px-1.5 py-0 text-[10px] font-mono uppercase ${protoMeta.badgeClass}`}
+            >
               {target.probe_type}
             </span>
             {isPinnedVip && (
@@ -234,12 +187,14 @@ function FocalTargetCard({
         </div>
 
         <div className="flex h-4 items-center justify-between gap-2 min-w-0 text-[11px]">
-          <p className="min-w-0 truncate font-mono text-zinc-400">
+          <p
+            title={groupName ? `${target.host} · ${groupName}` : target.host}
+            className="min-w-0 truncate font-mono text-zinc-400"
+          >
             {target.host}
-            {groupName ? ` · ${groupName}` : ""}
           </p>
 
-          {cells.length > 0 && (
+          {cells.length > 1 && (
             <div className="flex shrink-0 items-center gap-1 overflow-x-auto">
               {cells.slice(0, 4).map((cell) => {
                 const pName = probeMap.get(cell.probe_id) ?? "Probe";
@@ -278,12 +233,19 @@ function FocalTargetCard({
         className="flex shrink-0 flex-col overflow-hidden"
       >
         {!focalCell || !focalSeries ? (
-          <div
+          <button
+            type="button"
+            onClick={() => onZoomTarget(target.id)}
+            data-testid="zoom-chart-btn"
             style={{ height: layout.panelHeight }}
-            className="flex items-center justify-center rounded-md border border-dashed border-border bg-canvas/50 text-xs font-mono text-zinc-400"
+            className="flex w-full flex-col items-center justify-center gap-1 rounded-md border border-dashed border-border bg-canvas/50 px-2 text-center text-xs font-mono text-zinc-400 cursor-zoom-in transition-colors hover:border-emerald-500/40 hover:text-zinc-200"
           >
-            Waiting for probe telemetry...
-          </div>
+            <span>Waiting for probe telemetry...</span>
+            <span className="inline-flex items-center gap-1 text-[10px] text-emerald-400">
+              <Maximize2 className="h-3 w-3" aria-hidden="true" />
+              Click to zoom &amp; inspect MTR
+            </span>
+          </button>
         ) : (
           <SmokeChartPanel
             compact
@@ -294,6 +256,7 @@ function FocalTargetCard({
             targetName={target.name}
             targetHost={target.host}
             rangeLabel={range}
+            windowSec={rangeKeyToSeconds(range)}
             baselineMs={focalCell.baseline_ms ?? focalSeries.baseline_ms ?? null}
             warnMs={resolveEffectiveWarnMs({
               cellWarnMs: focalCell.warn_ms,
@@ -303,18 +266,21 @@ function FocalTargetCard({
               series: focalSeries,
             })}
             showThresholdMeta={Boolean(isHighlight)}
+            onZoomClick={() => onZoomTarget(target.id)}
           />
         )}
       </div>
 
       {/* Compact Footer */}
-      <div className="flex h-[18px] shrink-0 items-center justify-between border-t border-border/60 pt-0.5 text-[10px] font-mono tabular-nums text-zinc-400">
+      <div className="flex h-[18px] shrink-0 items-center justify-between border-t border-border/50 pt-0.5 text-[10px] font-mono tabular-nums text-zinc-400">
         <span className="truncate">
-          Poll {target.interval_sec}s · {cells.length}{" "}
-          {cells.length === 1 ? "probe" : "probes"} · {range}
+          {cells.length > 1
+            ? `${cells.length} probes · Every ${target.interval_sec}s`
+            : `Every ${target.interval_sec}s`}
         </span>
         <span className="shrink-0">
-          Peak HIGH {formatMs(item.maxP95Ms)} · Loss {formatLoss(item.maxLossPct)}
+          Peak {formatMs(item.maxP95Ms)}
+          {item.maxLossPct > 0 ? ` · Loss ${formatLoss(item.maxLossPct)}` : ""}
         </span>
       </div>
     </article>
@@ -325,7 +291,13 @@ export default function NocTvWallboardPage() {
   const [cfg, setCfg] = useState<TvWallConfig>(DEFAULT_TV_CONFIG);
   const [urlHydrated, setUrlHydrated] = useState(false);
   const [data, setData] = useState<MatrixSnapshot | null>(null);
-  const [seriesByTarget, setSeriesByTarget] = useState<Record<string, ProbeSeries[]>>({});
+  const [seriesByRange, setSeriesByRange] = useState<
+    Record<string, Record<string, ProbeSeries[]>>
+  >({});
+  const seriesByTarget = useMemo(
+    () => seriesByRange[cfg.range] ?? {},
+    [seriesByRange, cfg.range]
+  );
   const [error, setError] = useState<string | null>(null);
   const [pageIdx, setPageIdx] = useState(0);
   const [countdown, setCountdown] = useState(DEFAULT_TV_CONFIG.rotateSec);
@@ -336,14 +308,23 @@ export default function NocTvWallboardPage() {
   const [simTargetId, setSimTargetId] = useState<string>("");
   const [simRunning, setSimRunning] = useState<boolean>(false);
   const [selectedProbeByTarget, setSelectedProbeByTarget] = useState<Record<string, string>>({});
+  const [showSearch, setShowSearch] = useState<boolean>(false);
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [impairedOnly, setImpairedOnly] = useState<boolean>(false);
+  const [zoomTargetId, setZoomTargetId] = useState<string | null>(null);
   const [stageBox, setStageBox] = useState<{ width: number; height: number }>({
     width: 1900,
     height: 988,
   });
 
   const mainRef = useRef<HTMLElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const prevImpairedIdsRef = useRef<Set<string>>(new Set());
   const hasSeededImpairedRef = useRef<boolean>(false);
+
+  const handleOpenZoomTarget = useCallback((targetId: string) => {
+    setZoomTargetId(targetId);
+  }, []);
 
   const handleSelectProbe = useCallback((targetId: string, probeId: string) => {
     setSelectedProbeByTarget((prev) => ({
@@ -546,6 +527,74 @@ export default function NocTvWallboardPage() {
     [stageBox.width, stageBox.height, cfg.orientation, cfg.cardsPerPage]
   );
 
+  const toggleProtocolFilter = useCallback(
+    (proto: ProtocolFamily) => {
+      updateConfig((prev) => ({
+        ...prev,
+        protocols: prev.protocols.includes(proto)
+          ? prev.protocols.filter((p) => p !== proto)
+          : [...prev.protocols, proto],
+      }));
+    },
+    [updateConfig]
+  );
+
+  const toggleGroupFilter = useCallback(
+    (groupId: string) => {
+      updateConfig((prev) => ({
+        ...prev,
+        groups: prev.groups.includes(groupId)
+          ? prev.groups.filter((id) => id !== groupId)
+          : [...prev.groups, groupId],
+      }));
+    },
+    [updateConfig]
+  );
+
+  const protocolCounts = useMemo(() => {
+    const counts: Partial<Record<ProtocolFamily, number>> = {};
+    if (!data) return counts;
+    const groupSet = new Set(cfg.groups);
+    const includeUngrouped = groupSet.has(UNGROUPED_GROUP_TOKEN);
+    for (const t of data.targets) {
+      if (!t.enabled) continue;
+      if (groupSet.size > 0) {
+        if (!t.group_id ? !includeUngrouped : !groupSet.has(t.group_id)) continue;
+      }
+      const fam = getProtocolFamily(t.probe_type);
+      counts[fam] = (counts[fam] ?? 0) + 1;
+    }
+    return counts;
+  }, [data, cfg.groups]);
+
+  const ungroupedCount = useMemo(() => {
+    if (!data) return 0;
+    return data.targets.filter((t) => !t.group_id).length;
+  }, [data]);
+
+  const filteredTargets = useMemo(() => {
+    if (!data) return [];
+    const q = searchQuery.trim().toLowerCase();
+    return data.targets.filter((t) => {
+      if (impairedOnly) {
+        const hasImpaired = data.cells.some(
+          (c) =>
+            c.target_id === t.id &&
+            (c.status === "down" || c.status === "loss" || c.status === "degraded")
+        );
+        if (!hasImpaired) return false;
+      }
+      if (!q) return true;
+      const gName = t.group_id ? (groupMap.get(t.group_id) ?? "").toLowerCase() : "ungrouped";
+      return (
+        t.name.toLowerCase().includes(q) ||
+        t.host.toLowerCase().includes(q) ||
+        t.probe_type.toLowerCase().includes(q) ||
+        gName.includes(q)
+      );
+    });
+  }, [data, searchQuery, impairedOnly, groupMap]);
+
   const partitioned = useMemo(() => {
     if (!data) {
       return {
@@ -558,12 +607,12 @@ export default function NocTvWallboardPage() {
       };
     }
     return partitionTargetsForTv(
-      data.targets,
+      filteredTargets,
       data.cells,
       cfg,
       gridLayout.cardsPerPage
     );
-  }, [data, cfg, gridLayout.cardsPerPage]);
+  }, [data, filteredTargets, cfg, gridLayout.cardsPerPage]);
 
   // Default simTargetId to the first active target when loaded
   useEffect(() => {
@@ -635,13 +684,17 @@ export default function NocTvWallboardPage() {
 
   const loadVisibleSeries = useCallback(async () => {
     if (!urlHydrated || !visibleIdsKey) return;
+    const requestedRange = cfg.range;
     try {
       const res = await apiRequest<BatchSeriesResponse>(
-        `/api/tv/series?range=${cfg.range}&ids=${encodeURIComponent(visibleIdsKey)}`
+        `/api/tv/series?range=${requestedRange}&ids=${encodeURIComponent(visibleIdsKey)}`
       );
-      setSeriesByTarget((prev) => ({
+      setSeriesByRange((prev) => ({
         ...prev,
-        ...res.targets,
+        [requestedRange]: {
+          ...(prev[requestedRange] ?? {}),
+          ...res.targets,
+        },
       }));
     } catch {
       // Fall back gracefully to live rolling cache if batch series fetch temporarily fails
@@ -693,9 +746,9 @@ export default function NocTvWallboardPage() {
     }
   }
 
-  // Carousel rotation timer across slides
+  // Carousel rotation timer across slides (automatically paused while Zoom Modal is open)
   useEffect(() => {
-    if (cfg.rotateSec <= 0 || paused || totalSlides <= 1) {
+    if (cfg.rotateSec <= 0 || paused || zoomTargetId !== null || totalSlides <= 1) {
       setCountdown(cfg.rotateSec);
       return;
     }
@@ -710,7 +763,32 @@ export default function NocTvWallboardPage() {
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, [cfg.rotateSec, paused, totalSlides]);
+  }, [cfg.rotateSec, paused, zoomTargetId, totalSlides]);
+
+  // Keyboard shortcuts: "/" opens Search & Protocol Filter bar, "Escape" closes bar or drawer
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      const inInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+      if (e.key === "Escape") {
+        if (zoomTargetId !== null) return;
+        if (showSearch) {
+          setShowSearch(false);
+          return;
+        }
+        if (showDrawer) {
+          setShowDrawer(false);
+        }
+      } else if (e.key === "/" && !inInput && !showDrawer && zoomTargetId === null) {
+        e.preventDefault();
+        setShowSearch(true);
+        setTimeout(() => searchInputRef.current?.focus(), 30);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [zoomTargetId, showSearch, showDrawer]);
 
   const kpis = useMemo(() => {
     if (!data) return { probesOnline: 0, totalProbes: 0, healthyTargets: 0 };
@@ -970,6 +1048,55 @@ export default function NocTvWallboardPage() {
 
           <button
             type="button"
+            data-testid="tv-search-toggle-btn"
+            aria-label="Search and filter by protocol or host"
+            aria-pressed={
+              showSearch ||
+              Boolean(searchQuery) ||
+              impairedOnly ||
+              cfg.protocols.length > 0 ||
+              cfg.ipVersion !== "all" ||
+              cfg.splitByProtocol
+            }
+            title="Search, Protocol Focus & Filters (Shortcut: /)"
+            onClick={() => {
+              setShowSearch((prev) => {
+                const next = !prev;
+                if (next) {
+                  setTimeout(() => searchInputRef.current?.focus(), 30);
+                }
+                return next;
+              });
+            }}
+            className={`inline-flex items-center gap-1 rounded border px-1.5 py-1 text-[11px] font-mono ${
+              showSearch ||
+              searchQuery ||
+              impairedOnly ||
+              cfg.protocols.length > 0 ||
+              cfg.ipVersion !== "all" ||
+              cfg.splitByProtocol
+                ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-300"
+                : "border-border bg-elevated text-zinc-200 hover:border-zinc-500"
+            }`}
+          >
+            <Search className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            {cfg.protocols.length > 0 || cfg.ipVersion !== "all" || cfg.splitByProtocol ? (
+              <span className="hidden lg:inline uppercase">
+                {[
+                  ...cfg.protocols,
+                  cfg.ipVersion !== "all" ? cfg.ipVersion : null,
+                  cfg.splitByProtocol ? "Split" : null,
+                ]
+                  .filter(Boolean)
+                  .join("·")}
+              </span>
+            ) : (
+              <span className="hidden xl:inline text-zinc-300">Filter</span>
+            )}
+          </button>
+
+          <button
+            type="button"
             onClick={handleToggleFullscreen}
             aria-label="Toggle fullscreen"
             className="hidden sm:inline-flex items-center justify-center rounded border border-border bg-elevated p-1.5 text-zinc-200 hover:border-zinc-500"
@@ -1012,6 +1139,118 @@ export default function NocTvWallboardPage() {
           </div>
         )}
 
+        {/* Collapsible Quick Search, Protocol Focus & IP Filter Bar */}
+        {showSearch && (
+          <div
+            data-testid="tv-search-bar"
+            className="flex shrink-0 flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-surface/95 px-3 py-2 text-xs shadow-lg"
+          >
+            <div className="flex flex-1 min-w-[200px] items-center gap-2">
+              <Search className="h-3.5 w-3.5 text-zinc-400 shrink-0" aria-hidden="true" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                data-testid="tv-search-input"
+                aria-label="Search monitored hosts"
+                value={searchQuery}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  setPageIdx(0);
+                }}
+                placeholder="Search target name, IPv4/IPv6 host, protocol, or group..."
+                className="w-full rounded border border-border bg-canvas px-2.5 py-1 text-xs font-mono text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <ProtocolFilterChips
+                compact
+                testIdPrefix="tv-proto"
+                selectedProtocols={cfg.protocols}
+                onToggleProtocol={toggleProtocolFilter}
+                onClearProtocols={() => updateConfig((prev) => ({ ...prev, protocols: [] }))}
+                ipVersion={cfg.ipVersion}
+                onChangeIpVersion={(ip: IpFamilyFilter) =>
+                  updateConfig((prev) => ({ ...prev, ipVersion: ip }))
+                }
+                protocolCounts={protocolCounts}
+              />
+
+              <button
+                type="button"
+                data-testid="tv-split-protocol-btn"
+                aria-pressed={cfg.splitByProtocol}
+                onClick={() =>
+                  updateConfig((prev) => ({
+                    ...prev,
+                    splitByProtocol: !prev.splitByProtocol,
+                  }))
+                }
+                title="Separate TV carousel slides by protocol family (ICMP, DNS Query, HTTP, TCP)"
+                className={`rounded border px-2 py-0.5 text-[11px] font-mono ${
+                  cfg.splitByProtocol
+                    ? "border-amber-500 bg-amber-500 font-semibold text-zinc-950"
+                    : "border-border bg-elevated text-zinc-300 hover:text-zinc-100"
+                }`}
+              >
+                Split by Protocol
+              </button>
+
+              <button
+                type="button"
+                aria-pressed={impairedOnly}
+                onClick={() => {
+                  setImpairedOnly((prev) => !prev);
+                  setPageIdx(0);
+                }}
+                className={`rounded border px-2 py-0.5 text-[11px] font-mono ${
+                  impairedOnly
+                    ? "border-rose-500 bg-rose-500 font-semibold text-zinc-950"
+                    : "border-border bg-elevated text-zinc-300 hover:text-zinc-100"
+                }`}
+              >
+                Impaired Only
+              </button>
+
+              <span className="px-1 font-mono text-[11px] text-zinc-400">
+                {partitioned.totalFiltered} match{partitioned.totalFiltered === 1 ? "" : "es"}
+              </span>
+
+              {(searchQuery ||
+                impairedOnly ||
+                cfg.protocols.length > 0 ||
+                cfg.ipVersion !== "all" ||
+                cfg.splitByProtocol) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery("");
+                    setImpairedOnly(false);
+                    updateConfig((prev) => ({
+                      ...prev,
+                      protocols: [],
+                      ipVersion: "all",
+                      splitByProtocol: false,
+                    }));
+                  }}
+                  className="rounded border border-border bg-elevated px-2 py-0.5 text-[11px] font-mono text-zinc-300 hover:text-white"
+                >
+                  Reset
+                </button>
+              )}
+
+              <button
+                type="button"
+                aria-label="Close search bar"
+                onClick={() => setShowSearch(false)}
+                className="rounded p-1 text-zinc-400 hover:text-zinc-100"
+              >
+                <X className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+        )}
+
         {activeSlide.kind === "highlight" ? (
           /* Dedicated Highlight & Multi-Probe Spotlight Page (locked 7:3 focal graphs) */
           <section
@@ -1050,6 +1289,7 @@ export default function NocTvWallboardPage() {
                   seriesByTarget={seriesByTarget}
                   selectedProbeId={selectedProbeByTarget[item.target.id]}
                   onSelectProbe={handleSelectProbe}
+                  onZoomTarget={handleOpenZoomTarget}
                   isHighlight
                 />
               ))}
@@ -1068,8 +1308,30 @@ export default function NocTvWallboardPage() {
             className="grid flex-1 min-h-0 content-start items-start gap-2.5 overflow-hidden"
           >
             {activeSlide.items.length === 0 ? (
-              <div className="col-span-full flex min-h-[220px] items-center justify-center rounded-lg border border-dashed border-border bg-surface text-sm font-mono text-zinc-400">
-                No active targets match the selected group filter.
+              <div className="col-span-full flex min-h-[220px] flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-border bg-surface text-sm font-mono text-zinc-400">
+                <span>No active targets match the selected group or protocol filters.</span>
+                {(cfg.groups.length > 0 ||
+                  cfg.protocols.length > 0 ||
+                  cfg.ipVersion !== "all" ||
+                  Boolean(searchQuery) ||
+                  impairedOnly) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchQuery("");
+                      setImpairedOnly(false);
+                      updateConfig((prev) => ({
+                        ...prev,
+                        groups: [],
+                        protocols: [],
+                        ipVersion: "all",
+                      }));
+                    }}
+                    className="rounded border border-emerald-500/40 bg-emerald-500/15 px-3 py-1 text-xs text-emerald-300 hover:bg-emerald-500/25"
+                  >
+                    Reset Filters
+                  </button>
+                )}
               </div>
             ) : (
               activeSlide.items.map((item) => (
@@ -1083,6 +1345,7 @@ export default function NocTvWallboardPage() {
                   seriesByTarget={seriesByTarget}
                   selectedProbeId={selectedProbeByTarget[item.target.id]}
                   onSelectProbe={handleSelectProbe}
+                  onZoomTarget={handleOpenZoomTarget}
                 />
               ))
             )}
@@ -1119,6 +1382,24 @@ export default function NocTvWallboardPage() {
           · {cfg.range} · {partitionSummary(kpis.probesOnline, kpis.totalProbes, data?.active_incidents ?? 0)}
         </span>
       </footer>
+
+      {/* Interactive Target Zoom & Multi-Probe Inspector Modal */}
+      {zoomTargetId && data && (() => {
+        const zTarget = data.targets.find((t) => t.id === zoomTargetId);
+        if (!zTarget) return null;
+        return (
+          <TargetZoomModal
+            mode="tv"
+            target={zTarget}
+            groupName={zTarget.group_id ? groupMap.get(zTarget.group_id) : null}
+            cells={data.cells}
+            probeMap={probeMap}
+            initialRange={cfg.range}
+            fallbackSeries={seriesByTarget[zTarget.id] ?? []}
+            onClose={() => setZoomTargetId(null)}
+          />
+        );
+      })()}
 
       {/* TV Configuration Drawer Modal */}
       {showDrawer && (
@@ -1270,6 +1551,96 @@ export default function NocTvWallboardPage() {
                 </div>
               </div>
 
+              {/* Protocol Focus & Split Slides */}
+              <div>
+                <div className="mb-2 flex items-center justify-between">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
+                    Protocol Focus (ICMP, Query, HTTP, TCP)
+                  </p>
+                  {(cfg.protocols.length > 0 || cfg.ipVersion !== "all") && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateConfig((prev) => ({
+                          ...prev,
+                          protocols: [],
+                          ipVersion: "all",
+                        }))
+                      }
+                      className="text-xs text-emerald-400 underline"
+                    >
+                      All Protocols
+                    </button>
+                  )}
+                </div>
+
+                <div className="space-y-2.5 rounded-md border border-border bg-canvas p-3">
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {PROTOCOL_FAMILIES.map((meta) => {
+                      const active = cfg.protocols.includes(meta.id);
+                      const count = protocolCounts[meta.id] ?? 0;
+                      return (
+                        <button
+                          key={meta.id}
+                          type="button"
+                          aria-pressed={active}
+                          data-testid={`tv-drawer-proto-${meta.id}`}
+                          onClick={() => toggleProtocolFilter(meta.id)}
+                          className={`flex items-center justify-between rounded border px-2.5 py-1.5 text-xs font-mono ${
+                            active
+                              ? "border-emerald-500 bg-emerald-500 font-semibold text-zinc-950"
+                              : "border-border bg-elevated text-zinc-200 hover:border-zinc-500"
+                          }`}
+                        >
+                          <span>{meta.shortLabel}</span>
+                          <span className={active ? "text-zinc-900" : "text-zinc-400"}>
+                            {count}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2 border-t border-border/70 pt-2">
+                    <span className="text-[11px] font-mono text-zinc-400">IP Family</span>
+                    <div className="inline-flex rounded border border-border bg-elevated p-0.5">
+                      {(["all", "ipv4", "ipv6"] as const).map((ip) => (
+                        <button
+                          key={ip}
+                          type="button"
+                          aria-pressed={cfg.ipVersion === ip}
+                          onClick={() =>
+                            updateConfig((prev) => ({ ...prev, ipVersion: ip }))
+                          }
+                          className={`rounded px-2 py-0.5 text-[11px] font-mono uppercase ${
+                            cfg.ipVersion === ip
+                              ? "bg-cyan-500 font-semibold text-zinc-950"
+                              : "text-zinc-300"
+                          }`}
+                        >
+                          {ip}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <label className="flex items-center justify-between gap-2 border-t border-border/70 pt-2 text-xs text-zinc-200">
+                    <span>Separate slides by protocol</span>
+                    <input
+                      type="checkbox"
+                      data-testid="tv-drawer-split-protocol"
+                      checked={cfg.splitByProtocol}
+                      onChange={(e) =>
+                        updateConfig((prev) => ({
+                          ...prev,
+                          splitByProtocol: e.target.checked,
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+              </div>
+
               {/* Group Filter */}
               <div>
                 <div className="mb-2 flex items-center justify-between">
@@ -1289,8 +1660,22 @@ export default function NocTvWallboardPage() {
                   )}
                 </div>
                 <div className="max-h-36 overflow-y-auto space-y-1.5 rounded-md border border-border bg-canvas p-3">
+                  <label className="flex items-center justify-between gap-2 text-xs text-zinc-200">
+                    <span className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        data-testid="tv-group-ungrouped"
+                        checked={cfg.groups.includes(UNGROUPED_GROUP_TOKEN)}
+                        onChange={() => toggleGroupFilter(UNGROUPED_GROUP_TOKEN)}
+                      />
+                      <span>Ungrouped / Custom Targets</span>
+                    </span>
+                    <span className="font-mono text-[11px] text-zinc-400">
+                      {ungroupedCount}
+                    </span>
+                  </label>
                   {(data?.groups ?? []).length === 0 ? (
-                    <p className="text-xs text-zinc-400">No groups configured.</p>
+                    <p className="text-xs text-zinc-400">No named groups configured.</p>
                   ) : (
                     (data?.groups ?? []).map((g) => {
                       const checked = cfg.groups.includes(g.id);
@@ -1302,14 +1687,7 @@ export default function NocTvWallboardPage() {
                           <input
                             type="checkbox"
                             checked={checked}
-                            onChange={(e) => {
-                              updateConfig((prev) => ({
-                                ...prev,
-                                groups: e.target.checked
-                                  ? [...prev.groups, g.id]
-                                  : prev.groups.filter((id) => id !== g.id),
-                              }));
-                            }}
+                            onChange={() => toggleGroupFilter(g.id)}
                           />
                           <span>{g.name}</span>
                         </label>

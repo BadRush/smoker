@@ -13,19 +13,22 @@ interface ProbeOption {
 interface MtrSnapshotsPanelProps {
   snapshots: MTRSnapshot[];
   probes?: ProbeOption[];
-  running: boolean;
+  running?: boolean;
   errorMessage?: string | null;
-  onRunNow: (probeId?: string) => void;
+  onRunNow?: (probeId?: string) => void;
 }
 
 export function MtrSnapshotsPanel({
   snapshots,
   probes = [],
-  running,
+  running = false,
   errorMessage = null,
   onRunNow,
 }: MtrSnapshotsPanelProps) {
   const [selectedProbeId, setSelectedProbeId] = useState<string>("");
+  const visibleSnapshots = selectedProbeId
+    ? snapshots.filter((s) => s.probe_id === selectedProbeId)
+    : snapshots;
 
   return (
     <section
@@ -57,16 +60,18 @@ export function MtrSnapshotsPanel({
             </select>
           )}
 
-          <button
-            type="button"
-            onClick={() => onRunNow(selectedProbeId || undefined)}
-            disabled={running}
-            aria-busy={running}
-            className="inline-flex items-center gap-2 rounded-md border border-cyan-500/40 bg-cyan-500/15 px-3 py-1.5 text-xs font-semibold text-cyan-300 hover:bg-cyan-500/25 disabled:opacity-60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400"
-          >
-            <Play className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>{running ? "Running MTR..." : "Run MTR Now"}</span>
-          </button>
+          {onRunNow && (
+            <button
+              type="button"
+              onClick={() => onRunNow(selectedProbeId || undefined)}
+              disabled={running}
+              aria-busy={running}
+              className="inline-flex items-center gap-2 rounded-md border border-cyan-500/40 bg-cyan-500/15 px-3 py-1.5 text-xs font-semibold text-cyan-300 hover:bg-cyan-500/25 disabled:opacity-60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400"
+            >
+              <Play className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>{running ? "Running MTR..." : "Run MTR Now"}</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -80,13 +85,13 @@ export function MtrSnapshotsPanel({
         </div>
       )}
 
-      {snapshots.length === 0 ? (
+      {visibleSnapshots.length === 0 ? (
         <div className="rounded border border-dashed border-border bg-canvas/50 p-6 text-center text-xs text-zinc-400">
           No MTR snapshots recorded yet. Snapshots trigger automatically on consecutive or intermittent packet loss, or on demand.
         </div>
       ) : (
         <div className="space-y-4">
-          {snapshots.slice(0, 5).map((snap) => (
+          {visibleSnapshots.slice(0, 5).map((snap) => (
             <div key={snap.id} className="rounded-md border border-border bg-elevated/40 overflow-hidden">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2 text-xs font-mono">
                 <div className="flex items-center gap-2">

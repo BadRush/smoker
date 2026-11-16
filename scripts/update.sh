@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${ROOT_DIR}"
+
+ROLE="auto"
+BRANCH=""
+SKIP_PULL="false"
+STASH_LOCAL="false"
+DO_BACKUP="true"
+BACKUP_KEEP="5"
+NO_CACHE="false"
+DO_PRUNE="true"
+SERVICES_CSV=""
+DRY_RUN="false"
+
+usage() {
+  cat <<'EOF'
+Smoker Update Script (Central Server & Remote Probe)
+
+Usage:
+  ./scripts/update.sh [options]
+
+Options:
+  --role auto|central|probe|all   Target deployment role (default: auto via .env / .probe.env)
+  --branch BRANCH                 Git branch to pull (default: current active branch)
+  --skip-pull                     Skip 'git pull --ff-only' and rebuild from local files only
+  --stash                         Auto-stash dirty tracked files before 'git pull --ff-only'
+  --no-backup                     Skip pre-update TimescaleDB pg_dump backup (Central)
+  --backup-keep N                 Number of backups/*.sql.gz files to retain (default: 5)
+  --services s1,s2,...            Comma-separated Central services to rebuild/restart (e.g. central,web)
+  --no-cache                      Pass --no-cache to 'docker compose build'
+  --no-prune                      Skip 'docker image prune -f' after successful update
+  --dry-run                       Show planned actions without modifying git, backups, or containers
+  -h, --help                      Show this help message
+
+Examples:
+  ./scripts/update.sh                              # Auto-detect role, backup DB, pull, rebuild & verify
+  ./scripts/update.sh --services central,web       # Fast update of backend API + frontend only
+  ./scripts/update.sh --role probe                 # Update standalone Remote Probe node
+  ./scripts/update.sh --stash --no-cache           # Stash local edits, pull, and clean-rebuild
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --role) ROLE="${2:-}"; shift 2 ;;
+    --branch) BRANCH="${2:-}"; shift 2 ;;
+    --skip-pull) SKIP_PULL="true"; shift ;;
+    --stash) STASH_LOCAL="true"; shift ;;
+    --no-backup) DO_BACKUP="false"; shift ;;
+    --backup-keep) BACKUP_KEEP="${2:-}"; shift 2 ;;
+    --services) SERVICES_CSV="${2:-}"; shift 2 ;;
+    --no-cache) NO_CACHE="true"; shift ;;
+    --no-prune) DO_PRUNE="false"; shift ;;
+    --dry-run) DRY_RUN="true"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+log_info() { printf '\033[1;32m[smoker-update]\033[0m %s\n' "$*"; }
+log_warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
+log_err()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
+
+if ! [[ "$BACKUP_KEEP" =~ ^[0-9]+$ ]] || [[ "$BACKUP_KEEP" -lt 1 ]]; then
+  log_err "--backup-keep must be a positive integer (got: '$BACKUP_KEEP')"
+  exit 1
+fi
+
+check_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    log_err "Docker is not installed."
+    exit 1
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    log_err "Docker Compose v2 ('docker compose') is required."
+    exit 1
+  fi
+}
+
+read_env_var() {
+  local file="$1"
+  local key="$2"
+  if [[ -f "$file" ]]; then
+    grep -E "^${key}=" "$file" | head -n1 | cut -d'=' -f2- | tr -d '\r' || true
+  fi
+}
+
+backup_env_files() {
+  local ts="$1"
+  if [[ -f "${ROOT_DIR}/.env" ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log_info "[dry-run] Would back up .env -> .env.bak.${ts}"
+    else
+      cp "${ROOT_DIR}/.env" "${ROOT_DIR}/.env.bak.${ts}"
+      chmod 600 "${ROOT_DIR}/.env.bak.${ts}"
+      log_info "Backed up .env -> .env.bak.${ts}"
+    fi
+  fi
+  if [[ -f "${ROOT_DIR}/.probe.env" ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log_info "[dry-run] Would back up .probe.env -> .probe.env.bak.${ts}"
+    else
+      cp "${ROOT_DIR}/.probe.env" "${ROOT_DIR}/.probe.env.bak.${ts}"
+      chmod 600 "${ROOT_DIR}/.probe.env.bak.${ts}"
+      log_info "Backed up .probe.env -> .probe.env.bak.${ts}"
+    fi
+  fi
+}
+
+detect_roles() {
+  if [[ "$ROLE" != "auto" ]]; then
+    case "$ROLE" in
+      central|probe|all) echo "$ROLE"; return ;;
+      *) log_err "Invalid --role '$ROLE' (expected auto|central|probe|all)"; exit 1 ;;
+    esac
+  fi
+
+  local has_central="false"
+  local has_probe="false"
+  if [[ -f "${ROOT_DIR}/.env" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qE '^smoker-(central|db|web|gateway)$'; then
+    has_central="true"
+  fi
+  if [[ -f "${ROOT_DIR}/.probe.env" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'smoker-probe'; then
+    has_probe="true"
+  fi
+
+  if [[ "$has_central" == "true" && "$has_probe" == "true" ]]; then
+    echo "all"
+  elif [[ "$has_probe" == "true" ]]; then
+    echo "probe"
+  elif [[ "$has_central" == "true" ]]; then
+    echo "central"
+  else
+    log_err "Could not auto-detect Smoker installation (.env or .probe.env not found). Pass --role central|probe or run ./scripts/setup.sh first."
+    exit 1
+  fi
+}
+
+pull_updates() {
+  local ts="$1"
+  if [[ "$SKIP_PULL" == "true" ]]; then
+    log_info "Skipping git pull (--skip-pull enabled)."
+    return
+  fi
+  if [[ ! -d "${ROOT_DIR}/.git" ]]; then
+    log_warn "No .git repository directory found; skipping git pull and using local workspace."
+    return
+  fi
+
+  local active_branch="$BRANCH"
+  if [[ -z "$active_branch" ]]; then
+    active_branch="$(git rev-parse --abbrev-ref HEAD)"
+    if [[ "$active_branch" == "HEAD" ]]; then
+      log_err "Repository is in detached HEAD state. Pass --branch <branch> or --skip-pull."
+      exit 1
+    fi
+  fi
+
+  local dirty_tracked
+  dirty_tracked="$(git status --porcelain --untracked-files=no)"
+  if [[ -n "$dirty_tracked" ]]; then
+    if [[ "$STASH_LOCAL" == "true" ]]; then
+      if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] Would stash dirty tracked files before pulling '$active_branch'."
+      else
+        git stash push -m "smoker-update-${ts}" >/dev/null
+        log_warn "Stashed local tracked changes as 'smoker-update-${ts}' (inspect with 'git stash list')."
+      fi
+    else
+      log_err "Tracked files have uncommitted local modifications:"
+      echo "$dirty_tracked" >&2
+      log_err "Commit/discard changes or re-run with --stash or --skip-pull."
+      exit 1
+    fi
+  fi
+
+  local old_sha new_sha
+  old_sha="$(git rev-parse --short HEAD)"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[dry-run] Would run: git fetch origin '${active_branch}' && git pull --ff-only origin '${active_branch}'"
+    return
+  fi
+
+  log_info "Fetching and fast-forwarding '${active_branch}' from origin..."
+  git fetch origin "${active_branch}"
+  if ! git pull --ff-only origin "${active_branch}"; then
+    log_err "Fast-forward pull failed (local branch diverged from origin/${active_branch}). Resolve manually or use --skip-pull."
+    exit 1
+  fi
+  new_sha="$(git rev-parse --short HEAD)"
+
+  if [[ "$old_sha" == "$new_sha" ]]; then
+    log_info "Repository already at latest commit (${new_sha})."
+  else
+    log_info "Updated ${old_sha} -> ${new_sha}:"
+    git --no-pager log --oneline -n 10 "${old_sha}..${new_sha}" || true
+  fi
+
+  local sh_file
+  for sh_file in "${ROOT_DIR}/scripts/"*.sh; do
+    if [[ -f "$sh_file" && ! -x "$sh_file" ]]; then
+      chmod +x "$sh_file" 2>/dev/null || true
+    fi
+  done
+}
+
+backup_central_db() {
+  local ts="$1"
+  if [[ "$DO_BACKUP" != "true" ]]; then
+    log_info "Skipping pre-update database backup (--no-backup enabled)."
+    return
+  fi
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'smoker-db'; then
+    log_warn "Container 'smoker-db' is not running; skipping pg_dump backup."
+    return
+  fi
+
+  local pg_db pg_user backup_dir backup_file
+  pg_db="$(read_env_var "${ROOT_DIR}/.env" "POSTGRES_DB")"; pg_db="${pg_db:-smoker}"
+  pg_user="$(read_env_var "${ROOT_DIR}/.env" "POSTGRES_USER")"; pg_user="${pg_user:-smoker}"
+  backup_dir="${ROOT_DIR}/backups"
+  backup_file="${backup_dir}/smoker-pre-update-${ts}.sql.gz"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[dry-run] Would dump TimescaleDB (${pg_db}) -> ${backup_file} (keep latest ${BACKUP_KEEP})"
+    return
+  fi
+
+  mkdir -p "${backup_dir}"
+  chmod 700 "${backup_dir}"
+  log_info "Backing up TimescaleDB (${pg_db}) to ${backup_file}..."
+  if ! docker exec smoker-db pg_dump -U "${pg_user}" -d "${pg_db}" --no-owner --no-acl | gzip -c > "${backup_file}"; then
+    rm -f "${backup_file}"
+    log_err "Database backup failed; aborting update before restarting Central."
+    exit 1
+  fi
+  if [[ ! -s "${backup_file}" ]] || ! gzip -t "${backup_file}" >/dev/null 2>&1; then
+    rm -f "${backup_file}"
+    log_err "Generated backup archive failed integrity verification."
+    exit 1
+  fi
+  chmod 600 "${backup_file}"
+  log_info "Database backup verified ($(du -h "${backup_file}" | awk '{print $1}'))."
+
+  # Enforce retention count across smoker-pre-update-*.sql.gz
+  local old_backups
+  old_backups="$(ls -1t "${backup_dir}"/smoker-pre-update-*.sql.gz 2>/dev/null | tail -n +"$((BACKUP_KEEP + 1))" || true)"
+  if [[ -n "$old_backups" ]]; then
+    while IFS= read -r old_file; do
+      [[ -n "$old_file" ]] && rm -f "$old_file"
+    done <<< "$old_backups"
+    log_info "Pruned older DB backups (retained latest ${BACKUP_KEEP})."
+  fi
+}
+
+sync_proxy_and_profile() {
+  local access_mode domain app_port template_file vhost_out tmp_out
+  access_mode="$(read_env_var "${ROOT_DIR}/.env" "EXTERNAL_ACCESS_MODE")"
+  domain="$(read_env_var "${ROOT_DIR}/.env" "DOMAIN")"; domain="${domain:-localhost}"
+  app_port="$(read_env_var "${ROOT_DIR}/.env" "APP_PORT")"; app_port="${app_port:-8080}"
+
+  if [[ "$access_mode" == "nginx" && -n "$domain" && "$domain" != "localhost" ]]; then
+    template_file="${ROOT_DIR}/deploy/nginx/external-proxy.conf.template"
+    vhost_out="${ROOT_DIR}/deploy/nginx/generated-${domain}.conf"
+    if [[ -f "$template_file" ]]; then
+      if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] Would re-render Nginx vhost template -> ${vhost_out}"
+      else
+        tmp_out="$(mktemp)"
+        sed -e "s|__DOMAIN__|${domain}|g" \
+            -e "s|__UPSTREAM_ADDR__|127.0.0.1:${app_port}|g" \
+            "$template_file" > "$tmp_out"
+        if [[ -f "$vhost_out" ]] && cmp -s "$tmp_out" "$vhost_out"; then
+          rm -f "$tmp_out"
+        else
+          mv "$tmp_out" "$vhost_out"
+          chmod 644 "$vhost_out"
+          log_warn "Updated ${vhost_out} — re-copy and reload host Nginx if needed:"
+          log_warn "  sudo cp \"${vhost_out}\" /etc/nginx/sites-available/smoker.conf && sudo nginx -t && sudo systemctl reload nginx"
+        fi
+      fi
+    fi
+  fi
+}
+
+wait_central_healthy() {
+  log_info "Waiting for Central /readyz and Web healthchecks..."
+  local ready="false"
+  for _ in $(seq 1 45); do
+    if docker exec smoker-central wget -qO- http://127.0.0.1:8080/readyz >/dev/null 2>&1; then
+      ready="true"
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$ready" != "true" ]]; then
+    log_err "smoker-central failed /readyz within 90s; check 'docker compose logs central'."
+    exit 1
+  fi
+
+  local web_health="unknown"
+  for _ in $(seq 1 30); do
+    web_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' smoker-web 2>/dev/null || echo "missing")"
+    if [[ "$web_health" == "healthy" || "$web_health" == "running" ]]; then
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$web_health" != "healthy" && "$web_health" != "running" ]]; then
+    log_err "smoker-web status is '${web_health}'; check 'docker compose logs web'."
+    exit 1
+  fi
+  log_info "Central (/readyz) and Web (${web_health}) are healthy."
+}
+
+update_central() {
+  local ts="$1"
+  local access_mode
+  access_mode="$(read_env_var "${ROOT_DIR}/.env" "EXTERNAL_ACCESS_MODE")"
+
+  local -a profile_args=()
+  if [[ "$access_mode" == "tunnel" ]] || docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'smoker-cloudflared'; then
+    profile_args=(--profile tunnel)
+  elif [[ "$access_mode" == "tls" ]] || docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'smoker-caddy'; then
+    profile_args=(--profile tls)
+  fi
+
+  local -a build_flags=()
+  if [[ "$NO_CACHE" == "true" ]]; then
+    build_flags=(--no-cache)
+  fi
+
+  local -a target_services=()
+  if [[ -n "$SERVICES_CSV" ]]; then
+    IFS=',' read -r -a target_services <<< "$SERVICES_CSV"
+  fi
+
+  backup_central_db "$ts"
+  sync_proxy_and_profile
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[dry-run] Would run: docker compose ${profile_args[*]:-} build ${build_flags[*]:-} ${target_services[*]:-}"
+    log_info "[dry-run] Would run: docker compose ${profile_args[*]:-} up -d ${target_services[*]:-}"
+    return
+  fi
+
+  log_info "Building Central Docker images (${target_services[*]:-all services})..."
+  docker compose ${profile_args[@]+"${profile_args[@]}"} build ${build_flags[@]+"${build_flags[@]}"} ${target_services[@]+"${target_services[@]}"}
+
+  log_info "Updating and starting Central containers..."
+  docker compose ${profile_args[@]+"${profile_args[@]}"} up -d ${target_services[@]+"${target_services[@]}"}
+
+  wait_central_healthy
+}
+
+update_probe() {
+  if [[ ! -f "${ROOT_DIR}/.probe.env" ]]; then
+    log_err "Missing .probe.env for Remote Probe role. Run './scripts/setup.sh --role probe' first."
+    exit 1
+  fi
+
+  local -a build_flags=()
+  if [[ "$NO_CACHE" == "true" ]]; then
+    build_flags=(--no-cache)
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[dry-run] Would rebuild & restart deploy/docker/probe-agent.compose.yml"
+    return
+  fi
+
+  log_info "Building Remote Probe image..."
+  docker compose -f "${ROOT_DIR}/deploy/docker/probe-agent.compose.yml" --env-file "${ROOT_DIR}/.probe.env" build ${build_flags[@]+"${build_flags[@]}"}
+
+  log_info "Restarting smoker-probe container (preserving SQLite WAL buffer)..."
+  docker compose -f "${ROOT_DIR}/deploy/docker/probe-agent.compose.yml" --env-file "${ROOT_DIR}/.probe.env" up -d
+  sleep 3
+  docker logs --tail=10 smoker-probe || true
+}
+
+prune_images() {
+  if [[ "$DO_PRUNE" != "true" ]]; then
+    log_info "Skipping dangling image prune (--no-prune enabled)."
+    return
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[dry-run] Would run: docker image prune -f"
+    return
+  fi
+  log_info "Cleaning up dangling Docker images..."
+  docker image prune -f >/dev/null || true
+}
+
+main() {
+  local ts detected_role
+  ts="$(date -u +"%Y%m%d-%H%M%S")"
+
+  check_docker
+  detected_role="$(detect_roles)"
+  log_info "Detected deployment role: ${detected_role}"
+
+  backup_env_files "$ts"
+  pull_updates "$ts"
+
+  case "$detected_role" in
+    central)
+      update_central "$ts"
+      ;;
+    probe)
+      update_probe
+      ;;
+    all)
+      update_central "$ts"
+      update_probe
+      ;;
+  esac
+
+  prune_images
+
+  echo ""
+  echo "==================== SMOKER UPDATE COMPLETE ===================="
+  echo "Role      : ${detected_role}"
+  echo "Commit    : $(git rev-parse --short HEAD 2>/dev/null || echo 'non-git')"
+  if [[ "$DRY_RUN" != "true" ]]; then
+    docker ps --filter "name=smoker" --format "table {{.Names}}\t{{.Status}}"
+  else
+    echo "Status    : Dry run completed (no changes applied)"
+  fi
+  echo "================================================================"
+}
+
+main

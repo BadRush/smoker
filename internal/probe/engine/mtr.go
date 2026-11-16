@@ -119,6 +119,11 @@ func extractPeerIP(peer net.Addr) string {
 
 // RunMTR executes a bounded concurrent TTL-incrementing ICMP traceroute (IPv4/IPv6) with rDNS lookup.
 func RunMTR(ctx context.Context, rawHost string) ([]protocol.MTRHop, error) {
+	return RunMTRWithFamily(ctx, rawHost, false)
+}
+
+// RunMTRWithFamily executes an ICMP traceroute, forcing AAAA/ICMPv6 resolution when forceIPv6 is true.
+func RunMTRWithFamily(ctx context.Context, rawHost string, forceIPv6 bool) ([]protocol.MTRHop, error) {
 	host, err := ExtractMTRHost(rawHost)
 	if err != nil {
 		return nil, err
@@ -131,7 +136,11 @@ func RunMTR(ctx context.Context, rawHost string) ([]protocol.MTRHop, error) {
 		return nil, ctx.Err()
 	}
 
-	ip, err := resolveHostIP(ctx, host)
+	family := "ip"
+	if forceIPv6 {
+		family = "ip6"
+	}
+	ip, err := resolveHostIPWithFamily(ctx, host, family)
 	if err != nil {
 		return nil, err
 	}

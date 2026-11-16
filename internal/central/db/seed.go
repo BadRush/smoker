@@ -39,6 +39,11 @@ var starterGroups = []starterGroupSpec{
 		Description: "Major cloud, search, messaging, developer & productivity platforms",
 		SortOrder:   2,
 	},
+	{
+		Name:        "Public IPv6",
+		Description: "Native IPv6 Anycast DNS resolvers & global cloud endpoints (ICMPv6, DNS6, TCP6, HTTP6)",
+		SortOrder:   3,
+	},
 }
 
 var starterTargets = []starterTargetSpec{
@@ -63,6 +68,15 @@ var starterTargets = []starterTargetSpec{
 	{GroupName: "Public Apps", Name: "Wikipedia", Host: "https://en.wikipedia.org/wiki/Main_Page", ProbeType: "http", IntervalSec: 5, TimeoutMs: 3000},
 	{GroupName: "Public Apps", Name: "GitHub (TLS 443)", Host: "github.com", ProbeType: "tcp", PortOrPath: "443", IntervalSec: 2, TimeoutMs: 2000},
 	{GroupName: "Public Apps", Name: "OpenAI API (TLS 443)", Host: "api.openai.com", ProbeType: "tcp", PortOrPath: "443", IntervalSec: 2, TimeoutMs: 2000},
+
+	// Public IPv6 (Native v6 Anycast DNS & v6 HTTP/TCP endpoints)
+	{GroupName: "Public IPv6", Name: "Google DNSv6 (ICMP6)", Host: "2001:4860:4860::8888", ProbeType: "icmp6", IntervalSec: 1, TimeoutMs: 1000},
+	{GroupName: "Public IPv6", Name: "Google DNSv6 (Query)", Host: "2001:4860:4860::8888", ProbeType: "dns6", PortOrPath: "google.com|AAAA", IntervalSec: 2, TimeoutMs: 1500},
+	{GroupName: "Public IPv6", Name: "Cloudflare DNSv6 (ICMP6)", Host: "2606:4700:4700::1111", ProbeType: "icmp6", IntervalSec: 1, TimeoutMs: 1000},
+	{GroupName: "Public IPv6", Name: "Cloudflare DNSv6 (Query)", Host: "2606:4700:4700::1111", ProbeType: "dns6", PortOrPath: "cloudflare.com|AAAA", IntervalSec: 2, TimeoutMs: 1500},
+	{GroupName: "Public IPv6", Name: "Quad9 DNSv6 (ICMP6)", Host: "2620:fe::fe", ProbeType: "icmp6", IntervalSec: 2, TimeoutMs: 1500},
+	{GroupName: "Public IPv6", Name: "Cloudflare Edge v6", Host: "https://[2606:4700:4700::1111]/cdn-cgi/trace", ProbeType: "http6", IntervalSec: 5, TimeoutMs: 3000},
+	{GroupName: "Public IPv6", Name: "Google Search v6", Host: "https://ipv6.google.com/generate_204", ProbeType: "http6", IntervalSec: 5, TimeoutMs: 3000},
 }
 
 func targetSeedKey(name, host, probeType string) string {

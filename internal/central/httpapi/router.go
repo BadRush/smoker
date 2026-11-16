@@ -132,6 +132,7 @@ func NewRouter(deps Dependencies) http.Handler {
 	r.Post("/api/auth/logout", s.handleLogout)
 	r.Get("/api/tv/matrix", s.handleGetTVMatrix)
 	r.Get("/api/tv/series", s.handleGetTVSeries)
+	r.Get("/api/tv/targets/{id}/mtr", s.handleListTVTargetMTR)
 	r.Post("/api/targets/{id}/simulate", s.handleSimulateTarget)
 
 	// Protected API Routes

@@ -8,6 +8,7 @@ import {
   ArrowUpRight,
   Crosshair,
   LayoutGrid,
+  Maximize2,
   RefreshCw,
   Search,
   ServerCrash,
@@ -15,13 +16,27 @@ import {
 } from "lucide-react";
 import { MiniSparkline } from "@/components/charts/MiniSparkline";
 import { SmokeChartPanel } from "@/components/charts/SmokeChartPanel";
+import { TargetZoomModal } from "@/components/charts/TargetZoomModal";
 import { NocShell } from "@/components/layout/NocShell";
+import { ProtocolFilterChips } from "@/components/targets/ProtocolFilterChips";
 import {
   ApiError,
   apiRequest,
   type MatrixCell,
   type MatrixSnapshot,
+  type Target,
 } from "@/lib/api";
+import {
+  formatCleanTargetTitle,
+  getProtocolFamily,
+  getProtocolFamilyMeta,
+  groupItemsByProtocol,
+  groupItemsByTargetGroup,
+  matchesProtocolAndIpFilter,
+  type GroupByMode,
+  type IpFamilyFilter,
+  type ProtocolFamily,
+} from "@/lib/protocol-filters";
 import {
   appendSparkPoint,
   formatLoss,
@@ -41,7 +56,11 @@ export default function MatrixWallPage() {
   const [search, setSearch] = useState("");
   const [groupFilter, setGroupFilter] = useState<string>("all");
   const [statusFilter, setStatusFilter] = useState<string>("all");
+  const [selectedProtocols, setSelectedProtocols] = useState<ProtocolFamily[]>([]);
+  const [ipVersion, setIpVersion] = useState<IpFamilyFilter>("all");
+  const [groupBy, setGroupBy] = useState<GroupByMode>("protocol");
   const [viewMode, setViewMode] = useState<"matrix" | "grid">("matrix");
+  const [zoomTargetId, setZoomTargetId] = useState<string | null>(null);
 
   const loadMatrix = useCallback(async () => {
     try {
@@ -166,6 +185,34 @@ export default function MatrixWallPage() {
     return map;
   }, [data]);
 
+  const probeMap = useMemo(() => {
+    const map = new Map<string, string>();
+    if (!data) return map;
+    for (const p of data.probes) {
+      map.set(p.id, p.name);
+    }
+    return map;
+  }, [data]);
+
+  const toggleProtocol = useCallback((proto: ProtocolFamily) => {
+    setSelectedProtocols((prev) =>
+      prev.includes(proto) ? prev.filter((p) => p !== proto) : [...prev, proto]
+    );
+  }, []);
+
+  const protocolCounts = useMemo(() => {
+    const counts: Partial<Record<ProtocolFamily, number>> = {};
+    if (!data) return counts;
+    for (const t of data.targets) {
+      if (groupFilter !== "all" && (t.group_id ?? "ungrouped") !== groupFilter) {
+        continue;
+      }
+      const fam = getProtocolFamily(t.probe_type);
+      counts[fam] = (counts[fam] ?? 0) + 1;
+    }
+    return counts;
+  }, [data, groupFilter]);
+
   const filteredTargets = useMemo(() => {
     if (!data) return [];
     const q = search.trim().toLowerCase();
@@ -173,10 +220,14 @@ export default function MatrixWallPage() {
       if (groupFilter !== "all" && (t.group_id ?? "ungrouped") !== groupFilter) {
         return false;
       }
+      if (!matchesProtocolAndIpFilter(t, selectedProtocols, ipVersion)) {
+        return false;
+      }
       if (
         q &&
         !t.name.toLowerCase().includes(q) &&
-        !t.host.toLowerCase().includes(q)
+        !t.host.toLowerCase().includes(q) &&
+        !t.probe_type.toLowerCase().includes(q)
       ) {
         return false;
       }
@@ -189,7 +240,39 @@ export default function MatrixWallPage() {
       }
       return true;
     });
-  }, [data, search, groupFilter, statusFilter, cellIndex]);
+  }, [data, search, groupFilter, statusFilter, selectedProtocols, ipVersion, cellIndex]);
+
+  const targetSections = useMemo(() => {
+    if (groupBy === "protocol") {
+      return groupItemsByProtocol(filteredTargets, (t) => t).map((sec) => ({
+        key: `proto:${sec.family.id}`,
+        title: sec.family.label,
+        subtitle: sec.family.description,
+        badgeClass: sec.family.badgeClass,
+        targets: sec.items,
+      }));
+    }
+    if (groupBy === "group") {
+      return groupItemsByTargetGroup(filteredTargets, (t) => t, data?.groups ?? []).map(
+        (sec) => ({
+          key: `grp:${sec.id}`,
+          title: sec.label,
+          subtitle: sec.description,
+          badgeClass: "border-border bg-elevated text-zinc-200",
+          targets: sec.items,
+        })
+      );
+    }
+    return [
+      {
+        key: "all",
+        title: "",
+        subtitle: undefined,
+        badgeClass: undefined,
+        targets: filteredTargets,
+      },
+    ];
+  }, [filteredTargets, groupBy, data?.groups]);
 
   const kpis = useMemo(() => {
     if (!data) {
@@ -310,49 +393,95 @@ export default function MatrixWallPage() {
         </div>
 
         {/* Filters */}
-        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-surface p-3">
-          <div className="relative flex-1 min-w-[200px]">
-            <Search
-              className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-zinc-500"
-              aria-hidden="true"
-            />
-            <input
-              type="search"
-              placeholder="Search target name or IP/host..."
-              aria-label="Search targets"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="w-full rounded-md border border-border bg-canvas pl-9 pr-3 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
-            />
+        <div className="space-y-2.5 rounded-lg border border-border bg-surface p-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="relative flex-1 min-w-[200px]">
+              <Search
+                className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-zinc-500"
+                aria-hidden="true"
+              />
+              <input
+                type="search"
+                placeholder="Search target name, protocol, or IP/host..."
+                aria-label="Search targets"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="w-full rounded-md border border-border bg-canvas pl-9 pr-3 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+
+            <select
+              aria-label="Filter by group"
+              value={groupFilter}
+              onChange={(e) => setGroupFilter(e.target.value)}
+              className="rounded-md border border-border bg-canvas px-3 py-1.5 text-sm text-zinc-200 focus:border-emerald-500 focus:outline-none"
+            >
+              <option value="all">All Groups</option>
+              <option value="ungrouped">Ungrouped</option>
+              {data?.groups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+
+            <select
+              aria-label="Filter by status"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="rounded-md border border-border bg-canvas px-3 py-1.5 text-sm text-zinc-200 focus:border-emerald-500 focus:outline-none"
+            >
+              <option value="all">All Statuses</option>
+              <option value="healthy">Healthy</option>
+              <option value="degraded">Degraded</option>
+              <option value="loss">Packet Loss</option>
+              <option value="down">Down</option>
+            </select>
+
+            <div
+              role="group"
+              aria-label="Group rows by"
+              className="inline-flex rounded-md border border-border bg-canvas p-0.5 text-xs"
+            >
+              {(
+                [
+                  { id: "protocol", label: "By Protocol" },
+                  { id: "group", label: "By Group" },
+                  { id: "none", label: "Flat" },
+                ] as const
+              ).map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  data-testid={`dash-groupby-${opt.id}`}
+                  aria-pressed={groupBy === opt.id}
+                  onClick={() => setGroupBy(opt.id)}
+                  className={`rounded px-2.5 py-1 font-mono transition-colors ${
+                    groupBy === opt.id
+                      ? "bg-emerald-500 font-semibold text-zinc-950"
+                      : "text-zinc-300 hover:text-zinc-100"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
           </div>
 
-          <select
-            aria-label="Filter by group"
-            value={groupFilter}
-            onChange={(e) => setGroupFilter(e.target.value)}
-            className="rounded-md border border-border bg-canvas px-3 py-1.5 text-sm text-zinc-200 focus:border-emerald-500 focus:outline-none"
-          >
-            <option value="all">All Groups</option>
-            <option value="ungrouped">Ungrouped</option>
-            {data?.groups.map((g) => (
-              <option key={g.id} value={g.id}>
-                {g.name}
-              </option>
-            ))}
-          </select>
-
-          <select
-            aria-label="Filter by status"
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
-            className="rounded-md border border-border bg-canvas px-3 py-1.5 text-sm text-zinc-200 focus:border-emerald-500 focus:outline-none"
-          >
-            <option value="all">All Statuses</option>
-            <option value="healthy">Healthy</option>
-            <option value="degraded">Degraded</option>
-            <option value="loss">Packet Loss</option>
-            <option value="down">Down</option>
-          </select>
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2">
+            <ProtocolFilterChips
+              testIdPrefix="dash-proto"
+              selectedProtocols={selectedProtocols}
+              onToggleProtocol={toggleProtocol}
+              onClearProtocols={() => setSelectedProtocols([])}
+              ipVersion={ipVersion}
+              onChangeIpVersion={setIpVersion}
+              protocolCounts={protocolCounts}
+            />
+            <span className="text-xs font-mono text-zinc-400">
+              Showing {filteredTargets.length} of {data?.targets.length ?? 0} targets
+            </span>
+          </div>
         </div>
 
         {/* 5 UI States */}
@@ -401,101 +530,150 @@ export default function MatrixWallPage() {
             No targets match the current search or filter criteria.
           </div>
         ) : viewMode === "grid" ? (
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-            {filteredTargets.map((t) => {
-              const assignedCells = data.probes
-                .map((p) => ({ probe: p, cell: cellIndex.get(`${t.id}:${p.id}`) }))
-                .filter((item): item is { probe: typeof item.probe; cell: MatrixCell } => Boolean(item.cell));
-              return (
-                <article
-                  key={t.id}
-                  data-testid="grid-target-card"
-                  className="rounded-lg border border-border bg-surface p-4 space-y-3"
-                >
-                  <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <Link
-                          href={`/targets/${t.id}`}
-                          className="truncate text-sm font-semibold text-zinc-100 hover:text-emerald-400 transition-colors"
-                        >
-                          {t.name}
-                        </Link>
-                        <span className="rounded border border-border bg-elevated px-1.5 py-0.5 text-[10px] font-mono uppercase text-zinc-300">
-                          {t.probe_type}
-                        </span>
-                      </div>
-                      <p className="mt-0.5 truncate text-xs font-mono text-zinc-400">
-                        {t.host}
-                        {t.group_id && groupMap.get(t.group_id)
-                          ? ` · ${groupMap.get(t.group_id)}`
-                          : ""}
-                      </p>
-                    </div>
+          <div className="space-y-6">
+            {targetSections.map((section) => (
+              <section key={section.key} className="space-y-3">
+                {section.title && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/80 pb-2">
                     <div className="flex items-center gap-2">
-                      <Link
-                        href={`/targets?edit=${t.id}`}
-                        className="rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                      <span
+                        className={`rounded border px-2 py-0.5 text-xs font-mono font-semibold ${
+                          section.badgeClass ?? "border-border bg-elevated text-zinc-200"
+                        }`}
                       >
-                        Edit
-                      </Link>
-                      <Link
-                        href={`/targets/${t.id}`}
-                        className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-emerald-400 hover:border-emerald-500/60"
-                      >
-                        <span>Inspect</span>
-                        <ArrowUpRight className="h-3 w-3" aria-hidden="true" />
-                      </Link>
+                        {section.title}
+                      </span>
+                      {section.subtitle && (
+                        <span className="hidden sm:inline text-xs text-zinc-400">
+                          {section.subtitle}
+                        </span>
+                      )}
                     </div>
+                    <span className="text-xs font-mono text-zinc-400">
+                      {section.targets.length} target{section.targets.length === 1 ? "" : "s"}
+                    </span>
                   </div>
+                )}
 
-                  {assignedCells.length === 0 ? (
-                    <div className="rounded border border-dashed border-border p-4 text-center text-xs font-mono text-zinc-400">
-                      No probes assigned to this target.
-                    </div>
-                  ) : (
-                    <div
-                      className={
-                        assignedCells.length === 1
-                          ? "grid grid-cols-1"
-                          : "grid grid-cols-1 gap-2.5 sm:grid-cols-2"
-                      }
-                    >
-                      {assignedCells.map(({ probe, cell }) => {
-                        const cellSeries = sparklineToProbeSeries(
-                          probe.id,
-                          probe.name,
-                          probe.location_label || "",
-                          cell.sparkline,
-                          cell.jitter_ms,
-                          cell.warn_ms ?? null,
-                          cell.baseline_ms ?? null
-                        );
-                        return (
-                          <SmokeChartPanel
-                            key={`${t.id}:${probe.id}`}
-                            compact
-                            syncKey="matrix-grid"
-                            targetName={t.name}
-                            targetHost={t.host}
-                            rangeLabel="15m Live"
-                            baselineMs={cell.baseline_ms ?? null}
-                            warnMs={resolveEffectiveWarnMs({
-                              cellWarnMs: cell.warn_ms,
-                              target: t,
-                              probeId: probe.id,
-                              series: cellSeries,
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+                  {section.targets.map((t: Target) => {
+                    const assignedCells = data.probes
+                      .map((p) => ({ probe: p, cell: cellIndex.get(`${t.id}:${p.id}`) }))
+                      .filter((item): item is { probe: typeof item.probe; cell: MatrixCell } =>
+                        Boolean(item.cell)
+                      );
+                    return (
+                      <article
+                        key={t.id}
+                        data-testid="grid-target-card"
+                        className="rounded-lg border border-border bg-surface p-4 space-y-3"
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <Link
+                                href={`/targets/${t.id}`}
+                                className="truncate text-sm font-semibold text-zinc-100 hover:text-emerald-400 transition-colors"
+                              >
+                                {formatCleanTargetTitle(t.name, t.probe_type)}
+                              </Link>
+                              <span
+                                className={`rounded border px-1.5 py-0.5 text-[10px] font-mono uppercase ${
+                                  getProtocolFamilyMeta(t.probe_type).badgeClass
+                                }`}
+                              >
+                                {t.probe_type}
+                              </span>
+                            </div>
+                            <p className="mt-0.5 truncate text-xs font-mono text-zinc-400">
+                              {t.host}
+                              {groupBy !== "group" && t.group_id && groupMap.get(t.group_id)
+                                ? ` · ${groupMap.get(t.group_id)}`
+                                : ""}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setZoomTargetId(t.id)}
+                              data-testid="grid-zoom-btn"
+                              className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-zinc-200 hover:border-emerald-500/60 hover:text-emerald-300"
+                            >
+                              <Maximize2 className="h-3 w-3" aria-hidden="true" />
+                              <span>Zoom</span>
+                            </button>
+                            <Link
+                              href={`/targets?edit=${t.id}`}
+                              className="rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                            >
+                              Edit
+                            </Link>
+                            <Link
+                              href={`/targets/${t.id}`}
+                              className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-emerald-400 hover:border-emerald-500/60"
+                            >
+                              <span>Inspect</span>
+                              <ArrowUpRight className="h-3 w-3" aria-hidden="true" />
+                            </Link>
+                          </div>
+                        </div>
+
+                        {assignedCells.length === 0 ? (
+                          <button
+                            type="button"
+                            onClick={() => setZoomTargetId(t.id)}
+                            className="flex w-full items-center justify-center gap-2 rounded border border-dashed border-border p-4 text-center text-xs font-mono text-zinc-400 cursor-zoom-in hover:border-emerald-500/50 hover:text-zinc-200"
+                          >
+                            <Maximize2 className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
+                            <span>Waiting for probe telemetry (Click to open Zoom &amp; MTR)</span>
+                          </button>
+                        ) : (
+                          <div
+                            className={
+                              assignedCells.length === 1
+                                ? "grid grid-cols-1"
+                                : "grid grid-cols-1 gap-2.5 sm:grid-cols-2"
+                            }
+                          >
+                            {assignedCells.map(({ probe, cell }) => {
+                              const cellSeries = sparklineToProbeSeries(
+                                probe.id,
+                                probe.name,
+                                probe.location_label || "",
+                                cell.sparkline,
+                                cell.jitter_ms,
+                                cell.warn_ms ?? null,
+                                cell.baseline_ms ?? null
+                              );
+                              return (
+                                <SmokeChartPanel
+                                  key={`${t.id}:${probe.id}`}
+                                  compact
+                                  syncKey="matrix-grid"
+                                  targetName={t.name}
+                                  targetHost={t.host}
+                                  rangeLabel="15m Live"
+                                  baselineMs={cell.baseline_ms ?? null}
+                                  warnMs={resolveEffectiveWarnMs({
+                                    cellWarnMs: cell.warn_ms,
+                                    target: t,
+                                    probeId: probe.id,
+                                    series: cellSeries,
+                                  })}
+                                  showThresholdMeta={false}
+                                  series={cellSeries}
+                                  onZoomClick={() => setZoomTargetId(t.id)}
+                                />
+                              );
                             })}
-                            showThresholdMeta={false}
-                            series={cellSeries}
-                          />
-                        );
-                      })}
-                    </div>
-                  )}
-                </article>
-              );
-            })}
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              </section>
+            ))}
           </div>
         ) : (
           <div className="overflow-x-auto rounded-lg border border-border bg-surface">
@@ -539,104 +717,172 @@ export default function MatrixWallPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-border/70">
-                {filteredTargets.map((t) => (
-                  <tr key={t.id} className="hover:bg-elevated/30">
-                    <td className="sticky left-0 z-10 bg-surface px-4 py-3 border-r border-border">
-                      <Link
-                        href={`/targets/${t.id}`}
-                        className="group flex items-start justify-between gap-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 rounded"
-                      >
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="truncate text-sm font-semibold text-zinc-100 group-hover:text-emerald-400 transition-colors">
-                              {t.name}
-                            </span>
-                            <span className="rounded border border-border bg-elevated px-1.5 py-0.5 text-[10px] font-mono uppercase text-zinc-400">
-                              {t.probe_type}
+                {targetSections.map((section) => (
+                  <React.Fragment key={section.key}>
+                    {section.title && (
+                      <tr className="bg-elevated/45">
+                        <td
+                          colSpan={1 + data.probes.length}
+                          className="border-y border-border/80 px-4 py-2"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={`rounded border px-2 py-0.5 text-[11px] font-mono font-semibold ${
+                                  section.badgeClass ?? "border-border bg-surface text-zinc-200"
+                                }`}
+                              >
+                                {section.title}
+                              </span>
+                              {section.subtitle && (
+                                <span className="hidden sm:inline text-xs text-zinc-400">
+                                  {section.subtitle}
+                                </span>
+                              )}
+                            </div>
+                            <span className="text-[11px] font-mono text-zinc-400">
+                              {section.targets.length} target
+                              {section.targets.length === 1 ? "" : "s"}
                             </span>
                           </div>
-                          <p className="truncate text-xs font-mono text-zinc-400 mt-0.5">
-                            {t.host}
-                            {t.group_id && groupMap.get(t.group_id)
-                              ? ` · ${groupMap.get(t.group_id)}`
-                              : ""}
-                          </p>
-                        </div>
-                        <ArrowUpRight
-                          className="h-4 w-4 shrink-0 text-zinc-500 group-hover:text-emerald-400"
-                          aria-hidden="true"
-                        />
-                      </Link>
-                    </td>
-
-                    {data.probes.map((p) => {
-                      const cell = cellIndex.get(`${t.id}:${p.id}`);
-                      if (!cell) {
-                        return (
-                          <td
-                            key={p.id}
-                            className="border-l border-border px-3 py-3 text-center text-xs font-mono text-zinc-600"
-                          >
-                            Unassigned
-                          </td>
-                        );
-                      }
-                      const vis = statusVisuals(cell.status as CellStatus);
-                      return (
-                        <td
-                          key={p.id}
-                          className="border-l border-border p-1.5"
-                        >
-                          <Link
-                            href={`/targets/${t.id}?probe=${p.id}`}
-                            className={`block rounded-md border px-2.5 py-2 transition-colors ${vis.cellClass}`}
-                          >
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="text-sm font-bold font-mono tabular-nums text-zinc-100">
-                                {formatMs(cell.p50_ms)}
-                              </span>
-                              <span
-                                className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-mono font-semibold ${vis.badgeClass}`}
-                              >
-                                <span
-                                  className={`h-1.5 w-1.5 rounded-full ${vis.dotClass}`}
-                                />
-                                {vis.label}
-                              </span>
-                            </div>
-                            <div className="my-1.5">
-                              <MiniSparkline
-                                points={cell.sparkline ?? []}
-                                status={cell.status}
-                                warnMs={resolveEffectiveWarnMs({
-                                  cellWarnMs: cell.warn_ms,
-                                  target: t,
-                                  probeId: p.id,
-                                })}
-                              />
-                            </div>
-                            <div className="flex items-center justify-between text-[11px] font-mono tabular-nums text-zinc-400">
-                              <span>jit {formatMs(cell.jitter_ms)}</span>
-                              <span
-                                className={
-                                  cell.loss_pct > 0
-                                    ? "text-rose-400 font-semibold"
-                                    : ""
-                                }
-                              >
-                                loss {formatLoss(cell.loss_pct)}
-                              </span>
-                            </div>
-                          </Link>
                         </td>
-                      );
-                    })}
-                  </tr>
+                      </tr>
+                    )}
+                    {section.targets.map((t) => (
+                      <tr key={t.id} className="hover:bg-elevated/30">
+                        <td className="sticky left-0 z-10 bg-surface px-4 py-3 border-r border-border">
+                          <div className="flex items-start justify-between gap-2">
+                            <Link
+                              href={`/targets/${t.id}`}
+                              className="group min-w-0 flex-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 rounded"
+                            >
+                              <div className="flex items-center gap-2">
+                                <span className="truncate text-sm font-semibold text-zinc-100 group-hover:text-emerald-400 transition-colors">
+                                  {formatCleanTargetTitle(t.name, t.probe_type)}
+                                </span>
+                                <span
+                                  className={`rounded border px-1.5 py-0.5 text-[10px] font-mono uppercase ${
+                                    getProtocolFamilyMeta(t.probe_type).badgeClass
+                                  }`}
+                                >
+                                  {t.probe_type}
+                                </span>
+                              </div>
+                              <p className="truncate text-xs font-mono text-zinc-400 mt-0.5">
+                                {t.host}
+                                {groupBy !== "group" && t.group_id && groupMap.get(t.group_id)
+                                  ? ` · ${groupMap.get(t.group_id)}`
+                                  : ""}
+                              </p>
+                            </Link>
+                            <div className="flex shrink-0 items-center gap-1 pt-0.5">
+                              <button
+                                type="button"
+                                onClick={() => setZoomTargetId(t.id)}
+                                title="Zoom multi-probe graph"
+                                aria-label={`Zoom ${t.name}`}
+                                className="rounded border border-border bg-elevated p-1 text-zinc-400 hover:border-emerald-500/50 hover:text-emerald-300"
+                              >
+                                <Maximize2 className="h-3.5 w-3.5" aria-hidden="true" />
+                              </button>
+                              <Link
+                                href={`/targets/${t.id}`}
+                                title="Open full detail page"
+                                aria-label={`Inspect ${t.name}`}
+                                className="rounded p-1 text-zinc-500 hover:text-emerald-400"
+                              >
+                                <ArrowUpRight className="h-4 w-4" aria-hidden="true" />
+                              </Link>
+                            </div>
+                          </div>
+                        </td>
+
+                        {data.probes.map((p) => {
+                          const cell = cellIndex.get(`${t.id}:${p.id}`);
+                          if (!cell) {
+                            return (
+                              <td
+                                key={p.id}
+                                className="border-l border-border px-3 py-3 text-center text-xs font-mono text-zinc-600"
+                              >
+                                Unassigned
+                              </td>
+                            );
+                          }
+                          const vis = statusVisuals(cell.status as CellStatus);
+                          return (
+                            <td
+                              key={p.id}
+                              className="border-l border-border p-1.5"
+                            >
+                              <Link
+                                href={`/targets/${t.id}?probe=${p.id}`}
+                                className={`block rounded-md border px-2.5 py-2 transition-colors ${vis.cellClass}`}
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="text-sm font-bold font-mono tabular-nums text-zinc-100">
+                                    {formatMs(cell.p50_ms)}
+                                  </span>
+                                  <span
+                                    className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-mono font-semibold ${vis.badgeClass}`}
+                                  >
+                                    <span
+                                      className={`h-1.5 w-1.5 rounded-full ${vis.dotClass}`}
+                                    />
+                                    {vis.label}
+                                  </span>
+                                </div>
+                                <div className="my-1.5">
+                                  <MiniSparkline
+                                    points={cell.sparkline ?? []}
+                                    status={cell.status}
+                                    warnMs={resolveEffectiveWarnMs({
+                                      cellWarnMs: cell.warn_ms,
+                                      target: t,
+                                      probeId: p.id,
+                                    })}
+                                  />
+                                </div>
+                                <div className="flex items-center justify-between text-[11px] font-mono tabular-nums text-zinc-400">
+                                  <span>jit {formatMs(cell.jitter_ms)}</span>
+                                  <span
+                                    className={
+                                      cell.loss_pct > 0
+                                        ? "text-rose-200 font-semibold"
+                                        : ""
+                                    }
+                                  >
+                                    loss {formatLoss(cell.loss_pct)}
+                                  </span>
+                                </div>
+                              </Link>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>
           </div>
         )}
+
+        {zoomTargetId && data && (() => {
+          const zTarget = data.targets.find((t) => t.id === zoomTargetId);
+          if (!zTarget) return null;
+          return (
+            <TargetZoomModal
+              mode="dashboard"
+              target={zTarget}
+              groupName={zTarget.group_id ? groupMap.get(zTarget.group_id) : null}
+              cells={data.cells}
+              probeMap={probeMap}
+              initialRange="3h"
+              onClose={() => setZoomTargetId(null)}
+            />
+          );
+        })()}
 
         {kpis.incidents > 0 && (
           <div className="flex items-center justify-between rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">

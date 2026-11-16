@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { NocShell } from "@/components/layout/NocShell";
+import { ProtocolFilterChips } from "@/components/targets/ProtocolFilterChips";
 import {
   ApiError,
   apiRequest,
@@ -25,6 +26,15 @@ import {
   type TargetGroup,
   type TargetInput,
 } from "@/lib/api";
+import {
+  getProtocolFamily,
+  groupItemsByProtocol,
+  groupItemsByTargetGroup,
+  matchesProtocolAndIpFilter,
+  type GroupByMode,
+  type IpFamilyFilter,
+  type ProtocolFamily,
+} from "@/lib/protocol-filters";
 
 export default function TargetsPage() {
   const router = useRouter();
@@ -39,7 +49,7 @@ export default function TargetsPage() {
   const [editingTarget, setEditingTarget] = useState<Target | null>(null);
   const [tName, setTName] = useState("");
   const [tHost, setTHost] = useState("");
-  const [tType, setTType] = useState<"icmp" | "tcp" | "http" | "dns">("icmp");
+  const [tType, setTType] = useState<TargetInput["probe_type"]>("icmp");
   const [tPortOrPath, setTPortOrPath] = useState("");
   const [tGroupId, setTGroupId] = useState<string>("");
   const [tInterval, setTInterval] = useState(1);
@@ -56,12 +66,82 @@ export default function TargetsPage() {
   const [saving, setSaving] = useState(false);
   const [simNotice, setSimNotice] = useState<string | null>(null);
 
+  // List Filters & Grouping
+  const [searchQuery, setSearchQuery] = useState("");
+  const [groupFilter, setGroupFilter] = useState<string>("all");
+  const [selectedProtocols, setSelectedProtocols] = useState<ProtocolFamily[]>([]);
+  const [ipVersion, setIpVersion] = useState<IpFamilyFilter>("all");
+  const [groupBy, setGroupBy] = useState<GroupByMode>("protocol");
+
   // Group Form Modal
   const [showGroupModal, setShowGroupModal] = useState(false);
   const [editingGroup, setEditingGroup] = useState<TargetGroup | null>(null);
   const [gName, setGName] = useState("");
   const [gDesc, setGDesc] = useState("");
   const handledQueryEditRef = useRef(false);
+
+  const toggleProtocol = useCallback((proto: ProtocolFamily) => {
+    setSelectedProtocols((prev) =>
+      prev.includes(proto) ? prev.filter((p) => p !== proto) : [...prev, proto]
+    );
+  }, []);
+
+  const groupMap = useMemo(() => {
+    return new Map(groups.map((g) => [g.id, g.name]));
+  }, [groups]);
+
+  const protocolCounts = useMemo(() => {
+    const counts: Partial<Record<ProtocolFamily, number>> = {};
+    for (const t of targets) {
+      if (groupFilter !== "all" && (t.group_id ?? "ungrouped") !== groupFilter) {
+        continue;
+      }
+      const fam = getProtocolFamily(t.probe_type);
+      counts[fam] = (counts[fam] ?? 0) + 1;
+    }
+    return counts;
+  }, [targets, groupFilter]);
+
+  const filteredTargets = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return targets.filter((t) => {
+      if (groupFilter !== "all" && (t.group_id ?? "ungrouped") !== groupFilter) {
+        return false;
+      }
+      if (!matchesProtocolAndIpFilter(t, selectedProtocols, ipVersion)) {
+        return false;
+      }
+      if (
+        q &&
+        !t.name.toLowerCase().includes(q) &&
+        !t.host.toLowerCase().includes(q) &&
+        !t.probe_type.toLowerCase().includes(q)
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [targets, groupFilter, selectedProtocols, ipVersion, searchQuery]);
+
+  const targetSections = useMemo(() => {
+    if (groupBy === "protocol") {
+      return groupItemsByProtocol(filteredTargets, (t) => t).map((sec) => ({
+        key: `proto:${sec.family.id}`,
+        title: sec.family.label,
+        badgeClass: sec.family.badgeClass,
+        items: sec.items,
+      }));
+    }
+    if (groupBy === "group") {
+      return groupItemsByTargetGroup(filteredTargets, (t) => t, groups).map((sec) => ({
+        key: `grp:${sec.id}`,
+        title: sec.label,
+        badgeClass: "border-border bg-elevated text-zinc-200",
+        items: sec.items,
+      }));
+    }
+    return [{ key: "all", title: "", badgeClass: undefined, items: filteredTargets }];
+  }, [filteredTargets, groupBy, groups]);
 
   const loadAll = useCallback(async () => {
     try {
@@ -420,6 +500,80 @@ export default function TargetsPage() {
           </div>
         )}
 
+        {!loading && targets.length > 0 && (
+          <div className="space-y-2.5 rounded-lg border border-border bg-surface p-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <input
+                type="search"
+                aria-label="Search configured targets"
+                placeholder="Search target name, host, or protocol..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="flex-1 min-w-[200px] rounded-md border border-border bg-canvas px-3 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
+              />
+
+              <select
+                aria-label="Filter targets by group"
+                value={groupFilter}
+                onChange={(e) => setGroupFilter(e.target.value)}
+                className="rounded-md border border-border bg-canvas px-3 py-1.5 text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none"
+              >
+                <option value="all">All Groups</option>
+                <option value="ungrouped">Ungrouped</option>
+                {groups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+
+              <div
+                role="group"
+                aria-label="Group target rows by"
+                className="inline-flex rounded-md border border-border bg-canvas p-0.5 text-xs"
+              >
+                {(
+                  [
+                    { id: "protocol", label: "By Protocol" },
+                    { id: "group", label: "By Group" },
+                    { id: "none", label: "Flat" },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    aria-pressed={groupBy === opt.id}
+                    onClick={() => setGroupBy(opt.id)}
+                    className={`rounded px-2.5 py-1 font-mono ${
+                      groupBy === opt.id
+                        ? "bg-emerald-500 font-semibold text-zinc-950"
+                        : "text-zinc-300 hover:text-zinc-100"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2">
+              <ProtocolFilterChips
+                compact
+                testIdPrefix="targets-proto"
+                selectedProtocols={selectedProtocols}
+                onToggleProtocol={toggleProtocol}
+                onClearProtocols={() => setSelectedProtocols([])}
+                ipVersion={ipVersion}
+                onChangeIpVersion={setIpVersion}
+                protocolCounts={protocolCounts}
+              />
+              <span className="text-xs font-mono text-zinc-400">
+                {filteredTargets.length} / {targets.length} targets
+              </span>
+            </div>
+          </div>
+        )}
+
         {loading ? (
           <div className="space-y-3">
             {[1, 2, 3].map((i) => (
@@ -429,6 +583,10 @@ export default function TargetsPage() {
         ) : targets.length === 0 ? (
           <div className="rounded-lg border border-dashed border-border bg-surface p-10 text-center text-sm text-zinc-400">
             No targets configured yet. Click &ldquo;Add Target&rdquo; or &ldquo;Add Starter Presets&rdquo; to start probing.
+          </div>
+        ) : filteredTargets.length === 0 ? (
+          <div className="rounded-lg border border-border bg-surface p-8 text-center text-sm text-zinc-400">
+            No targets match the selected protocol or group filters.
           </div>
         ) : (
           <div className="overflow-x-auto rounded-lg border border-border bg-surface">
@@ -445,7 +603,28 @@ export default function TargetsPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-border/70">
-                {targets.map((t) => (
+                {targetSections.map((section) => (
+                  <React.Fragment key={section.key}>
+                    {section.title && (
+                      <tr className="bg-elevated/45">
+                        <td colSpan={7} className="border-y border-border/80 px-4 py-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span
+                              className={`rounded border px-2 py-0.5 text-[11px] font-mono font-semibold ${
+                                section.badgeClass ?? "border-border bg-surface text-zinc-200"
+                              }`}
+                            >
+                              {section.title}
+                            </span>
+                            <span className="text-[11px] font-mono text-zinc-400">
+                              {section.items.length} target
+                              {section.items.length === 1 ? "" : "s"}
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    {section.items.map((t) => (
                   <tr
                     key={t.id}
                     className={`hover:bg-elevated/40 ${t.enabled ? "" : "opacity-75"}`}
@@ -455,6 +634,11 @@ export default function TargetsPage() {
                         <Link href={`/targets/${t.id}`} className="hover:text-emerald-400">
                           {t.name}
                         </Link>
+                        {t.group_id && groupMap.get(t.group_id) && (
+                          <span className="rounded border border-border bg-canvas px-1.5 py-0.5 text-[10px] font-mono text-zinc-400">
+                            {groupMap.get(t.group_id)}
+                          </span>
+                        )}
                         {t.pinned_on_tv && (
                           <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-mono uppercase text-amber-300">
                             <Pin className="h-2.5 w-2.5" aria-hidden="true" />
@@ -558,6 +742,8 @@ export default function TargetsPage() {
                       </div>
                     </td>
                   </tr>
+                    ))}
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>
@@ -636,14 +822,18 @@ export default function TargetsPage() {
                       id="t-type"
                       value={tType}
                       onChange={(e) =>
-                        setTType(e.target.value as "icmp" | "tcp" | "http" | "dns")
+                        setTType(e.target.value as TargetInput["probe_type"])
                       }
                       className="w-full rounded-md border border-border bg-canvas px-3 py-2 text-sm text-zinc-100"
                     >
-                      <option value="icmp">ICMP Echo</option>
-                      <option value="tcp">TCP SYN-ACK Port</option>
-                      <option value="http">HTTP / HTTPS</option>
-                      <option value="dns">DNS Query</option>
+                      <option value="icmp">ICMP Echo (IPv4/Auto)</option>
+                      <option value="icmp6">ICMPv6 Echo (IPv6)</option>
+                      <option value="tcp">TCP SYN-ACK Port (IPv4/Auto)</option>
+                      <option value="tcp6">TCPv6 SYN-ACK Port (IPv6)</option>
+                      <option value="http">HTTP / HTTPS (IPv4/Auto)</option>
+                      <option value="http6">HTTP / HTTPS over IPv6</option>
+                      <option value="dns">DNS Query (IPv4/Auto)</option>
+                      <option value="dns6">DNSv6 Query (IPv6)</option>
                     </select>
                   </div>
                   <div>
@@ -655,19 +845,27 @@ export default function TargetsPage() {
                       type="text"
                       value={tHost}
                       onChange={(e) => setTHost(e.target.value)}
-                      placeholder={tType === "http" ? "https://api.example.com" : "1.1.1.1"}
+                      placeholder={
+                        tType === "http6"
+                          ? "https://[2606:4700:4700::1111]/cdn-cgi/trace"
+                          : tType === "http"
+                          ? "https://api.example.com"
+                          : tType.endsWith("6")
+                          ? "2001:4860:4860::8888"
+                          : "1.1.1.1"
+                      }
                       className="w-full rounded-md border border-border bg-canvas px-3 py-2 text-sm font-mono text-zinc-100"
                     />
                   </div>
                 </div>
 
-                {tType !== "icmp" && (
+                {tType !== "icmp" && tType !== "icmp6" && (
                   <div>
                     <label htmlFor="t-port" className="mb-1 block text-xs text-zinc-300">
-                      {tType === "tcp"
+                      {tType === "tcp" || tType === "tcp6"
                         ? "TCP Port *"
-                        : tType === "dns"
-                        ? "Query Domain|Type (e.g. cloudflare.com|A)"
+                        : tType === "dns" || tType === "dns6"
+                        ? `Query Domain|Type (e.g. cloudflare.com|${tType === "dns6" ? "AAAA" : "A"})`
                         : "HTTP Path (optional)"}
                     </label>
                     <input
@@ -676,8 +874,10 @@ export default function TargetsPage() {
                       value={tPortOrPath}
                       onChange={(e) => setTPortOrPath(e.target.value)}
                       placeholder={
-                        tType === "tcp"
+                        tType === "tcp" || tType === "tcp6"
                           ? "443"
+                          : tType === "dns6"
+                          ? "example.com|AAAA"
                           : tType === "dns"
                           ? "example.com|A"
                           : "/healthz"

@@ -5,6 +5,7 @@ import {
   partitionTargetsForTv,
   selectFocalProbeCell,
   serializeTvConfig,
+  UNGROUPED_GROUP_TOKEN,
 } from "./tv-config";
 import type { MatrixCell, Target } from "./api";
 
@@ -12,14 +13,16 @@ function makeTarget(
   id: string,
   name: string,
   groupId: string | null = null,
-  pinnedOnTv = false
+  pinnedOnTv = false,
+  probeType: Target["probe_type"] = "icmp",
+  host = "1.1.1.1"
 ): Target {
   return {
     id,
     group_id: groupId,
     name,
-    host: "1.1.1.1",
-    probe_type: "icmp",
+    host,
+    probe_type: probeType,
     port_or_path: "",
     interval_sec: 1,
     timeout_ms: 1000,
@@ -63,6 +66,9 @@ describe("tv-config helpers", () => {
     expect(cfg).toEqual({
       orientation: "portrait",
       groups: ["g1", "g2"],
+      protocols: [],
+      ipVersion: "all",
+      splitByProtocol: false,
       rotateSec: 30,
       cardsPerPage: 8,
       range: "6h",
@@ -73,6 +79,17 @@ describe("tv-config helpers", () => {
     expect(qs).toBe(
       "orientation=portrait&groups=g1%2Cg2&rotate=30&cards=8&range=6h&sound=1"
     );
+
+    const protoCfg = parseTvConfig(
+      "?groups=ungrouped,g-custom&protocols=icmp,dns&ip=ipv6&split=protocol"
+    );
+    expect(protoCfg.groups).toEqual(["ungrouped", "g-custom"]);
+    expect(protoCfg.protocols).toEqual(["icmp", "dns"]);
+    expect(protoCfg.ipVersion).toBe("ipv6");
+    expect(protoCfg.splitByProtocol).toBe(true);
+    expect(serializeTvConfig(protoCfg)).toContain("protocols=icmp%2Cdns");
+    expect(serializeTvConfig(protoCfg)).toContain("ip=ipv6");
+    expect(serializeTvConfig(protoCfg)).toContain("split=protocol");
   });
 
   it("falls back to safe defaults on invalid query values and keeps rotation static by default", () => {
@@ -216,5 +233,48 @@ describe("tv-config helpers", () => {
     expect(res.slides[0].kind).toBe("grid");
     expect(res.slides[1].kind).toBe("highlight");
     expect(res.highlightSlideIdx).toBe(1);
+  });
+
+  it("supports ungrouped targets, protocol focus filtering, and separate protocol slides", () => {
+    const targets = [
+      makeTarget("t-ungrouped", "Custom Cloudflare", null, false, "icmp", "1.1.1.1"),
+      makeTarget("t-icmp6", "Google DNSv6", "g-v6", false, "icmp6", "2001:4860:4860::8888"),
+      makeTarget("t-dns1", "CF Query", "g-dns", false, "dns", "1.1.1.1"),
+      makeTarget("t-dns2", "Google Query", "g-dns", false, "dns", "8.8.8.8"),
+      makeTarget("t-http", "Cloudflare Edge", "g-apps", false, "http", "https://1.1.1.1/cdn-cgi/trace"),
+    ];
+    const cells = targets.map((t) => makeCell(t.id, "healthy", 0, 10));
+
+    // Selecting "ungrouped" includes targets where group_id === null
+    const ungroupedOnly = partitionTargetsForTv(targets, cells, {
+      groups: [UNGROUPED_GROUP_TOKEN],
+      cardsPerPage: 4,
+    });
+    expect(ungroupedOnly.totalFiltered).toBe(1);
+    expect(ungroupedOnly.slides[0].items.map((it) => it.target.id)).toEqual(["t-ungrouped"]);
+
+    // Filtering by protocol family ("dns") + IPv4 keeps only DNS v4 queries
+    const dnsOnly = partitionTargetsForTv(targets, cells, {
+      groups: [],
+      protocols: ["dns"],
+      ipVersion: "ipv4",
+      cardsPerPage: 4,
+    });
+    expect(dnsOnly.totalFiltered).toBe(2);
+    expect(dnsOnly.slides[0].items.map((it) => it.target.id)).toEqual(["t-dns1", "t-dns2"]);
+
+    // Splitting slides by protocol separates ICMP, DNS Query, and HTTP onto distinct slides
+    const splitRes = partitionTargetsForTv(targets, cells, {
+      groups: [],
+      splitByProtocol: true,
+      cardsPerPage: 1,
+    });
+    expect(splitRes.slides.map((s) => s.label)).toEqual([
+      "ICMP 1/2",
+      "ICMP 2/2",
+      "DNS QUERY 1/2",
+      "DNS QUERY 2/2",
+      "HTTP 1/1",
+    ]);
   });
 });

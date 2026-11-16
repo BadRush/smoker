@@ -494,7 +494,7 @@ export interface components {
             name: string;
             host: string;
             /** @enum {string} */
-            probe_type: "icmp" | "tcp" | "http" | "dns";
+            probe_type: "icmp" | "icmp6" | "tcp" | "tcp6" | "http" | "http6" | "dns" | "dns6";
             port_or_path: string;
             interval_sec: number;
             timeout_ms: number;
@@ -519,7 +519,7 @@ export interface components {
             name: string;
             host: string;
             /** @enum {string} */
-            probe_type: "icmp" | "tcp" | "http" | "dns";
+            probe_type: "icmp" | "icmp6" | "tcp" | "tcp6" | "http" | "http6" | "dns" | "dns6";
             port_or_path?: string;
             interval_sec?: number;
             timeout_ms?: number;

@@ -1,15 +1,17 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Camera, Check, Download } from "lucide-react";
+import { Camera, Check, Download, Maximize2, RotateCcw } from "lucide-react";
 import type uPlot from "uplot";
 import { formatAxisTicks24, formatDateTime24 } from "@/lib/date-format";
 import { exportSmokeChartPng } from "@/lib/export-chart-png";
 import {
   classifySampleSeverity,
+  computeChartXBounds,
   computeChartYUpper,
   formatLoss,
   formatMs,
+  rangeKeyToSeconds,
   type ProbeSeriesInput,
 } from "@/lib/smoke-math";
 import { createSmokePlugin } from "./uplotSmokePlugin";
@@ -51,10 +53,12 @@ interface SmokeChartPanelProps {
   targetName?: string;
   targetHost?: string;
   rangeLabel?: string;
+  windowSec?: number | null;
   baselineMs?: number | null;
   warnMs?: number | null;
   showThresholdMeta?: boolean;
   enableExport?: boolean;
+  onZoomClick?: () => void;
 }
 
 interface HoverReadout {
@@ -75,16 +79,19 @@ export function SmokeChartPanel({
   targetName,
   targetHost,
   rangeLabel,
+  windowSec,
   baselineMs,
   warnMs,
   showThresholdMeta,
   enableExport = true,
+  onZoomClick,
 }: SmokeChartPanelProps) {
   const effectiveFillHeight = fillHeight || (fixedHeight !== undefined && fixedHeight > 0);
   const defaultHeight = compact ? (effectiveFillHeight ? 96 : 132) : 210;
   const shouldShowMeta = showThresholdMeta ?? !compact;
   const effectiveWarnMs = warnMs ?? series.warn_ms ?? null;
   const effectiveBaselineMs = baselineMs ?? series.baseline_ms ?? null;
+  const effectiveWindowSec = windowSec ?? rangeKeyToSeconds(rangeLabel);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
   const sizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
@@ -92,6 +99,16 @@ export function SmokeChartPanel({
   seriesRef.current = series;
   const warnMsRef = useRef<number | null>(effectiveWarnMs);
   warnMsRef.current = effectiveWarnMs;
+  const windowSecRef = useRef<number | null>(effectiveWindowSec);
+  windowSecRef.current = effectiveWindowSec;
+  const [isZoomed, setIsZoomed] = useState(false);
+  const isZoomedRef = useRef(false);
+  const programmaticScaleRef = useRef(false);
+  const prevWindowKeyRef = useRef<string | number | null>(
+    effectiveWindowSec ?? rangeLabel ?? null
+  );
+  const pointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
+  const suppressNextClickRef = useRef(false);
 
   const latestIdx = useMemo(() => {
     for (let i = series.timestamps.length - 1; i >= 0; i--) {
@@ -119,6 +136,23 @@ export function SmokeChartPanel({
   }, [hoverIdx, latestIdx, series]);
 
   const hasData = series.timestamps.length > 0;
+
+  function handleResetZoom() {
+    const plot = plotRef.current;
+    const bounds = computeChartXBounds(
+      seriesRef.current.timestamps,
+      windowSecRef.current
+    );
+    if (!plot || !bounds) return;
+    isZoomedRef.current = false;
+    setIsZoomed(false);
+    programmaticScaleRef.current = true;
+    try {
+      plot.setScale?.("x", { min: bounds[0], max: bounds[1] });
+    } finally {
+      programmaticScaleRef.current = false;
+    }
+  }
 
   async function handleExportPng() {
     if (!containerRef.current) return;
@@ -182,7 +216,17 @@ export function SmokeChartPanel({
           drag: { x: true, y: false },
         },
         scales: {
-          x: { time: true },
+          x: {
+            time: true,
+            range: (_u, dataMin, dataMax) => {
+              const bounds = computeChartXBounds(
+                seriesRef.current.timestamps,
+                windowSecRef.current
+              );
+              if (bounds) return bounds;
+              return [dataMin, dataMax];
+            },
+          },
           y: {
             auto: true,
             range: (_u, _min, dataMax) => {
@@ -240,16 +284,45 @@ export function SmokeChartPanel({
               setHoverIdx(idx === null || idx === undefined ? null : idx);
             },
           ],
+          setScale: [
+            (u, key) => {
+              if (key !== "x") return;
+              if (programmaticScaleRef.current) return;
+              const bounds = computeChartXBounds(
+                seriesRef.current.timestamps,
+                windowSecRef.current
+              );
+              if (!bounds) return;
+              const min = u.scales.x?.min;
+              const max = u.scales.x?.max;
+              if (min === undefined || max === undefined) return;
+              const zoomed = min > bounds[0] + 2 || max < bounds[1] - 2;
+              isZoomedRef.current = zoomed;
+              setIsZoomed(zoomed);
+            },
+          ],
         },
-        plugins: [createSmokePlugin(seriesRef, warnMsRef)],
+        plugins: [createSmokePlugin(seriesRef, warnMsRef, !compact)],
       };
 
-      plot = new UPlot(
-        opts,
-        [seriesRef.current.timestamps, seriesRef.current.p50_ms] as unknown as uPlot.AlignedData,
-        targetEl
-      );
-      plotRef.current = plot;
+      programmaticScaleRef.current = true;
+      try {
+        plot = new UPlot(
+          opts,
+          [seriesRef.current.timestamps, seriesRef.current.p50_ms] as unknown as uPlot.AlignedData,
+          targetEl
+        );
+        plotRef.current = plot;
+        const initBounds = computeChartXBounds(
+          seriesRef.current.timestamps,
+          windowSecRef.current
+        );
+        if (initBounds) {
+          plot.setScale?.("x", { min: initBounds[0], max: initBounds[1] });
+        }
+      } finally {
+        programmaticScaleRef.current = false;
+      }
 
       if (typeof ResizeObserver !== "undefined") {
         ro = new ResizeObserver((entries) => {
@@ -277,18 +350,50 @@ export function SmokeChartPanel({
         plot.destroy();
       }
       plotRef.current = null;
+      isZoomedRef.current = false;
+      setIsZoomed(false);
     };
   }, [hasData, syncKey, defaultHeight, compact, effectiveFillHeight]);
 
   useEffect(() => {
-    if (plotRef.current && series.timestamps.length > 0) {
-      plotRef.current.setData([
-        series.timestamps,
-        series.p50_ms,
-      ] as unknown as uPlot.AlignedData);
-      plotRef.current.redraw?.();
+    const nextRangeKey = effectiveWindowSec ?? rangeLabel ?? null;
+    const rangeChanged = prevWindowKeyRef.current !== nextRangeKey;
+    prevWindowKeyRef.current = nextRangeKey;
+
+    if (rangeChanged) {
+      isZoomedRef.current = false;
+      setIsZoomed(false);
     }
-  }, [series, effectiveWarnMs]);
+
+    if (plotRef.current && series.timestamps.length > 0) {
+      const shouldResetScale = rangeChanged || !isZoomedRef.current;
+      programmaticScaleRef.current = true;
+      try {
+        plotRef.current.setData(
+          [
+            series.timestamps,
+            series.p50_ms,
+          ] as unknown as uPlot.AlignedData,
+          shouldResetScale
+        );
+        if (shouldResetScale) {
+          const bounds = computeChartXBounds(
+            series.timestamps,
+            effectiveWindowSec
+          );
+          if (bounds) {
+            plotRef.current.setScale?.("x", {
+              min: bounds[0],
+              max: bounds[1],
+            });
+          }
+        }
+        plotRef.current.redraw?.();
+      } finally {
+        programmaticScaleRef.current = false;
+      }
+    }
+  }, [series, effectiveWarnMs, effectiveWindowSec, rangeLabel]);
 
   const readoutSeverity = classifySampleSeverity({
     p50: displayReadout.p50,
@@ -304,21 +409,21 @@ export function SmokeChartPanel({
       style={fixedHeight && fixedHeight > 0 ? { height: fixedHeight } : undefined}
       className={
         fixedHeight && fixedHeight > 0
-          ? "group flex shrink-0 min-h-0 flex-col rounded-md border border-border/80 bg-canvas/55 px-2.5 py-1.5 overflow-hidden"
+          ? "group flex shrink-0 min-h-0 flex-col rounded border border-border/40 bg-canvas/35 px-2 py-1 overflow-hidden"
           : effectiveFillHeight
-          ? "group flex flex-1 min-h-0 flex-col rounded-md border border-border/80 bg-canvas/55 px-2.5 py-1.5 overflow-hidden"
+          ? "group flex flex-1 min-h-0 flex-col rounded border border-border/40 bg-canvas/35 px-2 py-1 overflow-hidden"
           : compact
-          ? "group rounded-md border border-border/80 bg-canvas/50 p-2.5"
+          ? "group rounded-md border border-border/60 bg-canvas/45 p-2.5"
           : "group rounded-lg border border-border bg-surface p-4"
       }
     >
       <div
         className={
           effectiveFillHeight
-            ? "mb-1 flex shrink-0 flex-nowrap items-center justify-between gap-1.5"
+            ? "mb-1 flex shrink-0 flex-nowrap items-center justify-between gap-1.5 min-w-0"
             : compact
-            ? "mb-1.5 flex flex-wrap items-center justify-between gap-2"
-            : "mb-3 flex flex-wrap items-center justify-between gap-3"
+            ? "mb-1.5 flex flex-wrap items-center justify-between gap-2 min-w-0"
+            : "mb-3 flex flex-wrap items-center justify-between gap-3 min-w-0"
         }
       >
         <div className="min-w-0 flex-1">
@@ -340,121 +445,220 @@ export function SmokeChartPanel({
           </div>
         </div>
 
-        <div
-          className={
-            compact
-              ? "flex shrink-0 flex-nowrap items-center gap-2 whitespace-nowrap text-[11px] font-mono tabular-nums"
-              : "flex flex-wrap items-center gap-4 text-xs font-mono tabular-nums"
-          }
-        >
-          {!compact && displayReadout.ts && (
-            <span className="text-zinc-400">
-              {formatDateTime24(displayReadout.ts)}
-            </span>
-          )}
-          {!compact && (
-            <div title="Minimum RTT — best observed path latency">
-              <span className="text-zinc-400 mr-1 cursor-help">BEST</span>
-              <span className="text-zinc-200">{formatMs(displayReadout.min)}</span>
+        <div className="flex min-w-0 shrink items-center justify-end gap-1.5">
+          <div
+            className={
+              compact
+                ? "flex min-w-0 shrink items-center gap-1.5 overflow-hidden whitespace-nowrap text-[10px] sm:text-[11px] font-mono tabular-nums"
+                : "flex flex-wrap items-center gap-4 text-xs font-mono tabular-nums"
+            }
+          >
+            {!compact && displayReadout.ts && (
+              <span className="text-zinc-400">
+                {formatDateTime24(displayReadout.ts)}
+              </span>
+            )}
+            {!compact && (
+              <div title="Minimum RTT — best observed path latency">
+                <span className="text-zinc-400 mr-1 cursor-help">BEST</span>
+                <span className="text-zinc-200">{formatMs(displayReadout.min)}</span>
+              </div>
+            )}
+            <div title="Typical median latency (50th percentile)">
+              <span className="text-zinc-400 mr-1 cursor-help">NORMAL</span>
+              <span
+                className={
+                  readoutSeverity === "critical"
+                    ? "text-rose-400 font-semibold"
+                    : readoutSeverity === "warn"
+                    ? "text-amber-400 font-semibold"
+                    : "text-emerald-400 font-semibold"
+                }
+              >
+                {formatMs(displayReadout.p50)}
+              </span>
             </div>
-          )}
-          <div title="Typical median latency (50th percentile)">
-            <span className="text-zinc-400 mr-1 cursor-help">NORMAL</span>
-            <span
-              className={
-                readoutSeverity === "critical"
-                  ? "text-rose-400 font-semibold"
-                  : readoutSeverity === "warn"
-                  ? "text-amber-400 font-semibold"
-                  : "text-emerald-400 font-semibold"
-              }
-            >
-              {formatMs(displayReadout.p50)}
-            </span>
-          </div>
-          {shouldShowMeta && effectiveBaselineMs !== null && (
-            <div title="Learned best-path baseline RTT from this probe">
-              <span className="text-zinc-400 mr-1 cursor-help">BASE</span>
-              <span className="text-zinc-200">{formatMs(effectiveBaselineMs)}</span>
+            {shouldShowMeta && effectiveBaselineMs !== null && (
+              <div title="Learned best-path baseline RTT from this probe">
+                <span className="text-zinc-400 mr-1 cursor-help">BASE</span>
+                <span className="text-zinc-200">{formatMs(effectiveBaselineMs)}</span>
+              </div>
+            )}
+            {shouldShowMeta && effectiveWarnMs !== null && (
+              <div title="Auto-computed latency warning threshold for this probe">
+                <span className="text-zinc-400 mr-1 cursor-help">WARN</span>
+                <span className="text-amber-300">{formatMs(effectiveWarnMs)}</span>
+              </div>
+            )}
+            <div title="High-water latency (95th percentile, excl. top 5% spikes)">
+              <span className="text-zinc-400 mr-1 cursor-help">HIGH</span>
+              <span className="text-cyan-400">{formatMs(displayReadout.p95)}</span>
             </div>
-          )}
-          {shouldShowMeta && effectiveWarnMs !== null && (
-            <div title="Auto-computed latency warning threshold for this probe">
-              <span className="text-zinc-400 mr-1 cursor-help">WARN</span>
-              <span className="text-amber-300">{formatMs(effectiveWarnMs)}</span>
+            {!compact && (
+              <div title="Round-trip delay variation (stability)">
+                <span className="text-zinc-400 mr-1 cursor-help">JITTER</span>
+                <span className="text-zinc-300">{formatMs(displayReadout.jitter)}</span>
+              </div>
+            )}
+            <div title="Packet loss percentage">
+              <span className="text-zinc-400 mr-1 cursor-help">LOSS</span>
+              <span
+                className={
+                  displayReadout.loss > 0
+                    ? "text-rose-400 font-semibold"
+                    : "text-zinc-300"
+                }
+              >
+                {formatLoss(displayReadout.loss)}
+              </span>
             </div>
-          )}
-          <div title="High-water latency (95th percentile, excl. top 5% spikes)">
-            <span className="text-zinc-400 mr-1 cursor-help">HIGH</span>
-            <span className="text-cyan-400">{formatMs(displayReadout.p95)}</span>
-          </div>
-          {!compact && (
-            <div title="Round-trip delay variation (stability)">
-              <span className="text-zinc-400 mr-1 cursor-help">JITTER</span>
-              <span className="text-zinc-300">{formatMs(displayReadout.jitter)}</span>
-            </div>
-          )}
-          <div title="Packet loss percentage">
-            <span className="text-zinc-400 mr-1 cursor-help">LOSS</span>
-            <span
-              className={
-                displayReadout.loss > 0
-                  ? "text-rose-400 font-semibold"
-                  : "text-zinc-300"
-              }
-            >
-              {formatLoss(displayReadout.loss)}
-            </span>
           </div>
 
-          {enableExport && hasData && (
-            <button
-              type="button"
-              onClick={() => void handleExportPng()}
-              data-testid="copy-chart-png-btn"
-              title="Copy evidence graph as PNG (or download on HTTP)"
-              aria-label="Copy graph as PNG"
-              className="inline-flex items-center gap-1 rounded border border-border bg-elevated/90 px-1.5 py-0.5 text-[10px] font-mono text-zinc-200 transition-colors hover:border-cyan-500/50 hover:text-cyan-300"
-            >
-              {exportState === "copied" ? (
-                <>
-                  <Check className="h-3 w-3 text-emerald-400" aria-hidden="true" />
-                  <span className="text-emerald-400">Copied PNG</span>
-                </>
-              ) : exportState === "downloaded" ? (
-                <>
-                  <Download className="h-3 w-3 text-cyan-400" aria-hidden="true" />
-                  <span className="text-cyan-300">Saved PNG</span>
-                </>
-              ) : exportState === "error" ? (
-                <span className="text-rose-400">Export err</span>
-              ) : (
-                <>
-                  <Camera className="h-3 w-3" aria-hidden="true" />
-                  {!compact && <span>Copy PNG</span>}
-                </>
-              )}
-            </button>
-          )}
+          <div className="flex shrink-0 items-center gap-1">
+            {isZoomed && (
+              <button
+                type="button"
+                onClick={handleResetZoom}
+                data-testid="reset-zoom-btn"
+                title="Reset time zoom to full window"
+                aria-label="Reset zoom"
+                className="inline-flex items-center gap-1 rounded border border-amber-500/50 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-mono font-semibold text-amber-300 transition-colors hover:bg-amber-500/25"
+              >
+                <RotateCcw className="h-3 w-3" aria-hidden="true" />
+                {!compact && <span>Reset Zoom</span>}
+              </button>
+            )}
+
+            {onZoomClick && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onZoomClick();
+                }}
+                data-testid="zoom-chart-btn"
+                title="Zoom & inspect target graph"
+                aria-label="Zoom graph"
+                className="inline-flex items-center gap-1 rounded border border-border bg-elevated/90 px-1.5 py-0.5 text-[10px] font-mono text-zinc-200 transition-colors hover:border-emerald-500/50 hover:text-emerald-300"
+              >
+                <Maximize2 className="h-3 w-3" aria-hidden="true" />
+              </button>
+            )}
+
+            {enableExport && hasData && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void handleExportPng();
+                }}
+                data-testid="copy-chart-png-btn"
+                title="Copy evidence graph as PNG (or download on HTTP)"
+                aria-label="Copy graph as PNG"
+                className="inline-flex items-center gap-1 rounded border border-border bg-elevated/90 px-1.5 py-0.5 text-[10px] font-mono text-zinc-200 transition-colors hover:border-cyan-500/50 hover:text-cyan-300"
+              >
+                {exportState === "copied" ? (
+                  <>
+                    <Check className="h-3 w-3 text-emerald-400" aria-hidden="true" />
+                    <span className="text-emerald-400">Copied PNG</span>
+                  </>
+                ) : exportState === "downloaded" ? (
+                  <>
+                    <Download className="h-3 w-3 text-cyan-400" aria-hidden="true" />
+                    <span className="text-cyan-300">Saved PNG</span>
+                  </>
+                ) : exportState === "error" ? (
+                  <span className="text-rose-400">Export err</span>
+                ) : (
+                  <>
+                    <Camera className="h-3 w-3" aria-hidden="true" />
+                    {!compact && <span>Copy PNG</span>}
+                  </>
+                )}
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
       {series.timestamps.length === 0 ? (
-        <div
-          style={effectiveFillHeight ? undefined : { height: defaultHeight }}
-          className={
-            effectiveFillHeight
-              ? "flex flex-1 min-h-[72px] items-center justify-center rounded border border-dashed border-border bg-canvas/50 text-xs font-mono text-zinc-400"
-              : "flex items-center justify-center rounded border border-dashed border-border bg-canvas/50 text-xs font-mono text-zinc-400"
-          }
-        >
-          Waiting for telemetry samples from this probe...
-        </div>
+        onZoomClick ? (
+          <button
+            type="button"
+            onClick={onZoomClick}
+            data-testid="smoke-chart-empty-zoom"
+            style={effectiveFillHeight ? undefined : { height: defaultHeight }}
+            className={`${
+              effectiveFillHeight ? "flex-1 min-h-[72px]" : ""
+            } flex w-full flex-col items-center justify-center rounded border border-dashed border-border bg-canvas/50 px-2 text-center text-xs font-mono text-zinc-400 cursor-zoom-in transition-colors hover:border-emerald-500/40 hover:text-zinc-200`}
+          >
+            <span>Waiting for telemetry samples from this probe...</span>
+            <span className="mt-1 inline-flex items-center gap-1 text-[10px] text-emerald-400">
+              <Maximize2 className="h-3 w-3" aria-hidden="true" />
+              Click to zoom &amp; inspect MTR
+            </span>
+          </button>
+        ) : (
+          <div
+            style={effectiveFillHeight ? undefined : { height: defaultHeight }}
+            className={
+              effectiveFillHeight
+                ? "flex flex-1 min-h-[72px] items-center justify-center rounded border border-dashed border-border bg-canvas/50 text-xs font-mono text-zinc-400"
+                : "flex items-center justify-center rounded border border-dashed border-border bg-canvas/50 text-xs font-mono text-zinc-400"
+            }
+          >
+            Waiting for telemetry samples from this probe...
+          </div>
+        )
       ) : (
         <div
           ref={containerRef}
+          onDoubleClick={handleResetZoom}
+          onPointerDown={(e) => {
+            if (e.pointerType === "mouse" && e.button !== 0) return;
+            suppressNextClickRef.current = false;
+            pointerDownPosRef.current = { x: e.clientX ?? 0, y: e.clientY ?? 0 };
+          }}
+          onMouseDown={(e) => {
+            if (e.button !== 0 || pointerDownPosRef.current) return;
+            suppressNextClickRef.current = false;
+            pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
+          }}
+          onPointerCancel={() => {
+            pointerDownPosRef.current = null;
+            suppressNextClickRef.current = false;
+          }}
+          onPointerUp={(e) => {
+            const start = pointerDownPosRef.current;
+            pointerDownPosRef.current = null;
+            if (!start) return;
+            const dx = Math.abs((e.clientX ?? 0) - start.x);
+            const dy = Math.abs((e.clientY ?? 0) - start.y);
+            if (dx >= 8 || dy >= 8) {
+              suppressNextClickRef.current = true;
+            }
+          }}
+          onMouseUp={(e) => {
+            const start = pointerDownPosRef.current;
+            if (!start) return;
+            pointerDownPosRef.current = null;
+            const dx = Math.abs(e.clientX - start.x);
+            const dy = Math.abs(e.clientY - start.y);
+            if (dx >= 8 || dy >= 8) {
+              suppressNextClickRef.current = true;
+            }
+          }}
+          onClick={() => {
+            if (suppressNextClickRef.current) {
+              suppressNextClickRef.current = false;
+              return;
+            }
+            onZoomClick?.();
+          }}
           style={effectiveFillHeight ? undefined : { minHeight: defaultHeight }}
-          className={effectiveFillHeight ? "flex-1 min-h-[72px] w-full overflow-hidden" : "w-full"}
+          className={`${
+            effectiveFillHeight ? "flex-1 min-h-[72px] w-full overflow-hidden" : "w-full"
+          } ${onZoomClick ? "cursor-zoom-in" : ""}`}
         />
       )}
     </section>

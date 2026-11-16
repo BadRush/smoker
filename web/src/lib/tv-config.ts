@@ -1,5 +1,14 @@
 import type { MatrixCell, Target } from "./api";
+import {
+  groupItemsByProtocol,
+  isValidProtocolFamily,
+  matchesProtocolAndIpFilter,
+  type IpFamilyFilter,
+  type ProtocolFamily,
+} from "./protocol-filters";
 import type { CellStatus } from "./smoke-math";
+
+export const UNGROUPED_GROUP_TOKEN = "ungrouped";
 
 export type TvOrientation = "landscape" | "portrait";
 export type TvRange = "15m" | "1h" | "3h" | "6h" | "12h" | "24h" | "7d";
@@ -17,6 +26,9 @@ export const TV_RANGES: readonly TvRange[] = [
 export interface TvWallConfig {
   orientation: TvOrientation;
   groups: string[];
+  protocols: ProtocolFamily[];
+  ipVersion: IpFamilyFilter;
+  splitByProtocol: boolean;
   rotateSec: number;
   cardsPerPage: number;
   range: TvRange;
@@ -60,6 +72,9 @@ const VALID_RANGES = new Set<string>(TV_RANGES);
 export const DEFAULT_TV_CONFIG: TvWallConfig = {
   orientation: "landscape",
   groups: [],
+  protocols: [],
+  ipVersion: "all",
+  splitByProtocol: false,
   rotateSec: 0,
   cardsPerPage: 0, // 0 = Auto Best Fit
   range: "3h",
@@ -79,6 +94,24 @@ export function parseTvConfig(search: string): TvWallConfig {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+
+  const protocolsParam = params.get("protocols") ?? "";
+  const protocols: ProtocolFamily[] = [];
+  const seenProto = new Set<ProtocolFamily>();
+  for (const part of protocolsParam.split(",")) {
+    const clean = part.trim().toLowerCase();
+    if (isValidProtocolFamily(clean) && !seenProto.has(clean)) {
+      seenProto.add(clean);
+      protocols.push(clean);
+    }
+  }
+
+  const ipParam = (params.get("ip") ?? "").trim().toLowerCase();
+  const ipVersion: IpFamilyFilter =
+    ipParam === "ipv4" || ipParam === "ipv6" ? ipParam : "all";
+
+  const splitParam = (params.get("split") ?? "").trim().toLowerCase();
+  const splitByProtocol = splitParam === "protocol" || splitParam === "1" || splitParam === "true";
 
   const rotateNum = Number(params.get("rotate"));
   const rotateSec =
@@ -108,6 +141,9 @@ export function parseTvConfig(search: string): TvWallConfig {
   return {
     orientation,
     groups,
+    protocols,
+    ipVersion,
+    splitByProtocol,
     rotateSec,
     cardsPerPage,
     range,
@@ -120,6 +156,15 @@ export function serializeTvConfig(cfg: TvWallConfig): string {
   params.set("orientation", cfg.orientation);
   if (cfg.groups.length > 0) {
     params.set("groups", cfg.groups.join(","));
+  }
+  if (cfg.protocols.length > 0) {
+    params.set("protocols", cfg.protocols.join(","));
+  }
+  if (cfg.ipVersion !== "all") {
+    params.set("ip", cfg.ipVersion);
+  }
+  if (cfg.splitByProtocol) {
+    params.set("split", "protocol");
   }
   params.set("rotate", String(cfg.rotateSec));
   params.set("cards", cfg.cardsPerPage === 0 ? "auto" : String(cfg.cardsPerPage));
@@ -389,7 +434,8 @@ export function computeBestFitGrid(input: {
 export function partitionTargetsForTv(
   targets: Target[],
   cells: MatrixCell[],
-  cfg: Pick<TvWallConfig, "groups" | "cardsPerPage">,
+  cfg: Pick<TvWallConfig, "groups" | "cardsPerPage"> &
+    Partial<Pick<TvWallConfig, "protocols" | "ipVersion" | "splitByProtocol">>,
   effectiveCardsPerPage?: number
 ): {
   pinnedAlerts: TargetHealthSummary[];
@@ -400,10 +446,20 @@ export function partitionTargetsForTv(
   totalFiltered: number;
 } {
   const groupSet = new Set(cfg.groups);
+  const includeUngrouped = groupSet.has(UNGROUPED_GROUP_TOKEN);
+  const protocols = cfg.protocols ?? [];
+  const ipVersion = cfg.ipVersion ?? "all";
+
   const filtered = targets.filter((t) => {
     if (!t.enabled) return false;
-    if (groupSet.size === 0) return true;
-    return Boolean(t.group_id && groupSet.has(t.group_id));
+    if (groupSet.size > 0) {
+      if (!t.group_id) {
+        if (!includeUngrouped) return false;
+      } else if (!groupSet.has(t.group_id)) {
+        return false;
+      }
+    }
+    return matchesProtocolAndIpFilter(t, protocols, ipVersion);
   });
 
   const summaries = filtered.map((t) => summarizeTargetHealth(t, cells));
@@ -432,21 +488,40 @@ export function partitionTargetsForTv(
     cfg.cardsPerPage > 0 ? cfg.cardsPerPage : effectiveCardsPerPage ?? 12;
   const pageSize = Math.max(1, resolvedCount);
   const pages: TargetHealthSummary[][] = [];
-  for (let i = 0; i < summaries.length; i += pageSize) {
-    pages.push(summaries.slice(i, i + pageSize));
-  }
-  if (pages.length === 0) {
-    pages.push([]);
-  }
-
   const slides: TvPageSlide[] = [];
-  pages.forEach((p, idx) => {
-    slides.push({
-      kind: "grid",
-      label: `GRID ${idx + 1}/${pages.length}`,
-      items: p,
+
+  if (cfg.splitByProtocol && summaries.length > 0) {
+    const sections = groupItemsByProtocol(summaries, (s) => s.target);
+    for (const sec of sections) {
+      const secPages: TargetHealthSummary[][] = [];
+      for (let i = 0; i < sec.items.length; i += pageSize) {
+        const chunk = sec.items.slice(i, i + pageSize);
+        secPages.push(chunk);
+        pages.push(chunk);
+      }
+      secPages.forEach((chunk, idx) => {
+        slides.push({
+          kind: "grid",
+          label: `${sec.family.slideTitle} ${idx + 1}/${secPages.length}`,
+          items: chunk,
+        });
+      });
+    }
+  } else {
+    for (let i = 0; i < summaries.length; i += pageSize) {
+      pages.push(summaries.slice(i, i + pageSize));
+    }
+    if (pages.length === 0) {
+      pages.push([]);
+    }
+    pages.forEach((p, idx) => {
+      slides.push({
+        kind: "grid",
+        label: `GRID ${idx + 1}/${pages.length}`,
+        items: p,
+      });
     });
-  });
+  }
 
   let highlightSlideIdx: number | null = null;
   if (highlightItems.length > 0) {

@@ -1,6 +1,6 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import ProbesPage from "./page";
 import type { Probe } from "@/lib/api";
@@ -55,6 +55,27 @@ describe("ProbesPage", () => {
         });
       }
 
+      if (url === "/api/probes" && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          name: string;
+          location_label: string;
+          isp_asn: string;
+        };
+        const created = makeProbe({
+          id: "00000000-0000-7000-8000-000000000003",
+          name: body.name,
+          location_label: body.location_label,
+          isp_asn: body.isp_asn,
+          is_local: false,
+          status: "offline",
+        });
+        probeState.push(created);
+        return new Response(
+          JSON.stringify({ probe: created, token: "smk_live_test_token_123" }),
+          { status: 201, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
       if (url.startsWith("/api/probes/") && method === "PUT") {
         const id = url.split("/").pop() ?? "";
         const body = JSON.parse(String(init?.body ?? "{}")) as {
@@ -83,6 +104,7 @@ describe("ProbesPage", () => {
   });
 
   afterEach(() => {
+    cleanup();
     vi.restoreAllMocks();
   });
 
@@ -121,5 +143,25 @@ describe("ProbesPage", () => {
     });
     expect(await screen.findByText("NOC-Jakarta-Core")).toBeInTheDocument();
     expect(screen.getByText(/Jakarta Cyber1 · AS7713/)).toBeInTheDocument();
+  });
+
+  it("generates Cloudflared/Nginx WSS and Routed LAN/VPN WS provisioning commands for new probes", async () => {
+    const user = userEvent.setup();
+    render(<ProbesPage />);
+
+    expect(await screen.findByText("Local Central Probe")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add Probe" }));
+    await user.type(screen.getByLabelText("Probe Name *"), "Branch-SBY");
+    await user.click(screen.getByRole("button", { name: "Generate Token & Snippet" }));
+
+    expect(await screen.findByText(/Probe Enrolled: Branch-SBY/)).toBeInTheDocument();
+    expect(screen.getAllByText(/smk_live_test_token_123/).length).toBeGreaterThan(0);
+
+    // Switch to Routed / LAN / VPN IP mode and verify ws:// endpoint updates live
+    await user.click(screen.getByRole("button", { name: /Routed \/ LAN \/ VPN IP/i }));
+    const routedInput = screen.getByLabelText("Routed Central IP and port");
+    await user.clear(routedInput);
+    await user.type(routedInput, "10.20.30.40:8080");
+    expect(screen.getAllByText(/ws:\/\/10\.20\.30\.40:8080\/ws\/probe/).length).toBeGreaterThan(0);
   });
 });

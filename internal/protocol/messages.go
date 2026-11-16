@@ -96,6 +96,7 @@ type RunMTRPayload struct {
 	RequestID string `json:"request_id"`
 	TargetID  string `json:"target_id"`
 	Host      string `json:"host"`
+	ProbeType string `json:"probe_type,omitempty"`
 }
 
 type MTRHop struct {

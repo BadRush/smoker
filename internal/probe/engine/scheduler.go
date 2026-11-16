@@ -18,7 +18,7 @@ const (
 )
 
 type SampleHandler func(protocol.SampleRecord)
-type AutoMTRHandler func(targetID, host string) error
+type AutoMTRHandler func(targetID, host, probeType string) error
 
 type lossTracker struct {
 	mu              sync.Mutex
@@ -75,6 +75,7 @@ func (l *lossTracker) markFailed(now time.Time) {
 
 type targetWorker struct {
 	cfg    protocol.TargetConfig
+	ctx    context.Context
 	cancel context.CancelFunc
 }
 
@@ -107,10 +108,10 @@ func (s *Scheduler) ApplyConfig(parentCtx context.Context, targets []protocol.Ta
 		wanted[t.ID] = t
 	}
 
-	// Stop removed or changed targets
+	// Stop removed, changed, or terminated targets
 	for id, w := range s.workers {
 		next, ok := wanted[id]
-		if !ok || next != w.cfg {
+		if !ok || next != w.cfg || (w.ctx != nil && w.ctx.Err() != nil) {
 			w.cancel()
 			delete(s.workers, id)
 		}
@@ -122,7 +123,7 @@ func (s *Scheduler) ApplyConfig(parentCtx context.Context, targets []protocol.Ta
 			continue
 		}
 		ctx, cancel := context.WithCancel(parentCtx)
-		s.workers[id] = targetWorker{cfg: t, cancel: cancel}
+		s.workers[id] = targetWorker{cfg: t, ctx: ctx, cancel: cancel}
 		go s.runTargetLoop(ctx, t)
 	}
 }
@@ -162,12 +163,20 @@ func (s *Scheduler) runTargetLoop(ctx context.Context, t protocol.TargetConfig) 
 		switch t.ProbeType {
 		case "icmp":
 			rtt, err = s.icmp.Ping(probeCtx, t.Host, timeout)
+		case "icmp6":
+			rtt, err = s.icmp.PingIPv6(probeCtx, t.Host, timeout)
 		case "tcp":
 			rtt, err = ProbeTCP(probeCtx, t.Host, t.PortOrPath, timeout)
+		case "tcp6":
+			rtt, err = ProbeTCPWithNetwork(probeCtx, "tcp6", t.Host, t.PortOrPath, timeout)
 		case "http":
 			rtt, err = ProbeHTTP(probeCtx, t.Host, t.PortOrPath, timeout)
+		case "http6":
+			rtt, err = ProbeHTTPWithNetwork(probeCtx, "tcp6", t.Host, t.PortOrPath, timeout)
 		case "dns":
 			rtt, err = ProbeDNS(probeCtx, t.Host, t.PortOrPath, timeout)
+		case "dns6":
+			rtt, err = ProbeDNSWithFamily(probeCtx, true, t.Host, t.PortOrPath, timeout)
 		default:
 			return
 		}
@@ -182,11 +191,11 @@ func (s *Scheduler) runTargetLoop(ctx context.Context, t protocol.TargetConfig) 
 			rec.IsLoss = true
 			hasPrevRTT = false
 			if t.AutoMTROnLoss && tracker.record(true, t.MTRLossThreshold, time.Now()) && s.onAutoMTR != nil {
-				go func(targetID, host string) {
-					if mtrErr := s.onAutoMTR(targetID, host); mtrErr != nil {
+				go func(targetID, host, probeType string) {
+					if mtrErr := s.onAutoMTR(targetID, host, probeType); mtrErr != nil {
 						tracker.markFailed(time.Now())
 					}
-				}(t.ID, t.Host)
+				}(t.ID, t.Host, t.ProbeType)
 			}
 		} else {
 			rttUs := int32(rtt.Microseconds())

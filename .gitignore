@@ -1,7 +1,11 @@
 # Environments & Secrets
 .env
+.env.bak*
 .env.local
 .env.*.local
+.probe.env
+.probe.env.bak*
+deploy/nginx/generated-*.conf
 
 # Databases & Probe Local Buffer
 *.db
@@ -9,6 +13,7 @@
 *.db-shm
 probe-data/
 tsdb-data/
+backups/
 
 # Go Build Artifacts
 bin/

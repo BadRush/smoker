@@ -467,6 +467,7 @@ func (h *Hub) SendRunMTR(ctx context.Context, target db.Target, optionalProbeID 
 			RequestID: reqID,
 			TargetID:  target.ID.String(),
 			Host:      target.Host,
+			ProbeType: target.ProbeType,
 		}); err == nil {
 			reqIDs = append(reqIDs, reqID)
 		}

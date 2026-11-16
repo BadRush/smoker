@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -499,11 +500,25 @@ func validateTargetInput(req targetRequest) (db.TargetInput, string) {
 		return db.TargetInput{}, "Target host must be a valid IP, hostname, or URL without spaces"
 	}
 	switch pt {
-	case "icmp", "tcp", "http", "dns":
+	case "icmp", "icmp6", "tcp", "tcp6", "http", "http6", "dns", "dns6":
 	default:
-		return db.TargetInput{}, "probe_type must be one of: icmp, tcp, http, dns"
+		return db.TargetInput{}, "probe_type must be one of: icmp, icmp6, tcp, tcp6, http, http6, dns, dns6"
 	}
-	if pt == "tcp" {
+	if strings.HasSuffix(pt, "6") {
+		candidateHost := host
+		if strings.Contains(candidateHost, "://") {
+			if u, err := url.Parse(candidateHost); err == nil {
+				candidateHost = u.Hostname()
+			}
+		} else if h, _, err := net.SplitHostPort(candidateHost); err == nil && strings.HasPrefix(candidateHost, "[") {
+			candidateHost = h
+		}
+		candidateHost = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(candidateHost), "["), "]")
+		if ip := net.ParseIP(candidateHost); ip != nil && ip.To4() != nil {
+			return db.TargetInput{}, "IPv6 probe_type requires an IPv6 address or hostname, got IPv4 literal"
+		}
+	}
+	if pt == "tcp" || pt == "tcp6" {
 		port, err := strconv.Atoi(strings.TrimSpace(req.PortOrPath))
 		if err != nil || port < 1 || port > 65535 {
 			return db.TargetInput{}, "TCP probe requires port_or_path between 1 and 65535"
@@ -735,6 +750,13 @@ func (s *Server) handleListTargetMTR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, snaps)
+}
+
+func (s *Server) handleListTVTargetMTR(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeTVRequest(w, r) {
+		return
+	}
+	s.handleListTargetMTR(w, r)
 }
 
 func (s *Server) handleTriggerTargetMTR(w http.ResponseWriter, r *http.Request) {

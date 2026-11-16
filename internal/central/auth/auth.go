@@ -162,14 +162,24 @@ func (l *LoginRateLimiter) Allow(r *http.Request, now time.Time) bool {
 }
 
 func clientIP(r *http.Request) string {
+	if cfip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cfip != "" {
+		if ip := net.ParseIP(cfip); ip != nil {
+			return ip.String()
+		}
+	}
 	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
 		parts := strings.Split(xff, ",")
-		if len(parts) > 0 && strings.TrimSpace(parts[0]) != "" {
-			return strings.TrimSpace(parts[0])
+		if len(parts) > 0 {
+			candidate := strings.TrimSpace(parts[0])
+			if ip := net.ParseIP(candidate); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
-		return xri
+		if ip := net.ParseIP(xri); ip != nil {
+			return ip.String()
+		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

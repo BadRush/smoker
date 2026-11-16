@@ -19,7 +19,8 @@ export interface SmokeWarnRef {
  */
 export function createSmokePlugin(
   seriesRef: SmokeBandsRef,
-  warnMsRef?: SmokeWarnRef
+  warnMsRef?: SmokeWarnRef,
+  showWarnLabel = true
 ): uPlot.Plugin {
   return {
     hooks: {
@@ -36,6 +37,7 @@ export function createSmokePlugin(
             toY: (val) => u.valToPos(val, "y", true),
             yMax: u.scales.y?.max,
             warnMs: warnMsRef?.current ?? s.warn_ms ?? null,
+            showWarnLabel,
           });
         },
       ],

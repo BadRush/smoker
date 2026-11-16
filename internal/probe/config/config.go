@@ -18,6 +18,7 @@ type ProbeConfig struct {
 	MaxBufferMB    int
 	MaxBufferHours int
 	AgentVersion   string
+	TLSSkipVerify  bool
 }
 
 func LoadProbe() (ProbeConfig, error) {
@@ -28,6 +29,7 @@ func LoadProbe() (ProbeConfig, error) {
 		MaxBufferMB:    getEnvInt("MAX_BUFFER_MB", 1024),
 		MaxBufferHours: getEnvInt("MAX_BUFFER_HOURS", 168),
 		AgentVersion:   getEnvDefault("AGENT_VERSION", "1.0.0"),
+		TLSSkipVerify:  strings.EqualFold(getEnvDefault("PROBE_TLS_INSECURE_SKIP_VERIFY", "false"), "true"),
 	}
 	if cfg.CentralURL == "" {
 		return cfg, fmt.Errorf("CENTRAL_URL is required")

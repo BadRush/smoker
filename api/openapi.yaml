@@ -682,7 +682,7 @@ components:
         group_id: { type: string, format: uuid, nullable: true }
         name: { type: string }
         host: { type: string }
-        probe_type: { type: string, enum: [icmp, tcp, http, dns] }
+        probe_type: { type: string, enum: [icmp, icmp6, tcp, tcp6, http, http6, dns, dns6] }
         port_or_path: { type: string }
         interval_sec: { type: integer }
         timeout_ms: { type: integer }
@@ -707,7 +707,7 @@ components:
         group_id: { type: string, format: uuid, nullable: true }
         name: { type: string }
         host: { type: string }
-        probe_type: { type: string, enum: [icmp, tcp, http, dns] }
+        probe_type: { type: string, enum: [icmp, icmp6, tcp, tcp6, http, http6, dns, dns6] }
         port_or_path: { type: string }
         interval_sec: { type: integer }
         timeout_ms: { type: integer }
