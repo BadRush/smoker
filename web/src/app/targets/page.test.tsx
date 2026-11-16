@@ -150,9 +150,51 @@ describe("TargetsPage search, filters, and pagination", () => {
     await user.click(screen.getByTestId("targets-group-pill-ungrouped"));
     expect(screen.getAllByTestId("target-row")).toHaveLength(3);
 
-    // Further filter by Probe = Custom Assigned Only -> t-24 (1 item)
+    // Further filter by Probe = Custom Assigned Only -> t-24 (1 item) & displays probe name
     await user.selectOptions(screen.getByTestId("targets-probe-filter"), "custom");
     expect(screen.getAllByTestId("target-row")).toHaveLength(1);
     expect(screen.getByText("Monitor Node 24")).toBeInTheDocument();
+    expect(screen.getByText("Remote-SGP")).toBeInTheDocument();
+  });
+
+  it("validates non-empty probe selection, filters per-probe overrides, and supports Select All / Clear in target modal", async () => {
+    const user = userEvent.setup();
+    render(<TargetsPage />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("target-row")).toHaveLength(20);
+    });
+
+    await user.click(screen.getByRole("button", { name: "Add Target" }));
+    await user.type(screen.getByLabelText("Target Name *"), "Branch Probe Target");
+    await user.type(screen.getByLabelText("Host / IP / URL *"), "10.99.0.1");
+
+    // Uncheck Assign to all active & future probes -> 0 selected
+    await user.click(screen.getByLabelText("Assign to all active & future probes"));
+    expect(screen.getByText("Select Probes (0 selected):")).toBeInTheDocument();
+    // Per-Probe High-Latency Override should be hidden when 0 probes selected
+    expect(screen.queryByRole("spinbutton", { name: "Local Central" })).not.toBeInTheDocument();
+
+    // Submit without selecting any probe -> shows validation error
+    await user.click(screen.getByRole("button", { name: "Save & Sync to Probes" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Select at least one probe when 'Assign to all active & future probes' is unchecked."
+    );
+
+    // Select All -> both probes checked & overrides appear
+    await user.click(screen.getByRole("button", { name: "Select All" }));
+    expect(screen.getByText("Select Probes (2 selected):")).toBeInTheDocument();
+    expect(screen.getByRole("spinbutton", { name: "Local Central" })).toBeInTheDocument();
+    expect(screen.getByRole("spinbutton", { name: "Remote-SGP" })).toBeInTheDocument();
+
+    // Clear -> back to 0 selected, then pick only Remote-SGP
+    await user.click(screen.getByRole("button", { name: "Clear" }));
+    expect(screen.getByText("Select Probes (0 selected):")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: "Remote-SGP" }));
+    expect(screen.getByText("Select Probes (1 selected):")).toBeInTheDocument();
+    expect(screen.getByText(/Only 1 probe assigned/)).toBeInTheDocument();
+    expect(screen.queryByRole("spinbutton", { name: "Local Central" })).not.toBeInTheDocument();
+    expect(screen.getByRole("spinbutton", { name: "Remote-SGP" })).toBeInTheDocument();
   });
 });

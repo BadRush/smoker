@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Bell, CheckCircle2, Plus, Send, Trash2 } from "lucide-react";
+import { AlertTriangle, Bell, CheckCircle2, Plus, Send, Trash2 } from "lucide-react";
 import { NocShell } from "@/components/layout/NocShell";
 import { formatDateTime24 } from "@/lib/date-format";
 import {
@@ -11,6 +11,7 @@ import {
   type AlertChannel,
   type AlertRule,
   type Incident,
+  type Probe,
   type Target,
 } from "@/lib/api";
 
@@ -20,6 +21,7 @@ export default function AlertsPage() {
   const [rules, setRules] = useState<AlertRule[]>([]);
   const [channels, setChannels] = useState<AlertChannel[]>([]);
   const [targets, setTargets] = useState<Target[]>([]);
+  const [probes, setProbes] = useState<Probe[]>([]);
   const [loading, setLoading] = useState(true);
   const [feedback, setFeedback] = useState<string | null>(null);
 
@@ -38,20 +40,23 @@ export default function AlertsPage() {
   const [cName, setCName] = useState("");
   const [cBotToken, setCBotToken] = useState("");
   const [cChatId, setCChatId] = useState("");
+  const [cThreadId, setCThreadId] = useState("");
   const [cWebhookUrl, setCWebhookUrl] = useState("");
 
   const loadAlerts = useCallback(async () => {
     try {
-      const [incRes, ruleRes, chanRes, tRes] = await Promise.all([
+      const [incRes, ruleRes, chanRes, tRes, pRes] = await Promise.all([
         apiRequest<Incident[]>("/api/alerts/incidents"),
         apiRequest<AlertRule[]>("/api/alerts/rules"),
         apiRequest<AlertChannel[]>("/api/alerts/channels"),
         apiRequest<Target[]>("/api/targets"),
+        apiRequest<Probe[]>("/api/probes"),
       ]);
       setIncidents(incRes);
       setRules(ruleRes);
       setChannels(chanRes);
       setTargets(tRes);
+      setProbes(pRes);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.replace("/login");
@@ -60,6 +65,25 @@ export default function AlertsPage() {
       setLoading(false);
     }
   }, [router]);
+
+  const targetMap = useMemo(() => new Map(targets.map((t) => [t.id, t])), [targets]);
+
+  const getEffectiveProbeCount = useCallback(
+    (target: Target): number => {
+      return target.assign_all_probes ? probes.length : target.probe_ids.length;
+    },
+    [probes.length]
+  );
+
+  const selectedTarget = rTargetId ? targetMap.get(rTargetId) : undefined;
+  const selectedTargetProbeCount = selectedTarget
+    ? getEffectiveProbeCount(selectedTarget)
+    : null;
+  const formQuorumTooHigh =
+    rMetric !== "probe_offline" &&
+    selectedTargetProbeCount !== null &&
+    selectedTargetProbeCount > 0 &&
+    Number(rQuorum) > selectedTargetProbeCount;
 
   useEffect(() => {
     void loadAlerts();
@@ -93,6 +117,11 @@ export default function AlertsPage() {
   async function handleCreateChannel(e: React.FormEvent) {
     e.preventDefault();
     setFeedback(null);
+    const trimmedThreadId = cThreadId.trim();
+    if (cType === "telegram" && trimmedThreadId !== "" && !/^[1-9]\d*$/.test(trimmedThreadId)) {
+      setFeedback("Telegram Thread ID must be a positive integer.");
+      return;
+    }
     try {
       await apiRequest("/api/alerts/channels", {
         method: "POST",
@@ -101,6 +130,10 @@ export default function AlertsPage() {
           name: cName.trim(),
           bot_token: cBotToken.trim(),
           chat_id: cChatId.trim(),
+          thread_id:
+            cType === "telegram" && trimmedThreadId !== ""
+              ? Number(trimmedThreadId)
+              : undefined,
           webhook_url: cWebhookUrl.trim(),
           enabled: true,
         }),
@@ -108,6 +141,7 @@ export default function AlertsPage() {
       setCName("");
       setCBotToken("");
       setCChatId("");
+      setCThreadId("");
       setCWebhookUrl("");
       await loadAlerts();
       setFeedback("Notification channel encrypted and saved.");
@@ -249,7 +283,17 @@ export default function AlertsPage() {
                   <select
                     aria-label="Target"
                     value={rTargetId}
-                    onChange={(e) => setRTargetId(e.target.value)}
+                    onChange={(e) => {
+                      const nextId = e.target.value;
+                      setRTargetId(nextId);
+                      const t = targetMap.get(nextId);
+                      if (t) {
+                        const cnt = getEffectiveProbeCount(t);
+                        if (cnt > 0 && cnt < rQuorum) {
+                          setRQuorum(cnt);
+                        }
+                      }
+                    }}
                     className="sm:col-span-2 rounded border border-border bg-canvas px-2 py-1.5 text-xs text-zinc-100"
                   >
                     <option value="">Select Target...</option>
@@ -278,6 +322,18 @@ export default function AlertsPage() {
                   className="rounded border border-border bg-canvas px-2 py-1.5 text-xs font-mono text-zinc-100"
                 />
               </div>
+              {formQuorumTooHigh && (
+                <p
+                  role="status"
+                  data-testid="alert-quorum-warning"
+                  className="flex items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-300"
+                >
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                  <span>
+                    Target &ldquo;{selectedTarget?.name}&rdquo; is only assigned to {selectedTargetProbeCount} probe(s); quorum {rQuorum} will never trigger.
+                  </span>
+                </p>
+              )}
               <div className="flex items-center justify-between gap-2">
                 <label className="text-xs text-zinc-400">
                   Window (s):
@@ -300,13 +356,29 @@ export default function AlertsPage() {
             </form>
 
             <div className="space-y-2">
-              {rules.map((r) => (
+              {rules.map((r) => {
+                const ruleTarget = r.target_id ? targetMap.get(r.target_id) : undefined;
+                const ruleProbeCnt = ruleTarget ? getEffectiveProbeCount(ruleTarget) : null;
+                const quorumUnreachable =
+                  r.metric !== "probe_offline" &&
+                  ruleProbeCnt !== null &&
+                  ruleProbeCnt > 0 &&
+                  r.quorum_min_probes > ruleProbeCnt;
+                return (
                 <div
                   key={r.id}
-                  className="flex items-center justify-between rounded border border-border bg-elevated/40 px-3 py-2 text-xs"
+                  className="flex items-center justify-between gap-2 rounded border border-border bg-elevated/40 px-3 py-2 text-xs"
                 >
-                  <div>
-                    <p className="font-semibold text-zinc-100">{r.name}</p>
+                  <div className="space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="font-semibold text-zinc-100">{r.name}</p>
+                      {quorumUnreachable && (
+                        <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-mono text-amber-300">
+                          <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+                          <span>Quorum {r.quorum_min_probes} &gt; {ruleProbeCnt} probe(s)</span>
+                        </span>
+                      )}
+                    </div>
                     <p className="font-mono text-[11px] text-zinc-400">
                       {r.metric === "latency_p95" ? "High Latency (P95)" : r.metric} &gt;= {r.threshold_value} · {r.duration_sec}s · quorum {r.quorum_min_probes}
                     </p>
@@ -323,7 +395,8 @@ export default function AlertsPage() {
                     <Trash2 className="h-4 w-4" />
                   </button>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </section>
 
@@ -354,7 +427,7 @@ export default function AlertsPage() {
               </div>
 
               {cType === "telegram" ? (
-                <div className="grid gap-2 sm:grid-cols-2">
+                <div className="grid gap-2 sm:grid-cols-3">
                   <input
                     type="password"
                     placeholder="Bot Token"
@@ -369,6 +442,15 @@ export default function AlertsPage() {
                     aria-label="Telegram chat ID"
                     value={cChatId}
                     onChange={(e) => setCChatId(e.target.value)}
+                    className="rounded border border-border bg-canvas px-3 py-1.5 text-xs font-mono text-zinc-100"
+                  />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    placeholder="Thread ID (optional)"
+                    aria-label="Telegram thread ID"
+                    value={cThreadId}
+                    onChange={(e) => setCThreadId(e.target.value)}
                     className="rounded border border-border bg-canvas px-3 py-1.5 text-xs font-mono text-zinc-100"
                   />
                 </div>

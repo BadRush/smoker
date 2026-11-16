@@ -898,6 +898,7 @@ components:
         name: { type: string }
         bot_token: { type: string }
         chat_id: { type: string }
+        thread_id: { type: integer, format: int64, nullable: true }
         webhook_url: { type: string }
         enabled: { type: boolean }
     Incident:

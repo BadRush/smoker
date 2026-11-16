@@ -673,6 +673,8 @@ export interface components {
             name: string;
             bot_token?: string;
             chat_id?: string;
+            /** Format: int64 */
+            thread_id?: number | null;
             webhook_url?: string;
             enabled?: boolean;
         };

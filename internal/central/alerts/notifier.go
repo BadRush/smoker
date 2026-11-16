@@ -15,6 +15,7 @@ import (
 type ChannelSecret struct {
 	BotToken   string `json:"bot_token,omitempty"`
 	ChatID     string `json:"chat_id,omitempty"`
+	ThreadID   int64  `json:"thread_id,omitempty"`
 	WebhookURL string `json:"webhook_url,omitempty"`
 }
 
@@ -53,7 +54,7 @@ type AlertMessage struct {
 	Timestamp      string   `json:"timestamp"`
 }
 
-func (n *Notifier) SendTelegram(ctx context.Context, botToken, chatID string, msg AlertMessage) error {
+func (n *Notifier) SendTelegram(ctx context.Context, botToken, chatID string, threadID int64, msg AlertMessage) error {
 	if botToken == "" || chatID == "" {
 		return fmt.Errorf("telegram bot_token and chat_id required")
 	}
@@ -81,6 +82,9 @@ func (n *Notifier) SendTelegram(ctx context.Context, botToken, chatID string, ms
 		"chat_id":    chatID,
 		"text":       text,
 		"parse_mode": "Markdown",
+	}
+	if threadID > 0 {
+		payload["message_thread_id"] = threadID
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

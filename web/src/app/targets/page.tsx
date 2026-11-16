@@ -149,6 +149,16 @@ export default function TargetsPage() {
     return new Map(groups.map((g) => [g.id, g.name]));
   }, [groups]);
 
+  const probeNameMap = useMemo(() => {
+    return new Map(probes.map((p) => [p.id, p.name]));
+  }, [probes]);
+
+  const overrideProbes = useMemo(() => {
+    if (tAssignAll) return probes;
+    const selected = new Set(tProbeIds);
+    return probes.filter((p) => selected.has(p.id));
+  }, [probes, tAssignAll, tProbeIds]);
+
   const groupCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const t of targets) {
@@ -329,6 +339,16 @@ export default function TargetsPage() {
     assign_all_probes: boolean;
     probe_ids: string[];
   }): TargetInput {
+    const dedupedProbeIds = t.assign_all_probes
+      ? []
+      : Array.from(new Set(t.probe_ids));
+    const assignedSet = new Set(dedupedProbeIds);
+    const cleanedOverrides: Record<string, number> = {};
+    for (const [pid, val] of Object.entries(t.probe_latency_overrides ?? {})) {
+      if (val > 0 && (t.assign_all_probes || assignedSet.has(pid))) {
+        cleanedOverrides[pid] = val;
+      }
+    }
     return {
       name: t.name.trim(),
       host: t.host.trim(),
@@ -342,9 +362,9 @@ export default function TargetsPage() {
       mtr_loss_threshold: Number(t.mtr_loss_threshold) || 3,
       pinned_on_tv: Boolean(t.pinned_on_tv),
       latency_warn_ms: Number(t.latency_warn_ms) || 0,
-      probe_latency_overrides: t.probe_latency_overrides ?? {},
+      probe_latency_overrides: cleanedOverrides,
       assign_all_probes: t.assign_all_probes,
-      probe_ids: t.assign_all_probes ? [] : t.probe_ids,
+      probe_ids: dedupedProbeIds,
     };
   }
 
@@ -353,6 +373,12 @@ export default function TargetsPage() {
     setFormErr(null);
     if (!tName.trim() || !tHost.trim()) {
       setFormErr("Name and host are required.");
+      return;
+    }
+    if (!tAssignAll && tProbeIds.length === 0) {
+      setFormErr(
+        "Select at least one probe when 'Assign to all active & future probes' is unchecked."
+      );
       return;
     }
     setSaving(true);
@@ -913,7 +939,28 @@ export default function TargetsPage() {
                       {t.auto_mtr_on_loss ? `>= ${t.mtr_loss_threshold} loss` : "Off"}
                     </td>
                     <td className="px-4 py-3 text-zinc-300">
-                      {t.assign_all_probes ? "All Probes" : `${t.probe_ids.length} assigned`}
+                      {t.assign_all_probes ? (
+                        <span>All Probes</span>
+                      ) : t.probe_ids.length === 0 ? (
+                        <span className="inline-flex items-center rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[11px] font-mono text-amber-300">
+                          0 assigned
+                        </span>
+                      ) : (
+                        (() => {
+                          const names = t.probe_ids.map(
+                            (id) => probeNameMap.get(id) ?? id
+                          );
+                          const preview =
+                            names.length <= 2
+                              ? names.join(", ")
+                              : `${names.slice(0, 2).join(", ")} +${names.length - 2}`;
+                          return (
+                            <span title={names.join(", ")} className="font-mono text-[11px]">
+                              {preview}
+                            </span>
+                          );
+                        })()
+                      )}
                     </td>
                     <td className="px-4 py-3 text-right">
                       <div className="inline-flex items-center justify-end gap-1.5">
@@ -1278,13 +1325,85 @@ export default function TargetsPage() {
                   </div>
                 </div>
 
-                {probes.length > 0 && (
+                <div className="space-y-2 border-t border-border pt-3">
+                  <label className="flex items-center gap-2 text-xs text-zinc-200">
+                    <input
+                      type="checkbox"
+                      checked={tAssignAll}
+                      onChange={(e) => setTAssignAll(e.target.checked)}
+                      className="rounded border-border bg-canvas"
+                    />
+                    <span>Assign to all active &amp; future probes</span>
+                  </label>
+
+                  {!tAssignAll && (
+                    <div className="rounded border border-border bg-canvas p-3 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs font-medium text-zinc-300">
+                          Select Probes ({tProbeIds.length} selected):
+                        </p>
+                        {probes.length > 0 && (
+                          <div className="flex items-center gap-2 text-[11px] font-mono">
+                            <button
+                              type="button"
+                              onClick={() => setTProbeIds(probes.map((p) => p.id))}
+                              className="text-emerald-400 hover:text-emerald-300"
+                            >
+                              Select All
+                            </button>
+                            <span className="text-zinc-600">|</span>
+                            <button
+                              type="button"
+                              onClick={() => setTProbeIds([])}
+                              className="text-zinc-400 hover:text-zinc-200"
+                            >
+                              Clear
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                      {probes.length === 0 ? (
+                        <p className="text-xs text-amber-300">
+                          No probes registered yet. Register a probe in /probes or enable &ldquo;Assign to all active &amp; future probes&rdquo;.
+                        </p>
+                      ) : (
+                        <div className="grid gap-1.5 sm:grid-cols-2">
+                          {probes.map((p) => (
+                            <label key={p.id} className="flex items-center gap-2 text-xs text-zinc-200">
+                              <input
+                                type="checkbox"
+                                checked={tProbeIds.includes(p.id)}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setTProbeIds((prev) =>
+                                      prev.includes(p.id) ? prev : [...prev, p.id]
+                                    );
+                                  } else {
+                                    setTProbeIds((prev) => prev.filter((id) => id !== p.id));
+                                  }
+                                }}
+                              />
+                              <span className="truncate">{p.name}</span>
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                      {tProbeIds.length === 1 && (
+                        <p className="text-[11px] text-amber-300">
+                          Note: Only 1 probe assigned — alert rules with quorum &ge; 2 will not fire for this target unless quorum is set to 1.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {overrideProbes.length > 0 && (
                   <div className="rounded border border-border bg-canvas p-3 space-y-2">
                     <p className="text-xs font-medium text-zinc-300">
                       Per-Probe High-Latency Override (ms, 0 = Auto Best-Path Baseline):
                     </p>
                     <div className="grid gap-2 sm:grid-cols-2">
-                      {probes.map((p) => (
+                      {overrideProbes.map((p) => (
                         <div key={p.id} className="flex items-center justify-between gap-2 text-xs">
                           <label htmlFor={`probe-ov-${p.id}`} className="truncate text-zinc-300">
                             {p.name}
@@ -1361,38 +1480,7 @@ export default function TargetsPage() {
                       </div>
                     )}
                   </div>
-                  <label className="flex items-center gap-2 text-xs text-zinc-200">
-                    <input
-                      type="checkbox"
-                      checked={tAssignAll}
-                      onChange={(e) => setTAssignAll(e.target.checked)}
-                      className="rounded border-border bg-canvas"
-                    />
-                    <span>Assign to all active &amp; future probes</span>
-                  </label>
                 </div>
-
-                {!tAssignAll && probes.length > 0 && (
-                  <div className="rounded border border-border bg-canvas p-3 space-y-1.5">
-                    <p className="text-xs font-medium text-zinc-400">Select Probes:</p>
-                    {probes.map((p) => (
-                      <label key={p.id} className="flex items-center gap-2 text-xs text-zinc-200">
-                        <input
-                          type="checkbox"
-                          checked={tProbeIds.includes(p.id)}
-                          onChange={(e) => {
-                            if (e.target.checked) {
-                              setTProbeIds((prev) => [...prev, p.id]);
-                            } else {
-                              setTProbeIds((prev) => prev.filter((id) => id !== p.id));
-                            }
-                          }}
-                        />
-                        <span>{p.name}</span>
-                      </label>
-                    ))}
-                  </div>
-                )}
 
                 {formErr && (
                   <p role="alert" className="text-xs text-rose-400">

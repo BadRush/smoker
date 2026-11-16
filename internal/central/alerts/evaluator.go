@@ -308,7 +308,7 @@ func (e *Evaluator) dispatchAsync(msg AlertMessage) {
 			}
 			switch ch.Type {
 			case "telegram":
-				if err := e.notifier.SendTelegram(ctx, sec.BotToken, sec.ChatID, msg); err != nil {
+				if err := e.notifier.SendTelegram(ctx, sec.BotToken, sec.ChatID, sec.ThreadID, msg); err != nil {
 					slog.Warn("send telegram alert failed", "channel_id", ch.ID, "err", err)
 				}
 			case "webhook":

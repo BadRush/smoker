@@ -263,14 +263,57 @@ func (s *Store) RotateProbeToken(ctx context.Context, id uuid.UUID, tokenHash st
 }
 
 func (s *Store) DeleteProbe(ctx context.Context, id uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM probes WHERE id = $1 AND is_local = FALSE`, id)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, `
+		SELECT t.name
+		FROM targets t
+		WHERE t.enabled = TRUE
+		  AND t.assign_all_probes = FALSE
+		  AND EXISTS (
+			SELECT 1 FROM probe_target_assignments pta
+			WHERE pta.target_id = t.id AND pta.probe_id = $1
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM probe_target_assignments pta2
+			WHERE pta2.target_id = t.id AND pta2.probe_id <> $1
+		  )
+		ORDER BY t.name ASC
+	`, id)
+	if err != nil {
+		return mapPGError(err)
+	}
+	var blockingNames []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		blockingNames = append(blockingNames, name)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	if len(blockingNames) > 0 {
+		return &ProbeInUseError{TargetNames: blockingNames}
+	}
+
+	tag, err := tx.Exec(ctx, `DELETE FROM probes WHERE id = $1 AND is_local = FALSE`, id)
 	if err != nil {
 		return mapPGError(err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *Store) UpdateProbePresence(ctx context.Context, id uuid.UUID, status string, backlog int64, offsetMs float64, version string, seenAt time.Time) error {

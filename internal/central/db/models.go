@@ -2,6 +2,8 @@ package db
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,6 +15,18 @@ var (
 	ErrConflict     = errors.New("resource conflict")
 	ErrInvalidInput = errors.New("invalid input")
 )
+
+type ProbeInUseError struct {
+	TargetNames []string
+}
+
+func (e *ProbeInUseError) Error() string {
+	return fmt.Sprintf("probe is the sole assigned probe for active target(s): %s", strings.Join(e.TargetNames, ", "))
+}
+
+func (e *ProbeInUseError) Unwrap() error {
+	return ErrConflict
+}
 
 type AdminUser struct {
 	Username     string

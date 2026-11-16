@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -363,6 +364,12 @@ func (s *Server) handleDeleteProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.DeleteProbe(r.Context(), id); err != nil {
+		var inUse *db.ProbeInUseError
+		if errors.As(err, &inUse) {
+			writeProblem(w, r, http.StatusConflict, "probe_in_use",
+				"Cannot delete probe because it is the sole assigned probe for active target(s): "+strings.Join(inUse.TargetNames, ", "))
+			return
+		}
 		handleStoreErr(w, r, err)
 		return
 	}
@@ -567,15 +574,33 @@ func validateTargetInput(req targetRequest) (db.TargetInput, string) {
 	if latencyWarnMs < 0 || latencyWarnMs > 10000 {
 		return db.TargetInput{}, "latency_warn_ms must be between 0 and 10000"
 	}
-	cleanOverrides := make(map[string]int)
-	for k, v := range req.ProbeLatencyOverrides {
-		if _, err := uuid.Parse(k); err == nil && v > 0 && v <= 10000 {
-			cleanOverrides[k] = v
-		}
-	}
 	assignAll := true
 	if req.AssignAllProbes != nil {
 		assignAll = *req.AssignAllProbes
+	}
+	cleanProbeIDs := make([]uuid.UUID, 0, len(req.ProbeIDs))
+	assignedSet := make(map[string]bool)
+	if !assignAll {
+		seen := make(map[uuid.UUID]bool, len(req.ProbeIDs))
+		for _, pid := range req.ProbeIDs {
+			if pid == uuid.Nil || seen[pid] {
+				continue
+			}
+			seen[pid] = true
+			cleanProbeIDs = append(cleanProbeIDs, pid)
+			assignedSet[pid.String()] = true
+		}
+		if len(cleanProbeIDs) == 0 {
+			return db.TargetInput{}, "At least one probe must be selected when assign_all_probes is false"
+		}
+	}
+	cleanOverrides := make(map[string]int)
+	for k, v := range req.ProbeLatencyOverrides {
+		if _, err := uuid.Parse(k); err == nil && v > 0 && v <= 10000 {
+			if assignAll || assignedSet[k] {
+				cleanOverrides[k] = v
+			}
+		}
 	}
 
 	return db.TargetInput{
@@ -593,7 +618,7 @@ func validateTargetInput(req targetRequest) (db.TargetInput, string) {
 		LatencyWarnMs:         latencyWarnMs,
 		ProbeLatencyOverrides: cleanOverrides,
 		AssignAllProbes:       assignAll,
-		ProbeIDs:              req.ProbeIDs,
+		ProbeIDs:              cleanProbeIDs,
 	}, ""
 }
 
@@ -1003,14 +1028,42 @@ func (s *Server) handleListAlertChannels(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, channels)
 }
 
+func parseOptionalThreadID(raw json.RawMessage) (int64, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return 0, nil
+	}
+	var asNum int64
+	if err := json.Unmarshal(raw, &asNum); err == nil {
+		if asNum <= 0 {
+			return 0, errors.New("thread_id must be a positive integer")
+		}
+		return asNum, nil
+	}
+	var asStr string
+	if err := json.Unmarshal(raw, &asStr); err == nil {
+		asStr = strings.TrimSpace(asStr)
+		if asStr == "" {
+			return 0, nil
+		}
+		n, err := strconv.ParseInt(asStr, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, errors.New("thread_id must be a positive integer")
+		}
+		return n, nil
+	}
+	return 0, errors.New("thread_id must be a positive integer")
+}
+
 func (s *Server) handleCreateAlertChannel(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Type       string `json:"type"`
-		Name       string `json:"name"`
-		BotToken   string `json:"bot_token"`
-		ChatID     string `json:"chat_id"`
-		WebhookURL string `json:"webhook_url"`
-		Enabled    *bool  `json:"enabled"`
+		Type       string          `json:"type"`
+		Name       string          `json:"name"`
+		BotToken   string          `json:"bot_token"`
+		ChatID     string          `json:"chat_id"`
+		ThreadID   json.RawMessage `json:"thread_id"`
+		WebhookURL string          `json:"webhook_url"`
+		Enabled    *bool           `json:"enabled"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeProblem(w, r, http.StatusBadRequest, "bad_json", "Invalid channel payload")
@@ -1033,9 +1086,18 @@ func (s *Server) handleCreateAlertChannel(w http.ResponseWriter, r *http.Request
 			writeProblem(w, r, http.StatusBadRequest, "validation_error", "bot_token and chat_id are required for Telegram")
 			return
 		}
+		threadID, err := parseOptionalThreadID(req.ThreadID)
+		if err != nil {
+			writeProblem(w, r, http.StatusBadRequest, "validation_error", err.Error())
+			return
+		}
 		sec.BotToken = req.BotToken
 		sec.ChatID = req.ChatID
+		sec.ThreadID = threadID
 		hint = "chat:" + req.ChatID
+		if threadID > 0 {
+			hint += " · thread:" + strconv.FormatInt(threadID, 10)
+		}
 	case "webhook":
 		req.WebhookURL = strings.TrimSpace(req.WebhookURL)
 		u, err := url.Parse(req.WebhookURL)
@@ -1125,7 +1187,7 @@ func (s *Server) handleTestAlertChannel(w http.ResponseWriter, r *http.Request) 
 	var sendErr error
 	switch ch.Type {
 	case "telegram":
-		sendErr = s.notifier.SendTelegram(r.Context(), sec.BotToken, sec.ChatID, msg)
+		sendErr = s.notifier.SendTelegram(r.Context(), sec.BotToken, sec.ChatID, sec.ThreadID, msg)
 	case "webhook":
 		sendErr = s.notifier.SendWebhook(r.Context(), sec.WebhookURL, msg)
 	}

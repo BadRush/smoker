@@ -63,12 +63,16 @@ func TestNotifierTelegramAndWebhook(t *testing.T) {
 	t.Parallel()
 
 	var gotTelegramPath string
+	var gotTelegramPayloads []map[string]any
 	var gotWebhookContent string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/bot"):
 			gotTelegramPath = r.URL.Path
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotTelegramPayloads = append(gotTelegramPayloads, body)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"ok":true}`))
 		case r.URL.Path == "/webhook":
@@ -95,11 +99,21 @@ func TestNotifierTelegramAndWebhook(t *testing.T) {
 		Timestamp:      "2026-11-15T06:00:00Z",
 	}
 
-	if err := n.SendTelegram(context.Background(), "123:ABC", "-100999", msg); err != nil {
+	if err := n.SendTelegram(context.Background(), "123:ABC", "-100999", 0, msg); err != nil {
 		t.Fatalf("SendTelegram failed: %v", err)
 	}
 	if !strings.Contains(gotTelegramPath, "/bot123:ABC/sendMessage") {
 		t.Fatalf("unexpected telegram path: %s", gotTelegramPath)
+	}
+	if _, exists := gotTelegramPayloads[0]["message_thread_id"]; exists {
+		t.Fatalf("expected message_thread_id omitted when threadID=0, got %+v", gotTelegramPayloads[0])
+	}
+
+	if err := n.SendTelegram(context.Background(), "123:ABC", "-100999", 4281, msg); err != nil {
+		t.Fatalf("SendTelegram with threadID failed: %v", err)
+	}
+	if got, ok := gotTelegramPayloads[1]["message_thread_id"].(float64); !ok || int64(got) != 4281 {
+		t.Fatalf("expected message_thread_id=4281, got %+v", gotTelegramPayloads[1])
 	}
 
 	if err := n.SendWebhook(context.Background(), srv.URL+"/webhook", msg); err != nil {

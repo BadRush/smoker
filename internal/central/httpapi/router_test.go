@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"smoker/internal/central/alerts"
 	"smoker/internal/central/auth"
 	"smoker/internal/central/config"
 	"smoker/internal/central/db"
@@ -33,9 +34,10 @@ func (h *fakeHub) SendRunMTR(context.Context, db.Target, *uuid.UUID) ([]string, 
 func (h *fakeHub) BroadcastUI(string, protocol.LiveEvent) {}
 
 type fakeStore struct {
-	adminHash string
-	targets   []db.Target
-	probes    []db.Probe
+	adminHash     string
+	targets       []db.Target
+	probes        []db.Probe
+	alertChannels []db.AlertChannel
 }
 
 func (f *fakeStore) Ping(context.Context) error { return nil }
@@ -74,7 +76,18 @@ func (f *fakeStore) UpdateProbe(_ context.Context, id uuid.UUID, name, loc, isp 
 func (f *fakeStore) RotateProbeToken(context.Context, uuid.UUID, string) (db.Probe, error) {
 	return db.Probe{}, nil
 }
-func (f *fakeStore) DeleteProbe(context.Context, uuid.UUID) error             { return nil }
+func (f *fakeStore) DeleteProbe(_ context.Context, id uuid.UUID) error {
+	var blocking []string
+	for _, t := range f.targets {
+		if t.Enabled && !t.AssignAllProbes && len(t.ProbeIDs) == 1 && t.ProbeIDs[0] == id {
+			blocking = append(blocking, t.Name)
+		}
+	}
+	if len(blocking) > 0 {
+		return &db.ProbeInUseError{TargetNames: blocking}
+	}
+	return nil
+}
 func (f *fakeStore) ListGroups(context.Context) ([]db.TargetGroup, error)     { return []db.TargetGroup{}, nil }
 func (f *fakeStore) CreateGroup(context.Context, string, *uuid.UUID, string, int) (db.TargetGroup, error) {
 	return db.TargetGroup{}, nil
@@ -95,24 +108,50 @@ func (f *fakeStore) GetTarget(_ context.Context, id uuid.UUID) (db.Target, error
 	return db.Target{}, db.ErrNotFound
 }
 func (f *fakeStore) CreateTarget(_ context.Context, in db.TargetInput) (db.Target, error) {
+	probeIDs := in.ProbeIDs
+	if probeIDs == nil {
+		probeIDs = []uuid.UUID{}
+	}
+	overrides := in.ProbeLatencyOverrides
+	if overrides == nil {
+		overrides = map[string]int{}
+	}
 	t := db.Target{
-		ID:              uuid.New(),
-		Name:            in.Name,
-		Host:            in.Host,
-		ProbeType:       in.ProbeType,
-		IntervalSec:     in.IntervalSec,
-		TimeoutMs:       in.TimeoutMs,
-		Enabled:         in.Enabled,
-		AssignAllProbes: in.AssignAllProbes,
-		ProbeIDs:        []uuid.UUID{},
-		CreatedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
+		ID:                    uuid.New(),
+		Name:                  in.Name,
+		Host:                  in.Host,
+		ProbeType:             in.ProbeType,
+		IntervalSec:           in.IntervalSec,
+		TimeoutMs:             in.TimeoutMs,
+		Enabled:               in.Enabled,
+		AssignAllProbes:       in.AssignAllProbes,
+		ProbeIDs:              probeIDs,
+		ProbeLatencyOverrides: overrides,
+		CreatedAt:             time.Now().UTC(),
+		UpdatedAt:             time.Now().UTC(),
 	}
 	f.targets = append(f.targets, t)
 	return t, nil
 }
-func (f *fakeStore) UpdateTarget(context.Context, uuid.UUID, db.TargetInput) (db.Target, error) {
-	return db.Target{}, nil
+func (f *fakeStore) UpdateTarget(_ context.Context, id uuid.UUID, in db.TargetInput) (db.Target, error) {
+	for i, existing := range f.targets {
+		if existing.ID == id {
+			probeIDs := in.ProbeIDs
+			if probeIDs == nil {
+				probeIDs = []uuid.UUID{}
+			}
+			existing.Name = in.Name
+			existing.Host = in.Host
+			existing.ProbeType = in.ProbeType
+			existing.Enabled = in.Enabled
+			existing.AssignAllProbes = in.AssignAllProbes
+			existing.ProbeIDs = probeIDs
+			existing.ProbeLatencyOverrides = in.ProbeLatencyOverrides
+			f.targets[i] = existing
+			return existing, nil
+		}
+	}
+	return db.Target{}, db.ErrNotFound
 }
 func (f *fakeStore) DeleteTarget(context.Context, uuid.UUID) error { return nil }
 func (f *fakeStore) SeedPublicMonitors(context.Context, bool) (db.SeedResult, error) {
@@ -174,12 +213,29 @@ func (f *fakeStore) UpdateAlertRule(context.Context, uuid.UUID, db.AlertRuleInpu
 	return db.AlertRule{}, nil
 }
 func (f *fakeStore) DeleteAlertRule(context.Context, uuid.UUID) error             { return nil }
-func (f *fakeStore) ListAlertChannels(context.Context) ([]db.AlertChannel, error) { return []db.AlertChannel{}, nil }
-func (f *fakeStore) GetAlertChannel(context.Context, uuid.UUID) (db.AlertChannel, error) {
+func (f *fakeStore) ListAlertChannels(context.Context) ([]db.AlertChannel, error) {
+	return f.alertChannels, nil
+}
+func (f *fakeStore) GetAlertChannel(_ context.Context, id uuid.UUID) (db.AlertChannel, error) {
+	for _, ch := range f.alertChannels {
+		if ch.ID == id {
+			return ch, nil
+		}
+	}
 	return db.AlertChannel{}, db.ErrNotFound
 }
-func (f *fakeStore) CreateAlertChannel(context.Context, string, string, []byte, string, bool) (db.AlertChannel, error) {
-	return db.AlertChannel{}, nil
+func (f *fakeStore) CreateAlertChannel(_ context.Context, chType, name string, enc []byte, hint string, enabled bool) (db.AlertChannel, error) {
+	ch := db.AlertChannel{
+		ID:              uuid.New(),
+		Type:            chType,
+		Name:            name,
+		ConfigEncrypted: enc,
+		ConfigHint:      hint,
+		Enabled:         enabled,
+		CreatedAt:       time.Now().UTC(),
+	}
+	f.alertChannels = append(f.alertChannels, ch)
+	return ch, nil
 }
 func (f *fakeStore) DeleteAlertChannel(context.Context, uuid.UUID) error      { return nil }
 func (f *fakeStore) ListIncidents(context.Context, int) ([]db.Incident, error) { return []db.Incident{}, nil }
@@ -529,5 +585,155 @@ func TestTargetSeriesEnrichesWarnThreshold(t *testing.T) {
 	}
 	if len(out.Series) != 1 || out.Series[0].WarnMs == nil || *out.Series[0].WarnMs != 25 {
 		t.Fatalf("expected series[0].warn_ms = 25, got %+v", out.Series)
+	}
+}
+
+func TestTargetPerProbeValidationAndDeleteGuard(t *testing.T) {
+	pwHash, _ := auth.HashPassword("supersecret123")
+	probeA := uuid.New()
+	probeB := uuid.New()
+	store := &fakeStore{
+		adminHash: pwHash,
+		probes: []db.Probe{
+			{ID: probeA, Name: "Probe-JKT"},
+			{ID: probeB, Name: "Probe-SGP"},
+		},
+	}
+	cfg := config.CentralConfig{
+		JWTSecret:        "test-jwt-secret-at-least-32-chars!!",
+		AppEncryptionKey: "test-aes-secret-at-least-32-chars!!",
+		CookieSecure:     "false",
+	}
+	router := NewRouter(Dependencies{
+		Config: cfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		Hub:    &fakeHub{},
+		AESKey: auth.DeriveAESKey(cfg.AppEncryptionKey),
+	})
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"username":"admin","password":"supersecret123"}`))
+	loginRec := httptest.NewRecorder()
+	router.ServeHTTP(loginRec, loginReq)
+	sessionCookie := loginRec.Result().Cookies()[0]
+
+	// 1. assign_all_probes=false with empty probe_ids -> 400 validation_error
+	emptyReq := httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{"name":"Edge-Only","host":"1.1.1.1","probe_type":"icmp","assign_all_probes":false,"probe_ids":[]}`))
+	emptyReq.AddCookie(sessionCookie)
+	emptyRec := httptest.NewRecorder()
+	router.ServeHTTP(emptyRec, emptyReq)
+	if emptyRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when probe_ids empty, got %d (%s)", emptyRec.Code, emptyRec.Body.String())
+	}
+
+	// 2. Deduplicates probe_ids and prunes overrides for unassigned probes
+	createBody := `{"name":"Branch-GW","host":"10.20.30.1","probe_type":"icmp","assign_all_probes":false,"probe_ids":["` + probeA.String() + `","` + probeA.String() + `"],"probe_latency_overrides":{"` + probeA.String() + `":45,"` + probeB.String() + `":90}}`
+	createReq := httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(createBody))
+	createReq.AddCookie(sessionCookie)
+	createRec := httptest.NewRecorder()
+	router.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create target = %d (%s), want 201", createRec.Code, createRec.Body.String())
+	}
+	var created db.Target
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created target: %v", err)
+	}
+	if len(created.ProbeIDs) != 1 || created.ProbeIDs[0] != probeA {
+		t.Fatalf("expected deduplicated probe_ids [%s], got %+v", probeA, created.ProbeIDs)
+	}
+	if _, hasB := created.ProbeLatencyOverrides[probeB.String()]; hasB {
+		t.Fatalf("expected override for unassigned probeB to be pruned, got %+v", created.ProbeLatencyOverrides)
+	}
+	if created.ProbeLatencyOverrides[probeA.String()] != 45 {
+		t.Fatalf("expected override for probeA = 45, got %+v", created.ProbeLatencyOverrides)
+	}
+
+	// 3. Updating target with assign_all_probes=false & empty probe_ids -> 400
+	updEmptyReq := httptest.NewRequest(http.MethodPut, "/api/targets/"+created.ID.String(), bytes.NewBufferString(`{"name":"Branch-GW","host":"10.20.30.1","probe_type":"icmp","assign_all_probes":false,"probe_ids":[]}`))
+	updEmptyReq.AddCookie(sessionCookie)
+	updEmptyRec := httptest.NewRecorder()
+	router.ServeHTTP(updEmptyRec, updEmptyReq)
+	if updEmptyRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on update with empty probe_ids, got %d", updEmptyRec.Code)
+	}
+
+	// 4. Deleting probeA while it is the sole assigned probe of active target -> 409 Conflict
+	delBlockedReq := httptest.NewRequest(http.MethodDelete, "/api/probes/"+probeA.String(), nil)
+	delBlockedReq.AddCookie(sessionCookie)
+	delBlockedRec := httptest.NewRecorder()
+	router.ServeHTTP(delBlockedRec, delBlockedReq)
+	if delBlockedRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict deleting sole active probe, got %d (%s)", delBlockedRec.Code, delBlockedRec.Body.String())
+	}
+	if !bytes.Contains(delBlockedRec.Body.Bytes(), []byte("Branch-GW")) {
+		t.Fatalf("expected conflict message to mention Branch-GW, got %s", delBlockedRec.Body.String())
+	}
+
+	// 5. Deleting unassigned probeB succeeds -> 204
+	delOkReq := httptest.NewRequest(http.MethodDelete, "/api/probes/"+probeB.String(), nil)
+	delOkReq.AddCookie(sessionCookie)
+	delOkRec := httptest.NewRecorder()
+	router.ServeHTTP(delOkRec, delOkReq)
+	if delOkRec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 deleting unassigned probeB, got %d", delOkRec.Code)
+	}
+}
+
+func TestTelegramAlertChannelWithThreadID(t *testing.T) {
+	pwHash, _ := auth.HashPassword("supersecret123")
+	store := &fakeStore{adminHash: pwHash}
+	cfg := config.CentralConfig{
+		JWTSecret:        "test-jwt-secret-at-least-32-chars!!",
+		AppEncryptionKey: "test-aes-secret-at-least-32-chars!!",
+		CookieSecure:     "false",
+	}
+	router := NewRouter(Dependencies{
+		Config: cfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		Hub:    &fakeHub{},
+		AESKey: auth.DeriveAESKey(cfg.AppEncryptionKey),
+	})
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"username":"admin","password":"supersecret123"}`))
+	loginRec := httptest.NewRecorder()
+	router.ServeHTTP(loginRec, loginReq)
+	sessionCookie := loginRec.Result().Cookies()[0]
+
+	// Invalid thread_id -> 400
+	badReq := httptest.NewRequest(http.MethodPost, "/api/alerts/channels", bytes.NewBufferString(`{"type":"telegram","name":"NOC Topic","bot_token":"123:ABC","chat_id":"-1001234","thread_id":-5}`))
+	badReq.AddCookie(sessionCookie)
+	badRec := httptest.NewRecorder()
+	router.ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for negative thread_id, got %d (%s)", badRec.Code, badRec.Body.String())
+	}
+
+	// Valid thread_id -> 201 and hint includes thread:<id>
+	okReq := httptest.NewRequest(http.MethodPost, "/api/alerts/channels", bytes.NewBufferString(`{"type":"telegram","name":"NOC Topic","bot_token":"123:ABC","chat_id":"-1001234","thread_id":7788}`))
+	okReq.AddCookie(sessionCookie)
+	okRec := httptest.NewRecorder()
+	router.ServeHTTP(okRec, okReq)
+	if okRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating telegram channel with thread_id, got %d (%s)", okRec.Code, okRec.Body.String())
+	}
+	var ch db.AlertChannel
+	if err := json.Unmarshal(okRec.Body.Bytes(), &ch); err != nil {
+		t.Fatalf("decode created channel: %v", err)
+	}
+	if ch.ConfigHint != "chat:-1001234 · thread:7788" {
+		t.Fatalf("unexpected config_hint: %q", ch.ConfigHint)
+	}
+	plain, err := auth.DecryptAESGCM(auth.DeriveAESKey(cfg.AppEncryptionKey), store.alertChannels[0].ConfigEncrypted)
+	if err != nil {
+		t.Fatalf("decrypt secret: %v", err)
+	}
+	var sec alerts.ChannelSecret
+	if err := json.Unmarshal(plain, &sec); err != nil {
+		t.Fatalf("unmarshal secret: %v", err)
+	}
+	if sec.ThreadID != 7788 {
+		t.Fatalf("expected stored ThreadID=7788, got %d", sec.ThreadID)
 	}
 }

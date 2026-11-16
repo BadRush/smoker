@@ -27,6 +27,7 @@ export default function ProbesPage() {
   const [probes, setProbes] = useState<Probe[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const [showModal, setShowModal] = useState(false);
   const [editingProbe, setEditingProbe] = useState<Probe | null>(null);
@@ -150,6 +151,7 @@ export default function ProbesPage() {
   }
 
   async function handleRotate(id: string) {
+    setActionError(null);
     try {
       const res = await apiRequest<CreateProbeResponse>(
         `/api/probes/${id}/rotate-token`,
@@ -157,16 +159,17 @@ export default function ProbesPage() {
       );
       setProvisioned(res);
     } catch (err) {
-      setError(err instanceof ApiError ? err.detail : "Rotate token failed");
+      setActionError(err instanceof ApiError ? err.detail : "Rotate token failed");
     }
   }
 
   async function handleDelete(id: string) {
+    setActionError(null);
     try {
       await apiRequest(`/api/probes/${id}`, { method: "DELETE" });
       await loadProbes();
     } catch (err) {
-      setError(err instanceof ApiError ? err.detail : "Delete probe failed");
+      setActionError(err instanceof ApiError ? err.detail : "Delete probe failed");
     }
   }
 
@@ -245,6 +248,23 @@ MAX_BUFFER_HOURS=168`
             <span>Add Probe</span>
           </button>
         </div>
+
+        {actionError && (
+          <div
+            role="alert"
+            className="flex items-start justify-between gap-3 rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-xs text-rose-200"
+          >
+            <span>{actionError}</span>
+            <button
+              type="button"
+              onClick={() => setActionError(null)}
+              aria-label="Dismiss error"
+              className="rounded p-0.5 text-rose-300 hover:text-white"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
 
         {/* One-time Enrollment Snippets */}
         {provisioned && (
