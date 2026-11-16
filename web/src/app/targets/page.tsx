@@ -4,6 +4,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
+  ChevronLeft,
+  ChevronRight,
   Copy,
   Flame,
   FolderPlus,
@@ -12,6 +14,8 @@ import {
   Pin,
   Play,
   Plus,
+  RotateCcw,
+  Search,
   Sparkles,
   Trash2,
   X,
@@ -28,6 +32,7 @@ import {
 } from "@/lib/api";
 import {
   getProtocolFamily,
+  getProtocolFamilyMeta,
   groupItemsByProtocol,
   groupItemsByTargetGroup,
   matchesProtocolAndIpFilter,
@@ -35,6 +40,22 @@ import {
   type IpFamilyFilter,
   type ProtocolFamily,
 } from "@/lib/protocol-filters";
+import {
+  computeVisiblePageNumbers,
+  DEFAULT_TARGET_FILTERS,
+  filterAndSortTargets,
+  hasActiveTargetFilters,
+  matchesStatusAndProbe,
+  orderTargetsForSections,
+  PAGE_SIZE_OPTIONS,
+  paginateItems,
+  parseTargetTableFilters,
+  serializeTargetTableFilters,
+  type TargetPageSize,
+  type TargetSortOption,
+  type TargetStatusFilter,
+  type TargetTableFilters,
+} from "@/lib/target-table";
 
 export default function TargetsPage() {
   const router = useRouter();
@@ -66,12 +87,8 @@ export default function TargetsPage() {
   const [saving, setSaving] = useState(false);
   const [simNotice, setSimNotice] = useState<string | null>(null);
 
-  // List Filters & Grouping
-  const [searchQuery, setSearchQuery] = useState("");
-  const [groupFilter, setGroupFilter] = useState<string>("all");
-  const [selectedProtocols, setSelectedProtocols] = useState<ProtocolFamily[]>([]);
-  const [ipVersion, setIpVersion] = useState<IpFamilyFilter>("all");
-  const [groupBy, setGroupBy] = useState<GroupByMode>("protocol");
+  // List Filters, Sorting, Grouping & Pagination (URL-synced)
+  const [filters, setFilters] = useState<TargetTableFilters>(DEFAULT_TARGET_FILTERS);
 
   // Group Form Modal
   const [showGroupModal, setShowGroupModal] = useState(false);
@@ -80,68 +97,126 @@ export default function TargetsPage() {
   const [gDesc, setGDesc] = useState("");
   const handledQueryEditRef = useRef(false);
 
-  const toggleProtocol = useCallback((proto: ProtocolFamily) => {
-    setSelectedProtocols((prev) =>
-      prev.includes(proto) ? prev.filter((p) => p !== proto) : [...prev, proto]
-    );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setFilters(parseTargetTableFilters(window.location.search));
   }, []);
+
+  const updateFilters = useCallback(
+    (
+      updater: (prev: TargetTableFilters) => TargetTableFilters,
+      resetPage = true
+    ) => {
+      setFilters((prev) => {
+        const updated = updater(prev);
+        const next: TargetTableFilters = resetPage
+          ? { ...updated, page: 1 }
+          : updated;
+        if (typeof window !== "undefined") {
+          const qs = serializeTargetTableFilters(next, window.location.search);
+          const nextUrl = qs
+            ? `${window.location.pathname}?${qs}`
+            : window.location.pathname;
+          window.history.replaceState(null, "", nextUrl);
+        }
+        return next;
+      });
+    },
+    []
+  );
+
+  const toggleProtocol = useCallback(
+    (proto: ProtocolFamily) => {
+      updateFilters((prev) => ({
+        ...prev,
+        protocols: prev.protocols.includes(proto)
+          ? prev.protocols.filter((p) => p !== proto)
+          : [...prev.protocols, proto],
+      }));
+    },
+    [updateFilters]
+  );
+
+  const resetAllFilters = useCallback(() => {
+    updateFilters((prev) => ({
+      ...DEFAULT_TARGET_FILTERS,
+      groupBy: prev.groupBy,
+      pageSize: prev.pageSize,
+    }));
+  }, [updateFilters]);
 
   const groupMap = useMemo(() => {
     return new Map(groups.map((g) => [g.id, g.name]));
   }, [groups]);
 
+  const groupCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const t of targets) {
+      const key = t.group_id ?? "ungrouped";
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+  }, [targets]);
+
   const protocolCounts = useMemo(() => {
     const counts: Partial<Record<ProtocolFamily, number>> = {};
     for (const t of targets) {
-      if (groupFilter !== "all" && (t.group_id ?? "ungrouped") !== groupFilter) {
+      if (filters.group !== "all" && (t.group_id ?? "ungrouped") !== filters.group) {
+        continue;
+      }
+      if (!matchesStatusAndProbe(t, filters.status, filters.probeId)) {
+        continue;
+      }
+      if (!matchesProtocolAndIpFilter(t, [], filters.ipVersion)) {
         continue;
       }
       const fam = getProtocolFamily(t.probe_type);
       counts[fam] = (counts[fam] ?? 0) + 1;
     }
     return counts;
-  }, [targets, groupFilter]);
+  }, [targets, filters.group, filters.status, filters.probeId, filters.ipVersion]);
 
-  const filteredTargets = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    return targets.filter((t) => {
-      if (groupFilter !== "all" && (t.group_id ?? "ungrouped") !== groupFilter) {
-        return false;
-      }
-      if (!matchesProtocolAndIpFilter(t, selectedProtocols, ipVersion)) {
-        return false;
-      }
-      if (
-        q &&
-        !t.name.toLowerCase().includes(q) &&
-        !t.host.toLowerCase().includes(q) &&
-        !t.probe_type.toLowerCase().includes(q)
-      ) {
-        return false;
-      }
-      return true;
-    });
-  }, [targets, groupFilter, selectedProtocols, ipVersion, searchQuery]);
+  const filteredTargets = useMemo(
+    () => filterAndSortTargets(targets, groupMap, filters),
+    [targets, groupMap, filters]
+  );
 
-  const targetSections = useMemo(() => {
-    if (groupBy === "protocol") {
-      return groupItemsByProtocol(filteredTargets, (t) => t).map((sec) => ({
+  const orderedTargets = useMemo(
+    () => orderTargetsForSections(filteredTargets, groups, filters.groupBy),
+    [filteredTargets, groups, filters.groupBy]
+  );
+
+  const paged = useMemo(
+    () => paginateItems(orderedTargets, filters.page, filters.pageSize),
+    [orderedTargets, filters.page, filters.pageSize]
+  );
+
+  const visiblePages = useMemo(
+    () => computeVisiblePageNumbers(paged.safePage, paged.totalPages),
+    [paged.safePage, paged.totalPages]
+  );
+
+  const pageSections = useMemo(() => {
+    if (filters.groupBy === "protocol") {
+      return groupItemsByProtocol(paged.pageItems, (t) => t).map((sec) => ({
         key: `proto:${sec.family.id}`,
         title: sec.family.label,
         badgeClass: sec.family.badgeClass,
         items: sec.items,
       }));
     }
-    if (groupBy === "group") {
-      return groupItemsByTargetGroup(filteredTargets, (t) => t, groups).map((sec) => ({
+    if (filters.groupBy === "group") {
+      return groupItemsByTargetGroup(paged.pageItems, (t) => t, groups).map((sec) => ({
         key: `grp:${sec.id}`,
         title: sec.label,
         badgeClass: "border-border bg-elevated text-zinc-200",
         items: sec.items,
       }));
     }
-    return [{ key: "all", title: "", badgeClass: undefined, items: filteredTargets }];
-  }, [filteredTargets, groupBy, groups]);
+    return [{ key: "all", title: "", badgeClass: undefined, items: paged.pageItems }];
+  }, [paged.pageItems, filters.groupBy, groups]);
+
+  const filtersActive = useMemo(() => hasActiveTargetFilters(filters), [filters]);
 
   const loadAll = useCallback(async () => {
     try {
@@ -415,6 +490,9 @@ export default function TargetsPage() {
 
   async function handleDeleteGroup(id: string) {
     await apiRequest(`/api/groups/${id}`, { method: "DELETE" });
+    if (filters.group === id) {
+      updateFilters((prev) => ({ ...prev, group: "all" }));
+    }
     await loadAll();
   }
 
@@ -459,32 +537,79 @@ export default function TargetsPage() {
           </div>
         </div>
 
-        {groups.length > 0 && (
-          <div className="flex flex-wrap gap-2">
-            {groups.map((g) => (
-              <span
-                key={g.id}
-                className="inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1 text-xs text-zinc-300"
+        {(groups.length > 0 || (groupCounts.get("ungrouped") ?? 0) > 0) && (
+          <div className="flex flex-wrap items-center gap-2">
+            {groups.map((g) => {
+              const active = filters.group === g.id;
+              const cnt = groupCounts.get(g.id) ?? 0;
+              return (
+                <span
+                  key={g.id}
+                  className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs transition-colors ${
+                    active
+                      ? "border-emerald-500/70 bg-emerald-500/15 text-emerald-200"
+                      : "border-border bg-surface text-zinc-300"
+                  }`}
+                >
+                  <button
+                    type="button"
+                    data-testid={`targets-group-pill-${g.id}`}
+                    aria-pressed={active}
+                    onClick={() =>
+                      updateFilters((prev) => ({
+                        ...prev,
+                        group: prev.group === g.id ? "all" : g.id,
+                      }))
+                    }
+                    className="inline-flex items-center gap-1.5 font-medium hover:text-emerald-300"
+                  >
+                    <span>{g.name}</span>
+                    <span className="font-mono text-[10px] text-zinc-400">
+                      {cnt}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Edit group ${g.name}`}
+                    onClick={() => openEditGroup(g)}
+                    className="text-zinc-400 hover:text-emerald-400"
+                  >
+                    <Pencil className="h-3 w-3" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Delete group ${g.name}`}
+                    onClick={() => void handleDeleteGroup(g.id)}
+                    className="text-zinc-400 hover:text-rose-400"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </span>
+              );
+            })}
+            {(groupCounts.get("ungrouped") ?? 0) > 0 && (
+              <button
+                type="button"
+                data-testid="targets-group-pill-ungrouped"
+                aria-pressed={filters.group === "ungrouped"}
+                onClick={() =>
+                  updateFilters((prev) => ({
+                    ...prev,
+                    group: prev.group === "ungrouped" ? "all" : "ungrouped",
+                  }))
+                }
+                className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs transition-colors ${
+                  filters.group === "ungrouped"
+                    ? "border-emerald-500/70 bg-emerald-500/15 text-emerald-200 font-medium"
+                    : "border-border bg-surface text-zinc-300 hover:text-emerald-300"
+                }`}
               >
-                <span>{g.name}</span>
-                <button
-                  type="button"
-                  aria-label={`Edit group ${g.name}`}
-                  onClick={() => openEditGroup(g)}
-                  className="text-zinc-400 hover:text-emerald-400"
-                >
-                  <Pencil className="h-3 w-3" />
-                </button>
-                <button
-                  type="button"
-                  aria-label={`Delete group ${g.name}`}
-                  onClick={() => void handleDeleteGroup(g.id)}
-                  className="text-zinc-400 hover:text-rose-400"
-                >
-                  <X className="h-3 w-3" />
-                </button>
-              </span>
-            ))}
+                <span>Ungrouped</span>
+                <span className="font-mono text-[10px] text-zinc-400">
+                  {groupCounts.get("ungrouped") ?? 0}
+                </span>
+              </button>
+            )}
           </div>
         )}
 
@@ -502,74 +627,176 @@ export default function TargetsPage() {
 
         {!loading && targets.length > 0 && (
           <div className="space-y-2.5 rounded-lg border border-border bg-surface p-3">
-            <div className="flex flex-wrap items-center gap-3">
-              <input
-                type="search"
-                aria-label="Search configured targets"
-                placeholder="Search target name, host, or protocol..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="flex-1 min-w-[200px] rounded-md border border-border bg-canvas px-3 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
-              />
+            <div className="flex flex-wrap items-center gap-2.5">
+              <div className="relative flex-1 min-w-[220px]">
+                <Search
+                  className="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-zinc-500"
+                  aria-hidden="true"
+                />
+                <input
+                  type="search"
+                  data-testid="targets-search-input"
+                  aria-label="Search configured targets"
+                  placeholder="Search name, host/IP, port/domain, protocol, or group..."
+                  value={filters.q}
+                  onChange={(e) =>
+                    updateFilters((prev) => ({ ...prev, q: e.target.value }))
+                  }
+                  className="w-full rounded-md border border-border bg-canvas pl-8 pr-7 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
+                />
+                {filters.q && (
+                  <button
+                    type="button"
+                    aria-label="Clear search"
+                    onClick={() => updateFilters((prev) => ({ ...prev, q: "" }))}
+                    className="absolute right-2 top-1.5 rounded p-0.5 text-zinc-400 hover:text-zinc-100"
+                  >
+                    <X className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                )}
+              </div>
 
               <select
                 aria-label="Filter targets by group"
-                value={groupFilter}
-                onChange={(e) => setGroupFilter(e.target.value)}
-                className="rounded-md border border-border bg-canvas px-3 py-1.5 text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none"
+                data-testid="targets-group-filter"
+                value={filters.group}
+                onChange={(e) =>
+                  updateFilters((prev) => ({ ...prev, group: e.target.value }))
+                }
+                className="rounded-md border border-border bg-canvas px-2.5 py-1.5 text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none"
               >
-                <option value="all">All Groups</option>
-                <option value="ungrouped">Ungrouped</option>
+                <option value="all">All Groups ({targets.length})</option>
+                <option value="ungrouped">
+                  Ungrouped ({groupCounts.get("ungrouped") ?? 0})
+                </option>
                 {groups.map((g) => (
                   <option key={g.id} value={g.id}>
-                    {g.name}
+                    {g.name} ({groupCounts.get(g.id) ?? 0})
                   </option>
                 ))}
               </select>
 
-              <div
-                role="group"
-                aria-label="Group target rows by"
-                className="inline-flex rounded-md border border-border bg-canvas p-0.5 text-xs"
+              <select
+                aria-label="Filter targets by status"
+                data-testid="targets-status-filter"
+                value={filters.status}
+                onChange={(e) =>
+                  updateFilters((prev) => ({
+                    ...prev,
+                    status: e.target.value as TargetStatusFilter,
+                  }))
+                }
+                className="rounded-md border border-border bg-canvas px-2.5 py-1.5 text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none"
               >
-                {(
-                  [
-                    { id: "protocol", label: "By Protocol" },
-                    { id: "group", label: "By Group" },
-                    { id: "none", label: "Flat" },
-                  ] as const
-                ).map((opt) => (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    aria-pressed={groupBy === opt.id}
-                    onClick={() => setGroupBy(opt.id)}
-                    className={`rounded px-2.5 py-1 font-mono ${
-                      groupBy === opt.id
-                        ? "bg-emerald-500 font-semibold text-zinc-950"
-                        : "text-zinc-300 hover:text-zinc-100"
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
+                <option value="all">All States</option>
+                <option value="active">Active Only</option>
+                <option value="paused">Paused Only</option>
+                <option value="vip">VIP TV Pinned</option>
+                <option value="auto_mtr">Auto-MTR Enabled</option>
+              </select>
+
+              <select
+                aria-label="Filter targets by probe assignment"
+                data-testid="targets-probe-filter"
+                value={filters.probeId}
+                onChange={(e) =>
+                  updateFilters((prev) => ({ ...prev, probeId: e.target.value }))
+                }
+                className="rounded-md border border-border bg-canvas px-2.5 py-1.5 text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none"
+              >
+                <option value="all">All Probe Scopes</option>
+                <option value="assign_all">Broadcast (All Probes)</option>
+                <option value="custom">Custom Assigned Only</option>
+                {probes.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    Monitored by: {p.name}
+                  </option>
                 ))}
-              </div>
+              </select>
+
+              <select
+                aria-label="Sort targets by"
+                data-testid="targets-sort-select"
+                value={filters.sortBy}
+                onChange={(e) =>
+                  updateFilters((prev) => ({
+                    ...prev,
+                    sortBy: e.target.value as TargetSortOption,
+                  }))
+                }
+                className="rounded-md border border-border bg-canvas px-2.5 py-1.5 text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none"
+              >
+                <option value="name_asc">Sort: Name (A–Z)</option>
+                <option value="name_desc">Sort: Name (Z–A)</option>
+                <option value="protocol">Sort: Protocol</option>
+                <option value="interval_asc">Sort: Poll Interval</option>
+                <option value="newest">Sort: Newest First</option>
+                <option value="oldest">Sort: Oldest First</option>
+              </select>
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2">
               <ProtocolFilterChips
                 compact
                 testIdPrefix="targets-proto"
-                selectedProtocols={selectedProtocols}
+                selectedProtocols={filters.protocols}
                 onToggleProtocol={toggleProtocol}
-                onClearProtocols={() => setSelectedProtocols([])}
-                ipVersion={ipVersion}
-                onChangeIpVersion={setIpVersion}
+                onClearProtocols={() =>
+                  updateFilters((prev) => ({ ...prev, protocols: [] }))
+                }
+                ipVersion={filters.ipVersion}
+                onChangeIpVersion={(ip: IpFamilyFilter) =>
+                  updateFilters((prev) => ({ ...prev, ipVersion: ip }))
+                }
                 protocolCounts={protocolCounts}
               />
-              <span className="text-xs font-mono text-zinc-400">
-                {filteredTargets.length} / {targets.length} targets
-              </span>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <div
+                  role="group"
+                  aria-label="Group target rows by"
+                  className="inline-flex rounded-md border border-border bg-canvas p-0.5 text-xs"
+                >
+                  {(
+                    [
+                      { id: "protocol", label: "By Protocol" },
+                      { id: "group", label: "By Group" },
+                      { id: "none", label: "Flat" },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      aria-pressed={filters.groupBy === opt.id}
+                      onClick={() =>
+                        updateFilters((prev) => ({
+                          ...prev,
+                          groupBy: opt.id as GroupByMode,
+                        }))
+                      }
+                      className={`rounded px-2.5 py-1 font-mono ${
+                        filters.groupBy === opt.id
+                          ? "bg-emerald-500 font-semibold text-zinc-950"
+                          : "text-zinc-300 hover:text-zinc-100"
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+
+                {filtersActive && (
+                  <button
+                    type="button"
+                    data-testid="targets-reset-filters-btn"
+                    onClick={resetAllFilters}
+                    className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2.5 py-1 text-[11px] font-mono text-zinc-200 hover:border-emerald-500/50 hover:text-emerald-300"
+                  >
+                    <RotateCcw className="h-3 w-3" aria-hidden="true" />
+                    <span>Reset Filters</span>
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         )}
@@ -584,81 +811,98 @@ export default function TargetsPage() {
           <div className="rounded-lg border border-dashed border-border bg-surface p-10 text-center text-sm text-zinc-400">
             No targets configured yet. Click &ldquo;Add Target&rdquo; or &ldquo;Add Starter Presets&rdquo; to start probing.
           </div>
-        ) : filteredTargets.length === 0 ? (
-          <div className="rounded-lg border border-border bg-surface p-8 text-center text-sm text-zinc-400">
-            No targets match the selected protocol or group filters.
+        ) : paged.totalItems === 0 ? (
+          <div className="flex flex-col items-center justify-center gap-3 rounded-lg border border-border bg-surface p-8 text-center text-sm text-zinc-400">
+            <span>No targets match the current search or filter criteria.</span>
+            {filtersActive && (
+              <button
+                type="button"
+                onClick={resetAllFilters}
+                className="inline-flex items-center gap-1.5 rounded border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-xs font-mono text-emerald-300 hover:bg-emerald-500/25"
+              >
+                <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Reset All Filters</span>
+              </button>
+            )}
           </div>
         ) : (
-          <div className="overflow-x-auto rounded-lg border border-border bg-surface">
-            <table className="w-full text-left text-xs">
-              <thead className="border-b border-border bg-elevated/60 text-zinc-400 uppercase font-mono">
-                <tr>
-                  <th className="px-4 py-3">Name</th>
-                  <th className="px-4 py-3">Host / Endpoint</th>
-                  <th className="px-4 py-3">Type</th>
-                  <th className="px-4 py-3">Interval / Warn RTT</th>
-                  <th className="px-4 py-3">Auto MTR</th>
-                  <th className="px-4 py-3">Probes</th>
-                  <th className="px-4 py-3 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border/70">
-                {targetSections.map((section) => (
-                  <React.Fragment key={section.key}>
-                    {section.title && (
-                      <tr className="bg-elevated/45">
-                        <td colSpan={7} className="border-y border-border/80 px-4 py-2">
-                          <div className="flex items-center justify-between gap-2">
-                            <span
-                              className={`rounded border px-2 py-0.5 text-[11px] font-mono font-semibold ${
-                                section.badgeClass ?? "border-border bg-surface text-zinc-200"
-                              }`}
-                            >
-                              {section.title}
+          <div className="space-y-3">
+            <div className="overflow-x-auto rounded-lg border border-border bg-surface">
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-border bg-elevated/60 text-zinc-400 uppercase font-mono">
+                  <tr>
+                    <th className="px-4 py-3">Name</th>
+                    <th className="px-4 py-3">Host / Endpoint</th>
+                    <th className="px-4 py-3">Type</th>
+                    <th className="px-4 py-3">Interval / Warn RTT</th>
+                    <th className="px-4 py-3">Auto MTR</th>
+                    <th className="px-4 py-3">Probes</th>
+                    <th className="px-4 py-3 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/70">
+                  {pageSections.map((section) => (
+                    <React.Fragment key={section.key}>
+                      {section.title && (
+                        <tr className="bg-elevated/45">
+                          <td colSpan={7} className="border-y border-border/80 px-4 py-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span
+                                className={`rounded border px-2 py-0.5 text-[11px] font-mono font-semibold ${
+                                  section.badgeClass ?? "border-border bg-surface text-zinc-200"
+                                }`}
+                              >
+                                {section.title}
+                              </span>
+                              <span className="text-[11px] font-mono text-zinc-400">
+                                {section.items.length} on page
+                              </span>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      {section.items.map((t) => (
+                    <tr
+                      key={t.id}
+                      data-testid="target-row"
+                      className={`hover:bg-elevated/40 ${t.enabled ? "" : "opacity-75"}`}
+                    >
+                      <td className="px-4 py-3 font-semibold text-zinc-100">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <Link href={`/targets/${t.id}`} className="hover:text-emerald-400">
+                            {t.name}
+                          </Link>
+                          {t.group_id && groupMap.get(t.group_id) && (
+                            <span className="rounded border border-border bg-canvas px-1.5 py-0.5 text-[10px] font-mono text-zinc-400">
+                              {groupMap.get(t.group_id)}
                             </span>
-                            <span className="text-[11px] font-mono text-zinc-400">
-                              {section.items.length} target
-                              {section.items.length === 1 ? "" : "s"}
+                          )}
+                          {t.pinned_on_tv && (
+                            <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-mono uppercase text-amber-300">
+                              <Pin className="h-2.5 w-2.5" aria-hidden="true" />
+                              VIP TV
                             </span>
-                          </div>
-                        </td>
-                      </tr>
-                    )}
-                    {section.items.map((t) => (
-                  <tr
-                    key={t.id}
-                    className={`hover:bg-elevated/40 ${t.enabled ? "" : "opacity-75"}`}
-                  >
-                    <td className="px-4 py-3 font-semibold text-zinc-100">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <Link href={`/targets/${t.id}`} className="hover:text-emerald-400">
-                          {t.name}
-                        </Link>
-                        {t.group_id && groupMap.get(t.group_id) && (
-                          <span className="rounded border border-border bg-canvas px-1.5 py-0.5 text-[10px] font-mono text-zinc-400">
-                            {groupMap.get(t.group_id)}
-                          </span>
-                        )}
-                        {t.pinned_on_tv && (
-                          <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-mono uppercase text-amber-300">
-                            <Pin className="h-2.5 w-2.5" aria-hidden="true" />
-                            VIP TV
-                          </span>
-                        )}
-                        {!t.enabled && (
-                          <span className="rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-mono uppercase text-amber-300">
-                            Paused
-                          </span>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 font-mono text-zinc-300">
-                      {t.host}
-                      {t.port_or_path ? ` (${t.port_or_path})` : ""}
-                    </td>
-                    <td className="px-4 py-3 font-mono uppercase text-emerald-400">
-                      {t.probe_type}
-                    </td>
+                          )}
+                          {!t.enabled && (
+                            <span className="rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-mono uppercase text-amber-300">
+                              Paused
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 font-mono text-zinc-300">
+                        {t.host}
+                        {t.port_or_path ? ` (${t.port_or_path})` : ""}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={`rounded border px-1.5 py-0.5 text-[10px] font-mono uppercase ${
+                            getProtocolFamilyMeta(t.probe_type).badgeClass
+                          }`}
+                        >
+                          {t.probe_type}
+                        </span>
+                      </td>
                     <td className="px-4 py-3 font-mono tabular-nums text-zinc-300">
                       {t.interval_sec}s /{" "}
                       {t.latency_warn_ms && t.latency_warn_ms > 0
@@ -747,6 +991,108 @@ export default function TargetsPage() {
                 ))}
               </tbody>
             </table>
+            </div>
+
+            {/* Pagination Footer Bar */}
+            <div
+              data-testid="targets-pagination"
+              className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-surface px-4 py-2.5 text-xs"
+            >
+              <div className="flex flex-wrap items-center gap-3 font-mono text-zinc-400">
+                <span data-testid="targets-pagination-summary">
+                  Showing {paged.startIdx}–{paged.endIdx} of {paged.totalItems} target
+                  {paged.totalItems === 1 ? "" : "s"}
+                  {paged.totalItems !== targets.length
+                    ? ` (filtered from ${targets.length})`
+                    : ""}
+                </span>
+                <select
+                  aria-label="Targets per page"
+                  data-testid="targets-page-size"
+                  value={filters.pageSize}
+                  onChange={(e) =>
+                    updateFilters((prev) => ({
+                      ...prev,
+                      pageSize: Number(e.target.value) as TargetPageSize,
+                    }))
+                  }
+                  className="rounded border border-border bg-canvas px-2 py-1 text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none"
+                >
+                  {PAGE_SIZE_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {paged.totalPages > 1 && (
+                <div className="flex flex-wrap items-center gap-1">
+                  <button
+                    type="button"
+                    data-testid="targets-page-prev"
+                    disabled={paged.safePage <= 1}
+                    onClick={() =>
+                      updateFilters(
+                        (prev) => ({ ...prev, page: Math.max(1, paged.safePage - 1) }),
+                        false
+                      )
+                    }
+                    className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2.5 py-1 font-mono text-zinc-200 hover:border-zinc-500 disabled:opacity-40 disabled:pointer-events-none"
+                  >
+                    <ChevronLeft className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Prev</span>
+                  </button>
+
+                  {visiblePages.map((p, idx) =>
+                    p === "ellipsis" ? (
+                      <span
+                        key={`ell-${idx}`}
+                        className="px-1.5 font-mono text-zinc-500"
+                      >
+                        …
+                      </span>
+                    ) : (
+                      <button
+                        key={p}
+                        type="button"
+                        data-testid={`targets-page-${p}`}
+                        aria-current={paged.safePage === p ? "page" : undefined}
+                        onClick={() =>
+                          updateFilters((prev) => ({ ...prev, page: p }), false)
+                        }
+                        className={`min-w-[30px] rounded border px-2 py-1 text-center font-mono ${
+                          paged.safePage === p
+                            ? "border-emerald-500 bg-emerald-500 font-semibold text-zinc-950"
+                            : "border-border bg-elevated text-zinc-300 hover:border-zinc-500"
+                        }`}
+                      >
+                        {p}
+                      </button>
+                    )
+                  )}
+
+                  <button
+                    type="button"
+                    data-testid="targets-page-next"
+                    disabled={paged.safePage >= paged.totalPages}
+                    onClick={() =>
+                      updateFilters(
+                        (prev) => ({
+                          ...prev,
+                          page: Math.min(paged.totalPages, paged.safePage + 1),
+                        }),
+                        false
+                      )
+                    }
+                    className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2.5 py-1 font-mono text-zinc-200 hover:border-zinc-500 disabled:opacity-40 disabled:pointer-events-none"
+                  >
+                    <span>Next</span>
+                    <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         )}
 
