@@ -13,6 +13,7 @@ import {
   Pause,
   Pin,
   Play,
+  Radio,
   Search,
   Settings2,
   Volume2,
@@ -59,6 +60,7 @@ import {
 import {
   computeBestFitGrid,
   DEFAULT_TV_CONFIG,
+  groupSummariesByProbe,
   loadTvConfigFromStorage,
   MANUAL_CARD_OPTIONS,
   parseTvConfig,
@@ -72,6 +74,7 @@ import {
   type TargetHealthSummary,
   type TvGridLayout,
   type TvOrientation,
+  type TvProbeDisplayMode,
   type TvRange,
   type TvWallConfig,
 } from "@/lib/tv-config";
@@ -128,18 +131,24 @@ function FocalTargetCard({
   isHighlight = false,
 }: FocalTargetCardProps) {
   const { target, worstStatus, cells, isPinnedVip, isImpaired } = item;
+  const isPerProbeCard = Boolean(item.focalProbeId);
   const vis = statusVisuals(worstStatus);
   const groupName = target.group_id ? groupMap.get(target.group_id) : null;
   const protoMeta = getProtocolFamilyMeta(target.probe_type);
   const cleanTitle = formatCleanTargetTitle(target.name, target.probe_type);
   const targetSeries = seriesByTarget[target.id] ?? [];
   const seriesMap = new Map(targetSeries.map((s) => [s.probe_id, s]));
-  const focalCell = selectFocalProbeCell(cells, selectedProbeId);
+  const focalCell = item.focalProbeId
+    ? cells.find((c) => c.probe_id === item.focalProbeId) ?? null
+    : selectFocalProbeCell(cells, selectedProbeId);
+  const focalProbeLabel =
+    item.focalProbeName ??
+    (focalCell ? probeMap.get(focalCell.probe_id) ?? "Probe" : "Probe");
   const focalSeries = focalCell
     ? mergeProbeSeriesWithCell(
         seriesMap.get(focalCell.probe_id),
         focalCell,
-        probeMap.get(focalCell.probe_id) ?? "Probe",
+        focalProbeLabel,
         range
       )
     : null;
@@ -206,14 +215,30 @@ function FocalTargetCard({
         </div>
 
         <div className="flex h-4 items-center justify-between gap-2 min-w-0 text-[11px]">
-          <p
-            title={groupName ? `${target.host} · ${groupName}` : target.host}
-            className="min-w-0 truncate font-mono text-zinc-400"
-          >
-            {target.host}
-          </p>
+          <div className="flex items-center gap-1.5 min-w-0">
+            {isPerProbeCard && (
+              <span
+                data-testid="tv-card-probe-badge"
+                title={
+                  item.focalProbeLocation
+                    ? `${focalProbeLabel} · ${item.focalProbeLocation}`
+                    : focalProbeLabel
+                }
+                className="inline-flex shrink-0 items-center gap-1 rounded border border-cyan-500/40 bg-cyan-500/15 px-1.5 py-0 text-[10px] font-mono font-semibold text-cyan-300"
+              >
+                <Radio className="h-2.5 w-2.5 shrink-0" aria-hidden="true" />
+                <span className="max-w-[115px] truncate">{focalProbeLabel}</span>
+              </span>
+            )}
+            <p
+              title={groupName ? `${target.host} · ${groupName}` : target.host}
+              className="min-w-0 truncate font-mono text-zinc-400"
+            >
+              {target.host}
+            </p>
+          </div>
 
-          {cells.length > 1 && (
+          {!isPerProbeCard && cells.length > 1 && (
             <div className="flex shrink-0 items-center gap-1 overflow-x-auto">
               {cells.slice(0, 4).map((cell) => {
                 const pName = probeMap.get(cell.probe_id) ?? "Probe";
@@ -259,7 +284,11 @@ function FocalTargetCard({
             style={{ height: layout.panelHeight }}
             className="flex w-full flex-col items-center justify-center gap-1 rounded-md border border-dashed border-border bg-canvas/50 px-2 text-center text-xs font-mono text-zinc-400 cursor-zoom-in transition-colors hover:border-emerald-500/40 hover:text-zinc-200"
           >
-            <span>Waiting for probe telemetry...</span>
+            <span>
+              {isPerProbeCard
+                ? `Waiting for ${focalProbeLabel} telemetry...`
+                : "Waiting for probe telemetry..."}
+            </span>
             <span className="inline-flex items-center gap-1 text-[10px] text-emerald-400">
               <Maximize2 className="h-3 w-3" aria-hidden="true" />
               Click to zoom &amp; inspect MTR
@@ -293,7 +322,9 @@ function FocalTargetCard({
       {/* Compact Footer */}
       <div className="flex h-[18px] shrink-0 items-center justify-between border-t border-border/50 pt-0.5 text-[10px] font-mono tabular-nums text-zinc-400">
         <span className="truncate">
-          {cells.length > 1
+          {isPerProbeCard
+            ? `${focalProbeLabel}${item.focalProbeLocation ? ` · ${item.focalProbeLocation}` : ""} · Every ${target.interval_sec}s`
+            : cells.length > 1
             ? `${cells.length} probes · Every ${target.interval_sec}s`
             : `Every ${target.interval_sec}s`}
         </span>
@@ -543,11 +574,13 @@ export default function NocTvWallboardPage() {
   const filteredTargets = useMemo(() => {
     if (!data) return [];
     const q = searchQuery.trim().toLowerCase();
+    const probeFilterSet = new Set(cfg.probes);
     return data.targets.filter((t) => {
       if (impairedOnly) {
         const hasImpaired = data.cells.some(
           (c) =>
             c.target_id === t.id &&
+            (probeFilterSet.size === 0 || probeFilterSet.has(c.probe_id)) &&
             (c.status === "down" || c.status === "loss" || c.status === "degraded")
         );
         if (!hasImpaired) return false;
@@ -561,7 +594,7 @@ export default function NocTvWallboardPage() {
         gName.includes(q)
       );
     });
-  }, [data, searchQuery, impairedOnly, groupMap]);
+  }, [data, searchQuery, impairedOnly, groupMap, cfg.probes]);
 
   const effectiveFlow = useMemo(
     () => resolveTvFlowMode(cfg, stageBox.width, stageBox.height),
@@ -593,7 +626,7 @@ export default function NocTvWallboardPage() {
     if (!data) {
       return { totalFiltered: 0 };
     }
-    return partitionTargetsForTv(filteredTargets, data.cells, cfg, 12);
+    return partitionTargetsForTv(filteredTargets, data.cells, cfg, 12, data.probes);
   }, [data, filteredTargets, cfg]);
 
   const gridLayout = useMemo(
@@ -653,6 +686,18 @@ export default function NocTvWallboardPage() {
     [updateConfig]
   );
 
+  const toggleProbeFilter = useCallback(
+    (probeId: string) => {
+      updateConfig((prev) => ({
+        ...prev,
+        probes: prev.probes.includes(probeId)
+          ? prev.probes.filter((id) => id !== probeId)
+          : [...prev.probes, probeId],
+      }));
+    },
+    [updateConfig]
+  );
+
   const protocolCounts = useMemo(() => {
     const counts: Partial<Record<ProtocolFamily, number>> = {};
     if (!data) return counts;
@@ -690,7 +735,8 @@ export default function NocTvWallboardPage() {
       filteredTargets,
       data.cells,
       cfg,
-      gridLayout.cardsPerPage
+      gridLayout.cardsPerPage,
+      data.probes
     );
   }, [data, filteredTargets, cfg, gridLayout.cardsPerPage]);
 
@@ -812,7 +858,8 @@ export default function NocTvWallboardPage() {
         snap.targets,
         snap.cells,
         cfg,
-        gridLayout.cardsPerPage
+        gridLayout.cardsPerPage,
+        snap.probes
       );
       if (mode !== "clear" && nextPart.highlightSlideIdx !== null) {
         setPageIdx(nextPart.highlightSlideIdx);
@@ -1170,6 +1217,34 @@ export default function NocTvWallboardPage() {
 
           <button
             type="button"
+            data-testid="tv-probe-mode-btn"
+            aria-pressed={cfg.probeDisplayMode === "per-probe"}
+            title={
+              cfg.probeDisplayMode === "per-probe"
+                ? "Showing 1 graph card per Target × Probe (click for compact Per-Target)"
+                : "Showing 1 focal graph per Target (click to split every probe)"
+            }
+            onClick={() =>
+              updateConfig((prev) => ({
+                ...prev,
+                probeDisplayMode:
+                  prev.probeDisplayMode === "per-probe" ? "per-target" : "per-probe",
+              }))
+            }
+            className={`inline-flex items-center gap-1 rounded border px-1.5 xl:px-2 py-1 text-[11px] font-mono ${
+              cfg.probeDisplayMode === "per-probe"
+                ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-300"
+                : "border-border bg-elevated text-zinc-200 hover:border-zinc-500"
+            }`}
+          >
+            <Radio className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <span className="hidden sm:inline">
+              {cfg.probeDisplayMode === "per-probe" ? "Per-Probe" : "Per-Target"}
+            </span>
+          </button>
+
+          <button
+            type="button"
             data-testid="tv-layout-toggle-btn"
             aria-label="Configure display layout, columns, and custom width"
             aria-expanded={showLayoutBar}
@@ -1508,6 +1583,28 @@ export default function NocTvWallboardPage() {
                 Split by Protocol
               </button>
 
+              {cfg.probeDisplayMode === "per-probe" && (
+                <button
+                  type="button"
+                  data-testid="tv-group-probe-btn"
+                  aria-pressed={cfg.groupByProbe}
+                  onClick={() =>
+                    updateConfig((prev) => ({
+                      ...prev,
+                      groupByProbe: !prev.groupByProbe,
+                    }))
+                  }
+                  title="Group wallboard sections/slides by probe instead of keeping probes side-by-side per target"
+                  className={`rounded border px-2 py-0.5 text-[11px] font-mono ${
+                    cfg.groupByProbe
+                      ? "border-cyan-500 bg-cyan-500 font-semibold text-zinc-950"
+                      : "border-border bg-elevated text-zinc-300 hover:text-zinc-100"
+                  }`}
+                >
+                  Group by Probe
+                </button>
+              )}
+
               <button
                 type="button"
                 aria-pressed={impairedOnly}
@@ -1611,7 +1708,7 @@ export default function NocTvWallboardPage() {
             >
               {activeSlide.items.map((item) => (
                 <FocalTargetCard
-                  key={item.target.id}
+                  key={item.cardKey ?? item.target.id}
                   item={item}
                   layout={spotlightLayout}
                   range={cfg.range}
@@ -1642,8 +1739,9 @@ export default function NocTvWallboardPage() {
                 data-flow={effectiveFlow}
                 className="flex flex-1 min-h-[220px] flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-border bg-surface text-sm font-mono text-zinc-400"
               >
-                <span>No active targets match the selected group or protocol filters.</span>
+                <span>No active targets match the selected probe, group, or protocol filters.</span>
                 {(cfg.groups.length > 0 ||
+                  cfg.probes.length > 0 ||
                   cfg.protocols.length > 0 ||
                   cfg.ipVersion !== "all" ||
                   Boolean(searchQuery) ||
@@ -1656,6 +1754,7 @@ export default function NocTvWallboardPage() {
                       updateConfig((prev) => ({
                         ...prev,
                         groups: [],
+                        probes: [],
                         protocols: [],
                         ipVersion: "all",
                       }));
@@ -1665,6 +1764,67 @@ export default function NocTvWallboardPage() {
                     Reset Filters
                   </button>
                 )}
+              </section>
+            );
+          }
+
+          if (
+            effectiveFlow === "scroll" &&
+            cfg.probeDisplayMode === "per-probe" &&
+            cfg.groupByProbe
+          ) {
+            const probeSections = groupSummariesByProbe(
+              gridItems,
+              data?.probes ?? []
+            );
+            return (
+              <section
+                aria-label="Monitored hosts TV display"
+                data-testid="tv-cards-grid"
+                data-cols={gridLayout.cols}
+                data-rows={gridLayout.rows}
+                data-flow={effectiveFlow}
+                className="space-y-4 pb-2"
+              >
+                {probeSections.map((sec) => (
+                  <div key={sec.probeId} className="space-y-2">
+                    <div className="flex items-center justify-between border-b border-border/70 pb-1">
+                      <span className="inline-flex items-center gap-1.5 rounded border border-cyan-500/40 bg-cyan-500/15 px-2 py-0.5 text-xs font-mono font-semibold text-cyan-300">
+                        <Radio className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                        <span>{sec.probeName}</span>
+                        {sec.locationLabel && (
+                          <span className="text-[11px] font-normal text-cyan-200/80">
+                            · {sec.locationLabel}
+                          </span>
+                        )}
+                      </span>
+                      <span className="font-mono text-[11px] text-zinc-400">
+                        {sec.items.length} host{sec.items.length === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                    <div
+                      style={{
+                        gridTemplateColumns: `repeat(${gridLayout.cols}, minmax(0, 1fr))`,
+                      }}
+                      className="grid content-start items-start gap-2.5"
+                    >
+                      {sec.items.map((item) => (
+                        <FocalTargetCard
+                          key={item.cardKey ?? item.target.id}
+                          item={item}
+                          layout={gridLayout}
+                          range={cfg.range}
+                          probeMap={probeMap}
+                          groupMap={groupMap}
+                          seriesByTarget={seriesByTarget}
+                          selectedProbeId={selectedProbeByTarget[item.target.id]}
+                          onSelectProbe={handleSelectProbe}
+                          onZoomTarget={handleOpenZoomTarget}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))}
               </section>
             );
           }
@@ -1689,7 +1849,7 @@ export default function NocTvWallboardPage() {
                         {sec.family.label}
                       </span>
                       <span className="font-mono text-[11px] text-zinc-400">
-                        {sec.items.length} host{sec.items.length === 1 ? "" : "s"}
+                        {sec.items.length} card{sec.items.length === 1 ? "" : "s"}
                       </span>
                     </div>
                     <div
@@ -1700,7 +1860,7 @@ export default function NocTvWallboardPage() {
                     >
                       {sec.items.map((item) => (
                         <FocalTargetCard
-                          key={item.target.id}
+                          key={item.cardKey ?? item.target.id}
                           item={item}
                           layout={gridLayout}
                           range={cfg.range}
@@ -1743,7 +1903,7 @@ export default function NocTvWallboardPage() {
             >
               {gridItems.map((item) => (
                 <FocalTargetCard
-                  key={item.target.id}
+                  key={item.cardKey ?? item.target.id}
                   item={item}
                   layout={gridLayout}
                   range={cfg.range}
@@ -2121,6 +2281,100 @@ export default function NocTvWallboardPage() {
                       }
                     />
                   </label>
+                </div>
+              </div>
+
+              {/* Probe Display Mode & Probe Filter */}
+              <div>
+                <div className="mb-2 flex items-center justify-between">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
+                    Probe Display &amp; Filter
+                  </p>
+                  {cfg.probes.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateConfig((prev) => ({ ...prev, probes: [] }))
+                      }
+                      className="text-xs text-emerald-400 underline"
+                    >
+                      Show All Probes
+                    </button>
+                  )}
+                </div>
+                <div className="space-y-2.5 rounded-md border border-border bg-canvas p-3">
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {(
+                      [
+                        { id: "per-probe", label: "Per-Probe Cards" },
+                        { id: "per-target", label: "Per-Target (Focal)" },
+                      ] as Array<{ id: TvProbeDisplayMode; label: string }>
+                    ).map((mode) => (
+                      <button
+                        key={mode.id}
+                        type="button"
+                        aria-pressed={cfg.probeDisplayMode === mode.id}
+                        data-testid={`tv-drawer-probemode-${mode.id}`}
+                        onClick={() =>
+                          updateConfig((prev) => ({
+                            ...prev,
+                            probeDisplayMode: mode.id,
+                          }))
+                        }
+                        className={`rounded border px-2.5 py-1.5 text-xs font-mono ${
+                          cfg.probeDisplayMode === mode.id
+                            ? "border-cyan-500 bg-cyan-500 font-semibold text-zinc-950"
+                            : "border-border bg-elevated text-zinc-200"
+                        }`}
+                      >
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {cfg.probeDisplayMode === "per-probe" && (
+                    <label className="flex items-center justify-between gap-2 border-t border-border/70 pt-2 text-xs text-zinc-200">
+                      <span>Group cards/slides by probe</span>
+                      <input
+                        type="checkbox"
+                        data-testid="tv-drawer-group-probe"
+                        checked={cfg.groupByProbe}
+                        onChange={(e) =>
+                          updateConfig((prev) => ({
+                            ...prev,
+                            groupByProbe: e.target.checked,
+                          }))
+                        }
+                      />
+                    </label>
+                  )}
+
+                  <div className="max-h-32 overflow-y-auto space-y-1.5 border-t border-border/70 pt-2">
+                    {(data?.probes ?? []).length === 0 ? (
+                      <p className="text-xs text-zinc-400">No probes available.</p>
+                    ) : (
+                      (data?.probes ?? []).map((p) => (
+                        <label
+                          key={p.id}
+                          className="flex items-center justify-between gap-2 text-xs text-zinc-200"
+                        >
+                          <span className="flex items-center gap-2 min-w-0">
+                            <input
+                              type="checkbox"
+                              checked={cfg.probes.includes(p.id)}
+                              onChange={() => toggleProbeFilter(p.id)}
+                            />
+                            <span className="truncate">{p.name}</span>
+                          </span>
+                          {p.location_label && (
+                            <span className="shrink-0 font-mono text-[10px] text-zinc-400">
+                              {p.location_label}
+                            </span>
+                          )}
+                        </label>
+                      ))
+                    )}
+                  </div>
                 </div>
               </div>
 

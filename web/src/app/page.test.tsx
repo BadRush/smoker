@@ -264,4 +264,89 @@ describe("MatrixWallPage (Dashboard)", () => {
       "auto"
     );
   });
+
+  it("supports grouping Charts Grid By Probe and filtering by specific probe", async () => {
+    const multiProbeSnap: MatrixSnapshot = {
+      ...SNAPSHOT,
+      probes: [
+        SNAPSHOT.probes[0],
+        {
+          id: "p2",
+          name: "Remote-SGP",
+          location_label: "Singapore",
+          isp_asn: "AS13335",
+          is_local: false,
+          status: "online",
+          pending_backlog_count: 0,
+          clock_offset_ms: 0,
+          last_seen_at: "2026-11-16T03:00:00Z",
+          agent_version: "1.0.0",
+          created_at: "2026-11-15T00:00:00Z",
+        },
+      ],
+      targets: [
+        {
+          ...SNAPSHOT.targets[0],
+          id: "t-e1",
+          name: "e1-vhp.com",
+          host: "https://e1-vhp.com",
+          probe_type: "http",
+        },
+      ],
+      cells: [
+        {
+          target_id: "t-e1",
+          probe_id: "p1",
+          p50_ms: 11,
+          p95_ms: 18,
+          jitter_ms: 1.0,
+          loss_pct: 0,
+          sample_count: 10,
+          status: "healthy",
+          sparkline: [{ ts: 1700000000, min: 9, p50: 11, p95: 18, loss: 0 }],
+        },
+        {
+          target_id: "t-e1",
+          probe_id: "p2",
+          p50_ms: 32,
+          p95_ms: 45,
+          jitter_ms: 2.1,
+          loss_pct: 0,
+          sample_count: 10,
+          status: "healthy",
+          sparkline: [{ ts: 1700000000, min: 28, p50: 32, p95: 45, loss: 0 }],
+        },
+      ],
+    };
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/api/matrix")) {
+          return new Response(JSON.stringify(multiProbeSnap), { status: 200 });
+        }
+        return new Response(JSON.stringify({ username: "admin" }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<MatrixWallPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("e1-vhp.com")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: /charts grid/i }));
+    // Switch grouping to By Probe -> creates 2 probe sections (Local Central Probe & Remote-SGP), each with 1 chart panel
+    await user.click(screen.getByTestId("dash-groupby-probe"));
+    expect(screen.getAllByTestId("dash-section-grid")).toHaveLength(2);
+    expect(screen.getAllByTestId("grid-target-card")).toHaveLength(2);
+    expect(screen.getAllByTestId("smoke-chart-panel")).toHaveLength(2);
+
+    // Filter to Remote-SGP only -> 1 section & 1 card
+    await user.selectOptions(screen.getByTestId("dash-probe-filter"), "p2");
+    expect(screen.getAllByTestId("dash-section-grid")).toHaveLength(1);
+    expect(screen.getAllByTestId("grid-target-card")).toHaveLength(1);
+  });
 });

@@ -1,4 +1,4 @@
-import type { MatrixCell, Target } from "./api";
+import type { MatrixCell, Probe, Target } from "./api";
 import {
   clampChartHeight,
   clampColumnCount,
@@ -23,6 +23,7 @@ export const TV_CONFIG_STORAGE_KEY = "smoker.tv.config.v1";
 
 export type TvOrientation = "landscape" | "portrait";
 export type TvRange = "15m" | "1h" | "3h" | "6h" | "12h" | "24h" | "7d";
+export type TvProbeDisplayMode = "per-probe" | "per-target";
 
 export const TV_RANGES: readonly TvRange[] = [
   "15m",
@@ -37,6 +38,9 @@ export const TV_RANGES: readonly TvRange[] = [
 export interface TvWallConfig {
   orientation: TvOrientation;
   groups: string[];
+  probes: string[];
+  probeDisplayMode: TvProbeDisplayMode;
+  groupByProbe: boolean;
   protocols: ProtocolFamily[];
   ipVersion: IpFamilyFilter;
   splitByProtocol: boolean;
@@ -53,6 +57,10 @@ export interface TvWallConfig {
 }
 
 export interface TargetHealthSummary {
+  cardKey?: string;
+  focalProbeId?: string;
+  focalProbeName?: string;
+  focalProbeLocation?: string;
   target: Target;
   worstStatus: CellStatus;
   maxLossPct: number;
@@ -90,6 +98,9 @@ const VALID_RANGES = new Set<string>(TV_RANGES);
 export const DEFAULT_TV_CONFIG: TvWallConfig = {
   orientation: "landscape",
   groups: [],
+  probes: [],
+  probeDisplayMode: "per-probe",
+  groupByProbe: false,
   protocols: [],
   ipVersion: "all",
   splitByProtocol: false,
@@ -139,6 +150,20 @@ export function sanitizeTvConfig(raw: unknown): TvWallConfig {
   const groups = Array.isArray(obj.groups)
     ? obj.groups.map((s) => String(s).trim()).filter(Boolean)
     : [];
+  const probes: string[] = [];
+  const seenProbe = new Set<string>();
+  if (Array.isArray(obj.probes)) {
+    for (const part of obj.probes) {
+      const clean = String(part).trim();
+      if (clean && !seenProbe.has(clean)) {
+        seenProbe.add(clean);
+        probes.push(clean);
+      }
+    }
+  }
+  const probeDisplayMode: TvProbeDisplayMode =
+    obj.probeDisplayMode === "per-target" ? "per-target" : "per-probe";
+  const groupByProbe = Boolean(obj.groupByProbe);
   const protocols: ProtocolFamily[] = [];
   const seenProto = new Set<ProtocolFamily>();
   if (Array.isArray(obj.protocols)) {
@@ -186,6 +211,9 @@ export function sanitizeTvConfig(raw: unknown): TvWallConfig {
   return {
     orientation,
     groups,
+    probes,
+    probeDisplayMode,
+    groupByProbe,
     protocols,
     ipVersion,
     splitByProtocol,
@@ -238,6 +266,24 @@ export function parseTvConfig(search: string): TvWallConfig {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+
+  const probesParam = params.get("probes") ?? "";
+  const probes: string[] = [];
+  const seenProbe = new Set<string>();
+  for (const part of probesParam.split(",")) {
+    const clean = part.trim();
+    if (clean && !seenProbe.has(clean)) {
+      seenProbe.add(clean);
+      probes.push(clean);
+    }
+  }
+
+  const probeModeParam = (params.get("probeMode") ?? "").trim().toLowerCase();
+  const probeDisplayMode: TvProbeDisplayMode =
+    probeModeParam === "per-target" ? "per-target" : "per-probe";
+
+  const groupProbeParam = (params.get("groupProbe") ?? "").trim().toLowerCase();
+  const groupByProbe = groupProbeParam === "1" || groupProbeParam === "true";
 
   const protocolsParam = params.get("protocols") ?? "";
   const protocols: ProtocolFamily[] = [];
@@ -311,6 +357,9 @@ export function parseTvConfig(search: string): TvWallConfig {
   return {
     orientation,
     groups,
+    probes,
+    probeDisplayMode,
+    groupByProbe,
     protocols,
     ipVersion,
     splitByProtocol,
@@ -332,6 +381,15 @@ export function serializeTvConfig(cfg: TvWallConfig): string {
   params.set("orientation", cfg.orientation);
   if (cfg.groups.length > 0) {
     params.set("groups", cfg.groups.join(","));
+  }
+  if (cfg.probes.length > 0) {
+    params.set("probes", cfg.probes.join(","));
+  }
+  if (cfg.probeDisplayMode !== DEFAULT_TV_CONFIG.probeDisplayMode) {
+    params.set("probeMode", cfg.probeDisplayMode);
+  }
+  if (cfg.groupByProbe) {
+    params.set("groupProbe", "1");
   }
   if (cfg.protocols.length > 0) {
     params.set("protocols", cfg.protocols.join(","));
@@ -382,11 +440,16 @@ function statusSeverity(status: CellStatus | string): number {
   }
 }
 
-export function summarizeTargetHealth(
+function buildHealthSummary(
   target: Target,
-  allCells: MatrixCell[]
+  cells: MatrixCell[],
+  extra?: {
+    cardKey?: string;
+    focalProbeId?: string;
+    focalProbeName?: string;
+    focalProbeLocation?: string;
+  }
 ): TargetHealthSummary {
-  const cells = allCells.filter((c) => c.target_id === target.id);
   let worstStatus: CellStatus = "unknown";
   let worstRank = -1;
   let maxLossPct = 0;
@@ -421,6 +484,7 @@ export function summarizeTargetHealth(
   const isPinnedVip = Boolean(target.pinned_on_tv);
 
   return {
+    ...extra,
     target,
     worstStatus,
     maxLossPct,
@@ -431,6 +495,73 @@ export function summarizeTargetHealth(
     isPinnedVip,
     isImpaired,
   };
+}
+
+export function summarizeTargetHealth(
+  target: Target,
+  allCells: MatrixCell[]
+): TargetHealthSummary {
+  const cells = allCells.filter((c) => c.target_id === target.id);
+  return buildHealthSummary(target, cells);
+}
+
+export function summarizeTargetForProbe(
+  target: Target,
+  probe: Pick<Probe, "id" | "name" | "location_label">,
+  cell: MatrixCell | undefined
+): TargetHealthSummary {
+  return buildHealthSummary(target, cell ? [cell] : [], {
+    cardKey: `${target.id}:${probe.id}`,
+    focalProbeId: probe.id,
+    focalProbeName: probe.name,
+    focalProbeLocation: probe.location_label,
+  });
+}
+
+export interface TvProbeSection {
+  probeId: string;
+  probeName: string;
+  locationLabel: string;
+  items: TargetHealthSummary[];
+}
+
+export function groupSummariesByProbe(
+  items: readonly TargetHealthSummary[],
+  probes: readonly Probe[] = []
+): TvProbeSection[] {
+  const probeMeta = new Map(probes.map((p) => [p.id, p]));
+  const buckets = new Map<string, TvProbeSection>();
+
+  for (const item of items) {
+    const pid = item.focalProbeId ?? "unassigned";
+    const existing = buckets.get(pid);
+    if (existing) {
+      existing.items.push(item);
+      continue;
+    }
+    const p = probeMeta.get(pid);
+    buckets.set(pid, {
+      probeId: pid,
+      probeName: item.focalProbeName ?? p?.name ?? (pid === "unassigned" ? "Unassigned" : pid),
+      locationLabel: item.focalProbeLocation ?? p?.location_label ?? "",
+      items: [item],
+    });
+  }
+
+  const ordered: TvProbeSection[] = [];
+  for (const p of probes) {
+    const sec = buckets.get(p.id);
+    if (sec && sec.items.length > 0) {
+      ordered.push(sec);
+      buckets.delete(p.id);
+    }
+  }
+  for (const sec of buckets.values()) {
+    if (sec.items.length > 0) {
+      ordered.push(sec);
+    }
+  }
+  return ordered;
 }
 
 const TARGET_GRAPH_RATIO = 7 / 3;
@@ -924,8 +1055,14 @@ export function partitionTargetsForTv(
   targets: Target[],
   cells: MatrixCell[],
   cfg: Pick<TvWallConfig, "groups" | "cardsPerPage"> &
-    Partial<Pick<TvWallConfig, "protocols" | "ipVersion" | "splitByProtocol">>,
-  effectiveCardsPerPage?: number
+    Partial<
+      Pick<
+        TvWallConfig,
+        "protocols" | "ipVersion" | "splitByProtocol" | "probes" | "probeDisplayMode" | "groupByProbe"
+      >
+    >,
+  effectiveCardsPerPage?: number,
+  probes: readonly Probe[] = []
 ): {
   allSummaries: TargetHealthSummary[];
   pinnedAlerts: TargetHealthSummary[];
@@ -939,6 +1076,9 @@ export function partitionTargetsForTv(
   const includeUngrouped = groupSet.has(UNGROUPED_GROUP_TOKEN);
   const protocols = cfg.protocols ?? [];
   const ipVersion = cfg.ipVersion ?? "all";
+  const selectedProbes = new Set(cfg.probes ?? []);
+  const probeDisplayMode: TvProbeDisplayMode = cfg.probeDisplayMode ?? "per-probe";
+  const groupByProbe = Boolean(cfg.groupByProbe) && probeDisplayMode === "per-probe";
 
   const filtered = targets.filter((t) => {
     if (!t.enabled) return false;
@@ -952,7 +1092,78 @@ export function partitionTargetsForTv(
     return matchesProtocolAndIpFilter(t, protocols, ipVersion);
   });
 
-  const summaries = filtered.map((t) => summarizeTargetHealth(t, cells));
+  const cellIndex = new Map<string, MatrixCell>();
+  for (const c of cells) {
+    cellIndex.set(`${c.target_id}:${c.probe_id}`, c);
+  }
+  const probeMetaMap = new Map(probes.map((p) => [p.id, p]));
+
+  const summaries: TargetHealthSummary[] = [];
+  if (probeDisplayMode === "per-probe") {
+    for (const t of filtered) {
+      if (probes.length > 0) {
+        const assignedSet = new Set(t.probe_ids ?? []);
+        const targetProbes = probes.filter(
+          (p) =>
+            (t.assign_all_probes || assignedSet.has(p.id)) &&
+            (selectedProbes.size === 0 || selectedProbes.has(p.id))
+        );
+        for (const p of targetProbes) {
+          summaries.push(
+            summarizeTargetForProbe(t, p, cellIndex.get(`${t.id}:${p.id}`))
+          );
+        }
+      } else {
+        const tCells = cells.filter(
+          (c) =>
+            c.target_id === t.id &&
+            (selectedProbes.size === 0 || selectedProbes.has(c.probe_id))
+        );
+        if (tCells.length > 0) {
+          const seenPids = new Set<string>();
+          for (const c of tCells) {
+            if (seenPids.has(c.probe_id)) continue;
+            seenPids.add(c.probe_id);
+            const knownProbe = probeMetaMap.get(c.probe_id);
+            summaries.push(
+              summarizeTargetForProbe(
+                t,
+                knownProbe ?? {
+                  id: c.probe_id,
+                  name: c.probe_id,
+                  location_label: "",
+                },
+                c
+              )
+            );
+          }
+        } else if (selectedProbes.size === 0) {
+          summaries.push(summarizeTargetHealth(t, cells));
+        }
+      }
+    }
+  } else {
+    for (const t of filtered) {
+      if (selectedProbes.size > 0) {
+        if (probes.length > 0) {
+          const assignedSet = new Set(t.probe_ids ?? []);
+          const hasMatchingProbe = probes.some(
+            (p) =>
+              selectedProbes.has(p.id) &&
+              (t.assign_all_probes || assignedSet.has(p.id))
+          );
+          if (!hasMatchingProbe) continue;
+        }
+        const matchingCells = cells.filter(
+          (c) => c.target_id === t.id && selectedProbes.has(c.probe_id)
+        );
+        if (probes.length === 0 && matchingCells.length === 0) continue;
+        summaries.push(buildHealthSummary(t, matchingCells));
+      } else {
+        summaries.push(summarizeTargetHealth(t, cells));
+      }
+    }
+  }
 
   const pinnedAlerts = summaries
     .filter((s) => s.isImpaired)
@@ -980,7 +1191,24 @@ export function partitionTargetsForTv(
   const pages: TargetHealthSummary[][] = [];
   const slides: TvPageSlide[] = [];
 
-  if (cfg.splitByProtocol && summaries.length > 0) {
+  if (groupByProbe && summaries.length > 0) {
+    const sections = groupSummariesByProbe(summaries, probes);
+    for (const sec of sections) {
+      const secPages: TargetHealthSummary[][] = [];
+      for (let i = 0; i < sec.items.length; i += pageSize) {
+        const chunk = sec.items.slice(i, i + pageSize);
+        secPages.push(chunk);
+        pages.push(chunk);
+      }
+      secPages.forEach((chunk, idx) => {
+        slides.push({
+          kind: "grid",
+          label: `${sec.probeName} ${idx + 1}/${secPages.length}`,
+          items: chunk,
+        });
+      });
+    }
+  } else if (cfg.splitByProtocol && summaries.length > 0) {
     const sections = groupItemsByProtocol(summaries, (s) => s.target);
     for (const sec of sections) {
       const secPages: TargetHealthSummary[][] = [];

@@ -73,6 +73,9 @@ describe("tv-config helpers", () => {
     expect(cfg).toEqual({
       orientation: "portrait",
       groups: ["g1", "g2"],
+      probes: [],
+      probeDisplayMode: "per-probe",
+      groupByProbe: false,
       protocols: [],
       ipVersion: "all",
       splitByProtocol: false,
@@ -92,6 +95,15 @@ describe("tv-config helpers", () => {
     expect(qs).toBe(
       "orientation=portrait&groups=g1%2Cg2&rotate=30&cards=8&range=6h&sound=1"
     );
+
+    const probeCfg = parseTvConfig("?probes=p1,p2&probeMode=per-target&groupProbe=1");
+    expect(probeCfg.probes).toEqual(["p1", "p2"]);
+    expect(probeCfg.probeDisplayMode).toBe("per-target");
+    expect(probeCfg.groupByProbe).toBe(true);
+    const probeQs = serializeTvConfig(probeCfg);
+    expect(probeQs).toContain("probes=p1%2Cp2");
+    expect(probeQs).toContain("probeMode=per-target");
+    expect(probeQs).toContain("groupProbe=1");
 
     const layoutCfg = parseTvConfig(
       "?layout=single-row&cols=3&flow=slides&width=960px&rowW=480px&chartH=260"
@@ -408,6 +420,99 @@ describe("tv-config helpers", () => {
       "DNS QUERY 1/2",
       "DNS QUERY 2/2",
       "HTTP 1/1",
+    ]);
+  });
+
+  it("expands targets into separate per-probe cards by default, filters probes, and supports grouping slides by probe", () => {
+    const probes = [
+      {
+        id: "p1",
+        name: "Probe-JKT",
+        location_label: "Jakarta",
+        isp_asn: "AS1",
+        is_local: true,
+        status: "online" as const,
+        pending_backlog_count: 0,
+        clock_offset_ms: 0,
+        last_seen_at: null,
+        agent_version: "1.0.0",
+        created_at: "",
+      },
+      {
+        id: "p2",
+        name: "Probe-SGP",
+        location_label: "Singapore",
+        isp_asn: "AS2",
+        is_local: false,
+        status: "online" as const,
+        pending_backlog_count: 0,
+        clock_offset_ms: 0,
+        last_seen_at: null,
+        agent_version: "1.0.0",
+        created_at: "",
+      },
+    ];
+    const tWeb = makeTarget("t-web", "e1-vhp.com", null, false, "http", "https://e1-vhp.com");
+    const tCustom = {
+      ...makeTarget("t-sgp", "SGP Only", null, false, "icmp", "1.1.1.1"),
+      assign_all_probes: false,
+      probe_ids: ["p2"],
+    };
+    const cells: MatrixCell[] = [
+      { ...makeCell("t-web", "healthy", 0, 12), probe_id: "p1" },
+      // Notice: t-web on p2 has NO cell yet (newly added target) -> card must still be generated
+      { ...makeCell("t-sgp", "loss", 25, 18), probe_id: "p2" },
+    ];
+
+    // Default per-probe mode keeps e1-vhp.com cards side-by-side (p1, p2) then SGP Only (p2)
+    const expanded = partitionTargetsForTv(
+      [tWeb, tCustom],
+      cells,
+      { groups: [], cardsPerPage: 12, probeDisplayMode: "per-probe", groupByProbe: false },
+      12,
+      probes
+    );
+    expect(expanded.totalFiltered).toBe(3);
+    expect(
+      expanded.allSummaries.map((s) => `${s.target.name}@${s.focalProbeName}`)
+    ).toEqual([
+      "e1-vhp.com@Probe-JKT",
+      "e1-vhp.com@Probe-SGP",
+      "SGP Only@Probe-SGP",
+    ]);
+    // Only SGP Only@Probe-SGP is impaired
+    expect(expanded.pinnedAlerts.map((s) => `${s.target.name}@${s.focalProbeName}`)).toEqual([
+      "SGP Only@Probe-SGP",
+    ]);
+
+    // Grouping slides by probe splits Probe-JKT and Probe-SGP slides cleanly
+    const grouped = partitionTargetsForTv(
+      [tWeb, tCustom],
+      cells,
+      { groups: [], cardsPerPage: 12, probeDisplayMode: "per-probe", groupByProbe: true },
+      12,
+      probes
+    );
+    expect(grouped.slides.map((s) => s.label)).toEqual([
+      "Probe-JKT 1/1",
+      "Probe-SGP 1/1",
+      "SPOTLIGHT (1)",
+    ]);
+    expect(grouped.slides[1].items.map((it) => it.target.name)).toEqual([
+      "e1-vhp.com",
+      "SGP Only",
+    ]);
+
+    // Filtering to Probe-JKT only omits SGP-only target and p2 cards
+    const filteredProbe = partitionTargetsForTv(
+      [tWeb, tCustom],
+      cells,
+      { groups: [], probes: ["p1"], cardsPerPage: 12, probeDisplayMode: "per-probe" },
+      12,
+      probes
+    );
+    expect(filteredProbe.allSummaries.map((s) => `${s.target.name}@${s.focalProbeName}`)).toEqual([
+      "e1-vhp.com@Probe-JKT",
     ]);
   });
 });

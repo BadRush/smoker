@@ -61,6 +61,8 @@ import {
 } from "@/lib/smoke-math";
 import { useLiveSocket, type LiveEventMessage } from "@/lib/useLiveSocket";
 
+export type DashboardGroupBy = GroupByMode | "probe";
+
 export default function MatrixWallPage() {
   const router = useRouter();
   const [data, setData] = useState<MatrixSnapshot | null>(null);
@@ -68,10 +70,11 @@ export default function MatrixWallPage() {
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [groupFilter, setGroupFilter] = useState<string>("all");
+  const [probeFilter, setProbeFilter] = useState<string>("all");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [selectedProtocols, setSelectedProtocols] = useState<ProtocolFamily[]>([]);
   const [ipVersion, setIpVersion] = useState<IpFamilyFilter>("all");
-  const [groupBy, setGroupBy] = useState<GroupByMode>("protocol");
+  const [groupBy, setGroupBy] = useState<DashboardGroupBy>("protocol");
   const [viewMode, setViewMode] = useState<"matrix" | "grid">("matrix");
   const [zoomTargetId, setZoomTargetId] = useState<string | null>(null);
   const [dashboardLayout, setDashboardLayout] = useState<DashboardLayoutConfig>(
@@ -250,11 +253,24 @@ export default function MatrixWallPage() {
     return counts;
   }, [data, groupFilter]);
 
+  const visibleProbes = useMemo(() => {
+    if (!data) return [];
+    if (probeFilter === "all") return data.probes;
+    return data.probes.filter((p) => p.id === probeFilter);
+  }, [data, probeFilter]);
+
   const filteredTargets = useMemo(() => {
     if (!data) return [];
     const q = search.trim().toLowerCase();
     return data.targets.filter((t) => {
       if (groupFilter !== "all" && (t.group_id ?? "ungrouped") !== groupFilter) {
+        return false;
+      }
+      if (
+        probeFilter !== "all" &&
+        !t.assign_all_probes &&
+        !t.probe_ids.includes(probeFilter)
+      ) {
         return false;
       }
       if (!matchesProtocolAndIpFilter(t, selectedProtocols, ipVersion)) {
@@ -269,7 +285,8 @@ export default function MatrixWallPage() {
         return false;
       }
       if (statusFilter !== "all") {
-        const hasStatus = data.probes.some((p) => {
+        const checkProbes = probeFilter === "all" ? data.probes : visibleProbes;
+        const hasStatus = checkProbes.some((p) => {
           const cell = cellIndex.get(`${t.id}:${p.id}`);
           return cell?.status === statusFilter;
         });
@@ -277,9 +294,52 @@ export default function MatrixWallPage() {
       }
       return true;
     });
-  }, [data, search, groupFilter, statusFilter, selectedProtocols, ipVersion, cellIndex]);
+  }, [
+    data,
+    search,
+    groupFilter,
+    probeFilter,
+    visibleProbes,
+    statusFilter,
+    selectedProtocols,
+    ipVersion,
+    cellIndex,
+  ]);
 
-  const targetSections = useMemo(() => {
+  const targetSections = useMemo((): Array<{
+    key: string;
+    probeId?: string;
+    title: string;
+    subtitle?: string;
+    badgeClass?: string;
+    targets: Target[];
+  }> => {
+    if (groupBy === "probe") {
+      const sections: Array<{
+        key: string;
+        probeId?: string;
+        title: string;
+        subtitle?: string;
+        badgeClass?: string;
+        targets: Target[];
+      }> = [];
+      for (const p of visibleProbes) {
+        const probeTargets = filteredTargets.filter(
+          (t) => t.assign_all_probes || t.probe_ids.includes(p.id)
+        );
+        if (probeTargets.length > 0) {
+          sections.push({
+            key: `probe:${p.id}`,
+            probeId: p.id,
+            title: p.name,
+            subtitle: [p.location_label, p.isp_asn].filter(Boolean).join(" · ") || undefined,
+            badgeClass: "border-cyan-500/40 bg-cyan-500/15 text-cyan-300",
+            targets: probeTargets,
+          });
+        }
+      }
+      return sections;
+    }
     if (groupBy === "protocol") {
       return groupItemsByProtocol(filteredTargets, (t) => t).map((sec) => ({
         key: `proto:${sec.family.id}`,
@@ -309,7 +369,7 @@ export default function MatrixWallPage() {
         targets: filteredTargets,
       },
     ];
-  }, [filteredTargets, groupBy, data?.groups]);
+  }, [filteredTargets, groupBy, data?.groups, visibleProbes]);
 
   const kpis = useMemo(() => {
     if (!data) {
@@ -467,6 +527,21 @@ export default function MatrixWallPage() {
             </select>
 
             <select
+              aria-label="Filter by probe"
+              data-testid="dash-probe-filter"
+              value={probeFilter}
+              onChange={(e) => setProbeFilter(e.target.value)}
+              className="rounded-md border border-border bg-canvas px-3 py-1.5 text-sm text-zinc-200 focus:border-emerald-500 focus:outline-none"
+            >
+              <option value="all">All Probes</option>
+              {data?.probes.map((p) => (
+                <option key={p.id} value={p.id}>
+                  Probe: {p.name}
+                </option>
+              ))}
+            </select>
+
+            <select
               aria-label="Filter by status"
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value)}
@@ -488,6 +563,7 @@ export default function MatrixWallPage() {
                 [
                   { id: "protocol", label: "By Protocol" },
                   { id: "group", label: "By Group" },
+                  { id: "probe", label: "By Probe" },
                   { id: "none", label: "Flat" },
                 ] as const
               ).map((opt) => (
@@ -705,7 +781,10 @@ export default function MatrixWallPage() {
                     className={resolvedGrid.gridClassName}
                   >
                     {section.targets.map((t: Target) => {
-                      const assignedCells = data.probes
+                      const sectionProbes = section.probeId
+                        ? visibleProbes.filter((p) => p.id === section.probeId)
+                        : visibleProbes;
+                      const assignedCells = sectionProbes
                         .map((p) => ({ probe: p, cell: cellIndex.get(`${t.id}:${p.id}`) }))
                         .filter((item): item is { probe: typeof item.probe; cell: MatrixCell } =>
                           Boolean(item.cell)
@@ -716,7 +795,7 @@ export default function MatrixWallPage() {
                           : "grid grid-cols-1 gap-2.5 sm:grid-cols-2";
                       return (
                         <article
-                          key={t.id}
+                          key={`${section.key}:${t.id}`}
                           data-testid="grid-target-card"
                           style={resolvedGrid.isRowStrip ? resolvedGrid.rowCardStyle : undefined}
                           className="rounded-lg border border-border bg-surface p-4 space-y-3 flex flex-col justify-between"
@@ -840,7 +919,7 @@ export default function MatrixWallPage() {
                   <th className="sticky left-0 z-10 min-w-[230px] bg-elevated px-4 py-3 font-semibold text-zinc-300">
                     Target / Host
                   </th>
-                  {data.probes.map((p) => (
+                  {visibleProbes.map((p) => (
                     <th
                       key={p.id}
                       className="min-w-[160px] border-l border-border px-3 py-2.5"
@@ -879,7 +958,7 @@ export default function MatrixWallPage() {
                     {section.title && (
                       <tr className="bg-elevated/45">
                         <td
-                          colSpan={1 + data.probes.length}
+                          colSpan={1 + visibleProbes.length}
                           className="border-y border-border/80 px-4 py-2"
                         >
                           <div className="flex items-center justify-between gap-2">
@@ -906,7 +985,7 @@ export default function MatrixWallPage() {
                       </tr>
                     )}
                     {section.targets.map((t) => (
-                      <tr key={t.id} className="hover:bg-elevated/30">
+                      <tr key={`${section.key}:${t.id}`} className="hover:bg-elevated/30">
                         <td className="sticky left-0 z-10 bg-surface px-4 py-3 border-r border-border">
                           <div className="flex items-start justify-between gap-2">
                             <Link
@@ -954,7 +1033,7 @@ export default function MatrixWallPage() {
                           </div>
                         </td>
 
-                        {data.probes.map((p) => {
+                        {visibleProbes.map((p) => {
                           const cell = cellIndex.get(`${t.id}:${p.id}`);
                           if (!cell) {
                             return (

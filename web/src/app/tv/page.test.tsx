@@ -167,4 +167,97 @@ describe("NocTvWallboardPage layout controls", () => {
     expect(window.location.search).not.toContain("chartH=");
     expect(window.location.search).not.toContain("width=");
   });
+
+  it("renders separate Per-Probe cards side-by-side by default for multi-probe targets like e1-vhp.com and supports Per-Target & Group by Probe toggles", async () => {
+    const multiProbeSnapshot: MatrixSnapshot = {
+      generated_at: "2026-11-16T03:00:00Z",
+      active_incidents: 0,
+      probes: [
+        ...TV_SNAPSHOT.probes,
+        {
+          id: "p2",
+          name: "Remote-SGP",
+          location_label: "Singapore",
+          isp_asn: "AS13335",
+          is_local: false,
+          status: "online",
+          pending_backlog_count: 0,
+          clock_offset_ms: 0,
+          last_seen_at: "2026-11-16T03:00:00Z",
+          agent_version: "1.0.0",
+          created_at: "2026-11-15T00:00:00Z",
+        },
+      ],
+      groups: [],
+      targets: [
+        {
+          ...TV_SNAPSHOT.targets[0],
+          id: "t-e1",
+          name: "e1-vhp.com",
+          host: "https://e1-vhp.com",
+          probe_type: "http",
+        },
+      ],
+      cells: [
+        {
+          target_id: "t-e1",
+          probe_id: "p1",
+          p50_ms: 14,
+          p95_ms: 22,
+          jitter_ms: 1.2,
+          loss_pct: 0,
+          sample_count: 10,
+          status: "healthy",
+          sparkline: [{ ts: 1700000000, min: 10, p50: 14, p95: 22, loss: 0 }],
+        },
+        {
+          target_id: "t-e1",
+          probe_id: "p2",
+          p50_ms: 35,
+          p95_ms: 48,
+          jitter_ms: 2.4,
+          loss_pct: 0,
+          sample_count: 10,
+          status: "healthy",
+          sparkline: [{ ts: 1700000000, min: 30, p50: 35, p95: 48, loss: 0 }],
+        },
+      ],
+    };
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/api/tv/matrix")) {
+          return new Response(JSON.stringify(multiProbeSnapshot), { status: 200 });
+        }
+        if (url.startsWith("/api/tv/series")) {
+          return new Response(JSON.stringify({ range: "3h", targets: {} }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<NocTvWallboardPage />);
+
+    // Default Per-Probe mode generates 2 cards for e1-vhp.com (Local Central & Remote-SGP)
+    await waitFor(() => {
+      expect(screen.getAllByTestId("tv-target-card")).toHaveLength(2);
+    });
+    const badges = screen.getAllByTestId("tv-card-probe-badge");
+    expect(badges.map((b) => b.textContent)).toEqual(["Local Central", "Remote-SGP"]);
+
+    // Toggle to Per-Target compact mode -> collapses to 1 focal card with probe switcher chips
+    await user.click(screen.getByTestId("tv-probe-mode-btn"));
+    expect(screen.getAllByTestId("tv-target-card")).toHaveLength(1);
+    expect(screen.getAllByTestId("tv-probe-chip")).toHaveLength(2);
+    expect(window.location.search).toContain("probeMode=per-target");
+
+    // Toggle back to Per-Probe -> 2 cards again
+    await user.click(screen.getByTestId("tv-probe-mode-btn"));
+    expect(screen.getAllByTestId("tv-target-card")).toHaveLength(2);
+  });
 });
