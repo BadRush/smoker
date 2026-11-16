@@ -92,6 +92,7 @@ Atau jalankan non-interaktif sesuai skema akses:
   ./scripts/setup.sh --role probe --central-url "wss://smoker.example.com/ws/probe" --probe-token "<PROBE_TOKEN>" --yes
   ```
   (Atau gunakan `ws://<IP-ROUTED-CENTRAL>:8080/ws/probe` bila terhubung langsung lewat LAN/WireGuard/BGP.)
+  > Lihat panduan lengkap prasyarat, alur provisioning, update, dan troubleshooting di [docs/probe-install.md](docs/probe-install.md).
 
 ### 2. Alur Komunikasi Multi-Topologi Probe <-> Central
 
