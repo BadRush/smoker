@@ -24,6 +24,7 @@ export const TV_CONFIG_STORAGE_KEY = "smoker.tv.config.v1";
 export type TvOrientation = "landscape" | "portrait";
 export type TvRange = "15m" | "1h" | "3h" | "6h" | "12h" | "24h" | "7d";
 export type TvProbeDisplayMode = "per-probe" | "per-target";
+export type TvSpotlightMode = "off" | "vip" | "all";
 
 export const TV_RANGES: readonly TvRange[] = [
   "15m",
@@ -41,6 +42,8 @@ export interface TvWallConfig {
   probes: string[];
   probeDisplayMode: TvProbeDisplayMode;
   groupByProbe: boolean;
+  spotlightMode: TvSpotlightMode;
+  autoSwitchSpotlight: boolean;
   protocols: ProtocolFamily[];
   ipVersion: IpFamilyFilter;
   splitByProtocol: boolean;
@@ -101,6 +104,8 @@ export const DEFAULT_TV_CONFIG: TvWallConfig = {
   probes: [],
   probeDisplayMode: "per-probe",
   groupByProbe: false,
+  spotlightMode: "off",
+  autoSwitchSpotlight: false,
   protocols: [],
   ipVersion: "all",
   splitByProtocol: false,
@@ -164,6 +169,12 @@ export function sanitizeTvConfig(raw: unknown): TvWallConfig {
   const probeDisplayMode: TvProbeDisplayMode =
     obj.probeDisplayMode === "per-target" ? "per-target" : "per-probe";
   const groupByProbe = Boolean(obj.groupByProbe);
+  const spotlightMode: TvSpotlightMode =
+    obj.spotlightMode === "vip" || obj.spotlightMode === "all"
+      ? obj.spotlightMode
+      : "off";
+  const autoSwitchSpotlight =
+    spotlightMode !== "off" && Boolean(obj.autoSwitchSpotlight);
   const protocols: ProtocolFamily[] = [];
   const seenProto = new Set<ProtocolFamily>();
   if (Array.isArray(obj.protocols)) {
@@ -214,6 +225,8 @@ export function sanitizeTvConfig(raw: unknown): TvWallConfig {
     probes,
     probeDisplayMode,
     groupByProbe,
+    spotlightMode,
+    autoSwitchSpotlight,
     protocols,
     ipVersion,
     splitByProtocol,
@@ -284,6 +297,17 @@ export function parseTvConfig(search: string): TvWallConfig {
 
   const groupProbeParam = (params.get("groupProbe") ?? "").trim().toLowerCase();
   const groupByProbe = groupProbeParam === "1" || groupProbeParam === "true";
+
+  const spotlightParam = (params.get("spotlight") ?? "").trim().toLowerCase();
+  const spotlightMode: TvSpotlightMode =
+    spotlightParam === "vip" || spotlightParam === "all"
+      ? spotlightParam
+      : "off";
+
+  const autoSwitchParam = (params.get("autoSwitch") ?? "").trim().toLowerCase();
+  const autoSwitchSpotlight =
+    spotlightMode !== "off" &&
+    (autoSwitchParam === "1" || autoSwitchParam === "true");
 
   const protocolsParam = params.get("protocols") ?? "";
   const protocols: ProtocolFamily[] = [];
@@ -360,6 +384,8 @@ export function parseTvConfig(search: string): TvWallConfig {
     probes,
     probeDisplayMode,
     groupByProbe,
+    spotlightMode,
+    autoSwitchSpotlight,
     protocols,
     ipVersion,
     splitByProtocol,
@@ -390,6 +416,12 @@ export function serializeTvConfig(cfg: TvWallConfig): string {
   }
   if (cfg.groupByProbe) {
     params.set("groupProbe", "1");
+  }
+  if (cfg.spotlightMode !== DEFAULT_TV_CONFIG.spotlightMode) {
+    params.set("spotlight", cfg.spotlightMode);
+  }
+  if (cfg.spotlightMode !== "off" && cfg.autoSwitchSpotlight) {
+    params.set("autoSwitch", "1");
   }
   if (cfg.protocols.length > 0) {
     params.set("protocols", cfg.protocols.join(","));
@@ -1058,7 +1090,13 @@ export function partitionTargetsForTv(
     Partial<
       Pick<
         TvWallConfig,
-        "protocols" | "ipVersion" | "splitByProtocol" | "probes" | "probeDisplayMode" | "groupByProbe"
+        | "protocols"
+        | "ipVersion"
+        | "splitByProtocol"
+        | "probes"
+        | "probeDisplayMode"
+        | "groupByProbe"
+        | "spotlightMode"
       >
     >,
   effectiveCardsPerPage?: number,
@@ -1079,6 +1117,7 @@ export function partitionTargetsForTv(
   const selectedProbes = new Set(cfg.probes ?? []);
   const probeDisplayMode: TvProbeDisplayMode = cfg.probeDisplayMode ?? "per-probe";
   const groupByProbe = Boolean(cfg.groupByProbe) && probeDisplayMode === "per-probe";
+  const spotlightMode: TvSpotlightMode = cfg.spotlightMode ?? "off";
 
   const filtered = targets.filter((t) => {
     if (!t.enabled) return false;
@@ -1174,15 +1213,20 @@ export function partitionTargetsForTv(
       return (b.maxP95Ms ?? 0) - (a.maxP95Ms ?? 0);
     });
 
-  const highlightItems = summaries
-    .filter((s) => s.isImpaired || s.isPinnedVip)
-    .sort((a, b) => {
-      const rankDiff = statusSeverity(b.worstStatus) - statusSeverity(a.worstStatus);
-      if (rankDiff !== 0) return rankDiff;
-      if (a.isImpaired !== b.isImpaired) return a.isImpaired ? -1 : 1;
-      if (b.maxLossPct !== a.maxLossPct) return b.maxLossPct - a.maxLossPct;
-      return (b.maxP95Ms ?? 0) - (a.maxP95Ms ?? 0);
-    });
+  const highlightItems =
+    spotlightMode === "off"
+      ? []
+      : summaries
+          .filter((s) =>
+            spotlightMode === "vip" ? s.isPinnedVip : s.isImpaired || s.isPinnedVip
+          )
+          .sort((a, b) => {
+            const rankDiff = statusSeverity(b.worstStatus) - statusSeverity(a.worstStatus);
+            if (rankDiff !== 0) return rankDiff;
+            if (a.isImpaired !== b.isImpaired) return a.isImpaired ? -1 : 1;
+            if (b.maxLossPct !== a.maxLossPct) return b.maxLossPct - a.maxLossPct;
+            return (b.maxP95Ms ?? 0) - (a.maxP95Ms ?? 0);
+          });
 
   // Regular grid pages follow fixed override or dynamically computed Best Fit size
   const resolvedCount =

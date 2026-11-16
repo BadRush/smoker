@@ -76,6 +76,7 @@ import {
   type TvOrientation,
   type TvProbeDisplayMode,
   type TvRange,
+  type TvSpotlightMode,
   type TvWallConfig,
 } from "@/lib/tv-config";
 import { useLiveSocket, type LiveEventMessage } from "@/lib/useLiveSocket";
@@ -371,6 +372,7 @@ export default function NocTvWallboardPage() {
   const mainRef = useRef<HTMLElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const prevImpairedIdsRef = useRef<Set<string>>(new Set());
+  const prevCriticalIdsRef = useRef<Set<string>>(new Set());
   const hasSeededImpairedRef = useRef<boolean>(false);
 
   const handleOpenZoomTarget = useCallback((targetId: string) => {
@@ -747,15 +749,26 @@ export default function NocTvWallboardPage() {
     }
   }, [data, simTargetId]);
 
-  // Event-Driven Auto-Switch + Audio Chime when a target newly enters an impaired state
+  // Event-Driven Auto-Switch (opt-in) + Audio Chime when a target newly enters an impaired state
   useEffect(() => {
     if (!data) return;
     const currentImpaired = new Set(
       partitioned.pinnedAlerts.map((a) => a.target.id)
     );
+    const currentCritical = new Set(
+      partitioned.pinnedAlerts
+        .filter(
+          (a) =>
+            (a.worstStatus === "loss" || a.worstStatus === "down") &&
+            (cfg.spotlightMode !== "vip" || a.isPinnedVip)
+        )
+        .map((a) => a.target.id)
+    );
+
     if (!hasSeededImpairedRef.current) {
       hasSeededImpairedRef.current = true;
       prevImpairedIdsRef.current = currentImpaired;
+      prevCriticalIdsRef.current = currentCritical;
       return;
     }
 
@@ -766,26 +779,37 @@ export default function NocTvWallboardPage() {
         break;
       }
     }
+    let hasNewCritical = false;
+    for (const id of currentCritical) {
+      if (!prevCriticalIdsRef.current.has(id)) {
+        hasNewCritical = true;
+        break;
+      }
+    }
     prevImpairedIdsRef.current = currentImpaired;
+    prevCriticalIdsRef.current = currentCritical;
 
-    if (hasNewImpaired) {
-      if (cfg.sound) {
-        playAlertChime();
-      }
-      if (
-        cfg.rotateSec > 0 &&
-        !paused &&
-        partitioned.highlightSlideIdx !== null
-      ) {
-        setPageIdx(partitioned.highlightSlideIdx);
-        setCountdown(cfg.rotateSec);
-      }
+    if (hasNewImpaired && cfg.sound) {
+      playAlertChime();
+    }
+    if (
+      hasNewCritical &&
+      cfg.spotlightMode !== "off" &&
+      cfg.autoSwitchSpotlight &&
+      cfg.rotateSec > 0 &&
+      !paused &&
+      partitioned.highlightSlideIdx !== null
+    ) {
+      setPageIdx(partitioned.highlightSlideIdx);
+      setCountdown(cfg.rotateSec);
     }
   }, [
     data,
     partitioned.pinnedAlerts,
     partitioned.highlightSlideIdx,
     cfg.sound,
+    cfg.spotlightMode,
+    cfg.autoSwitchSpotlight,
     cfg.rotateSec,
     paused,
   ]);
@@ -861,11 +885,18 @@ export default function NocTvWallboardPage() {
         gridLayout.cardsPerPage,
         snap.probes
       );
-      if (mode !== "clear" && nextPart.highlightSlideIdx !== null) {
-        setPageIdx(nextPart.highlightSlideIdx);
-        setCountdown(cfg.rotateSec);
-        setShowDrawer(false);
-      } else if (mode === "clear") {
+      if (mode !== "clear") {
+        if (cfg.spotlightMode !== "off" && nextPart.highlightSlideIdx !== null) {
+          setPageIdx(nextPart.highlightSlideIdx);
+          setCountdown(cfg.rotateSec);
+          setShowDrawer(false);
+        } else {
+          setImpairedOnly(true);
+          setPageIdx(0);
+          setShowDrawer(false);
+        }
+      } else {
+        setImpairedOnly(false);
         setPageIdx(0);
       }
     } catch (err) {
@@ -1122,7 +1153,7 @@ export default function NocTvWallboardPage() {
 
         {/* Right Controls */}
         <div className="flex items-center gap-1 xl:gap-1.5 shrink-0">
-          {partitioned.highlightItems.length > 0 && (
+          {cfg.spotlightMode !== "off" && partitioned.highlightItems.length > 0 ? (
             <button
               type="button"
               data-testid="tv-spotlight-btn"
@@ -1144,7 +1175,30 @@ export default function NocTvWallboardPage() {
                 {partitioned.highlightItems.length})
               </span>
             </button>
-          )}
+          ) : cfg.spotlightMode === "off" &&
+            (partitioned.pinnedAlerts.length > 0 || impairedOnly) ? (
+            <button
+              type="button"
+              data-testid="tv-anomalies-btn"
+              aria-pressed={impairedOnly}
+              title="Click to filter grid to impaired targets only (Auto Spotlight is Off)"
+              onClick={() => {
+                setImpairedOnly((prev) => !prev);
+                setPageIdx(0);
+              }}
+              className={`inline-flex items-center gap-1 rounded border px-1.5 xl:px-2 py-1 text-[11px] xl:text-xs font-mono font-semibold ${
+                impairedOnly
+                  ? "border-rose-400 bg-rose-500 text-zinc-950"
+                  : "border-rose-500/40 bg-rose-500/15 text-rose-300 hover:bg-rose-500/25"
+              }`}
+            >
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              <span>
+                <span className="hidden xl:inline">Anomalies </span>(
+                {partitioned.pinnedAlerts.length})
+              </span>
+            </button>
+          ) : null}
 
           <button
             type="button"
@@ -2432,6 +2486,69 @@ export default function NocTvWallboardPage() {
                     })
                   )}
                 </div>
+              </div>
+
+              {/* Spotlight & Auto-Switch Policy */}
+              <div className="space-y-2.5 rounded-md border border-border bg-canvas p-3">
+                <p className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
+                  Spotlight &amp; Auto-Switch
+                </p>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(
+                    [
+                      { id: "off", label: "Off (Default)" },
+                      { id: "vip", label: "VIP Only" },
+                      { id: "all", label: "All Anomalies" },
+                    ] as Array<{ id: TvSpotlightMode; label: string }>
+                  ).map((sm) => (
+                    <button
+                      key={sm.id}
+                      type="button"
+                      aria-pressed={cfg.spotlightMode === sm.id}
+                      data-testid={`tv-drawer-spotlight-${sm.id}`}
+                      onClick={() =>
+                        updateConfig((prev) => ({
+                          ...prev,
+                          spotlightMode: sm.id,
+                          autoSwitchSpotlight:
+                            sm.id === "off" ? false : prev.autoSwitchSpotlight,
+                        }))
+                      }
+                      className={`rounded border px-2 py-1.5 text-[11px] font-mono ${
+                        cfg.spotlightMode === sm.id
+                          ? "border-amber-500 bg-amber-500 font-semibold text-zinc-950"
+                          : "border-border bg-elevated text-zinc-200"
+                      }`}
+                    >
+                      {sm.label}
+                    </button>
+                  ))}
+                </div>
+                <label
+                  className={`flex items-start justify-between gap-2 border-t border-border/70 pt-2 text-xs ${
+                    cfg.spotlightMode === "off" ? "text-zinc-500" : "text-zinc-200"
+                  }`}
+                >
+                  <div>
+                    <span className="block">Auto-switch to Spotlight on loss/down</span>
+                    <span className="block text-[10px] text-zinc-400">
+                      Ignores minor latency spikes; in VIP Only mode, only pinned VIP targets jump.
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    data-testid="tv-drawer-auto-switch"
+                    disabled={cfg.spotlightMode === "off"}
+                    checked={cfg.spotlightMode !== "off" && cfg.autoSwitchSpotlight}
+                    onChange={(e) =>
+                      updateConfig((prev) => ({
+                        ...prev,
+                        autoSwitchSpotlight: e.target.checked,
+                      }))
+                    }
+                    className="mt-0.5"
+                  />
+                </label>
               </div>
 
               {/* Alert Audio Chime */}

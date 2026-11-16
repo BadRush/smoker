@@ -260,4 +260,68 @@ describe("NocTvWallboardPage layout controls", () => {
     await user.click(screen.getByTestId("tv-probe-mode-btn"));
     expect(screen.getAllByTestId("tv-target-card")).toHaveLength(2);
   });
+
+  it("keeps Auto Spotlight off by default with manual Anomalies badge, and allows enabling VIP Only + Auto-Switch in Drawer", async () => {
+    const snapWithLoss: MatrixSnapshot = {
+      ...TV_SNAPSHOT,
+      targets: [
+        { ...TV_SNAPSHOT.targets[0], pinned_on_tv: true },
+        TV_SNAPSHOT.targets[1],
+      ],
+      cells: [
+        TV_SNAPSHOT.cells[0],
+        {
+          ...TV_SNAPSHOT.cells[1],
+          status: "down",
+          loss_pct: 100,
+          p50_ms: null,
+          p95_ms: null,
+        },
+      ],
+    };
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/api/tv/matrix")) {
+          return new Response(JSON.stringify(snapWithLoss), { status: 200 });
+        }
+        if (url.startsWith("/api/tv/series")) {
+          return new Response(JSON.stringify({ range: "3h", targets: {} }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<NocTvWallboardPage />);
+
+    // Default Spotlight=off: no tv-spotlight-btn, shows Anomalies (1) button instead, stays on normal grid
+    await waitFor(() => {
+      expect(screen.getByTestId("tv-anomalies-btn")).toHaveTextContent("(1)");
+    });
+    expect(screen.queryByTestId("tv-spotlight-btn")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("tv-highlight-page")).not.toBeInTheDocument();
+
+    // Clicking Anomalies (1) filters the grid to impaired targets manually
+    await user.click(screen.getByTestId("tv-anomalies-btn"));
+    expect(screen.getAllByTestId("tv-target-card")).toHaveLength(1);
+    await user.click(screen.getByTestId("tv-anomalies-btn"));
+    expect(screen.getAllByTestId("tv-target-card")).toHaveLength(2);
+
+    // Open TV Config Drawer -> enable VIP Only spotlight & Auto-Switch
+    await user.click(screen.getByRole("button", { name: "Configure TV Display" }));
+    expect(screen.getByTestId("tv-drawer-auto-switch")).toBeDisabled();
+    await user.click(screen.getByTestId("tv-drawer-spotlight-vip"));
+    expect(screen.getByTestId("tv-drawer-auto-switch")).toBeEnabled();
+    await user.click(screen.getByTestId("tv-drawer-auto-switch"));
+    expect(window.location.search).toContain("spotlight=vip");
+    expect(window.location.search).toContain("autoSwitch=1");
+
+    // Spotlight button now shows 1 (the VIP target only, not the non-VIP down target)
+    expect(screen.getByTestId("tv-spotlight-btn")).toHaveTextContent("(1)");
+  });
 });

@@ -76,6 +76,8 @@ describe("tv-config helpers", () => {
       probes: [],
       probeDisplayMode: "per-probe",
       groupByProbe: false,
+      spotlightMode: "off",
+      autoSwitchSpotlight: false,
       protocols: [],
       ipVersion: "all",
       splitByProtocol: false,
@@ -104,6 +106,17 @@ describe("tv-config helpers", () => {
     expect(probeQs).toContain("probes=p1%2Cp2");
     expect(probeQs).toContain("probeMode=per-target");
     expect(probeQs).toContain("groupProbe=1");
+
+    const spotlightCfg = parseTvConfig("?spotlight=vip&autoSwitch=1");
+    expect(spotlightCfg.spotlightMode).toBe("vip");
+    expect(spotlightCfg.autoSwitchSpotlight).toBe(true);
+    expect(serializeTvConfig(spotlightCfg)).toContain("spotlight=vip");
+    expect(serializeTvConfig(spotlightCfg)).toContain("autoSwitch=1");
+
+    // autoSwitch cannot stay enabled when spotlight=off
+    const offCfg = parseTvConfig("?spotlight=off&autoSwitch=1");
+    expect(offCfg.spotlightMode).toBe("off");
+    expect(offCfg.autoSwitchSpotlight).toBe(false);
 
     const layoutCfg = parseTvConfig(
       "?layout=single-row&cols=3&flow=slides&width=960px&rowW=480px&chartH=260"
@@ -338,9 +351,21 @@ describe("tv-config helpers", () => {
       makeCell("t4", "loss", 25, 40),
     ];
 
+    // Default spotlightMode="off" keeps pinnedAlerts for header count but omits SPOTLIGHT slide
+    const offRes = partitionTargetsForTv(targets, cells, {
+      groups: [],
+      cardsPerPage: 2,
+    });
+    expect(offRes.pinnedAlerts.map((a) => a.target.id)).toEqual(["t3", "t4", "t2"]);
+    expect(offRes.highlightItems).toEqual([]);
+    expect(offRes.highlightSlideIdx).toBeNull();
+    expect(offRes.slides.length).toBe(2);
+
+    // spotlightMode="all" creates dedicated SPOTLIGHT slide with all impaired hosts
     const res = partitionTargetsForTv(targets, cells, {
       groups: [],
       cardsPerPage: 2,
+      spotlightMode: "all",
     });
 
     expect(res.pinnedAlerts.map((a) => a.target.id)).toEqual(["t3", "t4", "t2"]);
@@ -360,20 +385,21 @@ describe("tv-config helpers", () => {
     expect(g1Only.pinnedAlerts.map((a) => a.target.id)).toEqual(["t3", "t2"]);
   });
 
-  it("includes VIP pinned targets on the highlight slide even when healthy", () => {
+  it("includes only VIP pinned targets on the highlight slide when spotlightMode is 'vip'", () => {
     const targets = [
       makeTarget("t1", "VIP Google DNS", "g1", true),
-      makeTarget("t2", "Regular Host", "g1", false),
+      makeTarget("t2", "Regular Host Down", "g1", false),
     ];
     const cells = [
       makeCell("t1", "healthy", 0, 8),
-      makeCell("t2", "healthy", 0, 12),
+      makeCell("t2", "down", 100, null),
     ];
     const res = partitionTargetsForTv(targets, cells, {
       groups: [],
       cardsPerPage: 6,
+      spotlightMode: "vip",
     });
-    expect(res.pinnedAlerts.length).toBe(0);
+    expect(res.pinnedAlerts.map((a) => a.target.id)).toEqual(["t2"]);
     expect(res.highlightItems.map((h) => h.target.id)).toEqual(["t1"]);
     expect(res.slides[0].kind).toBe("grid");
     expect(res.slides[1].kind).toBe("highlight");
@@ -485,7 +511,7 @@ describe("tv-config helpers", () => {
       "SGP Only@Probe-SGP",
     ]);
 
-    // Grouping slides by probe splits Probe-JKT and Probe-SGP slides cleanly
+    // Grouping slides by probe splits Probe-JKT and Probe-SGP slides cleanly (no auto-spotlight by default)
     const grouped = partitionTargetsForTv(
       [tWeb, tCustom],
       cells,
@@ -496,7 +522,6 @@ describe("tv-config helpers", () => {
     expect(grouped.slides.map((s) => s.label)).toEqual([
       "Probe-JKT 1/1",
       "Probe-SGP 1/1",
-      "SPOTLIGHT (1)",
     ]);
     expect(grouped.slides[1].items.map((it) => it.target.name)).toEqual([
       "e1-vhp.com",
