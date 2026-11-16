@@ -12,11 +12,16 @@ import {
   RefreshCw,
   Search,
   ServerCrash,
+  SlidersHorizontal,
   Table2,
 } from "lucide-react";
 import { MiniSparkline } from "@/components/charts/MiniSparkline";
 import { SmokeChartPanel } from "@/components/charts/SmokeChartPanel";
 import { TargetZoomModal } from "@/components/charts/TargetZoomModal";
+import {
+  DisplaySizeControls,
+  LayoutPresetPills,
+} from "@/components/layout/DisplaySizeControls";
 import { NocShell } from "@/components/layout/NocShell";
 import { ProtocolFilterChips } from "@/components/targets/ProtocolFilterChips";
 import {
@@ -26,6 +31,14 @@ import {
   type MatrixSnapshot,
   type Target,
 } from "@/lib/api";
+import {
+  DEFAULT_DASHBOARD_LAYOUT,
+  isDefaultDashboardLayout,
+  loadDashboardLayout,
+  resolveDashboardGrid,
+  saveDashboardLayout,
+  type DashboardLayoutConfig,
+} from "@/lib/display-layout";
 import {
   formatCleanTargetTitle,
   getProtocolFamily,
@@ -61,6 +74,30 @@ export default function MatrixWallPage() {
   const [groupBy, setGroupBy] = useState<GroupByMode>("protocol");
   const [viewMode, setViewMode] = useState<"matrix" | "grid">("matrix");
   const [zoomTargetId, setZoomTargetId] = useState<string | null>(null);
+  const [dashboardLayout, setDashboardLayout] = useState<DashboardLayoutConfig>(
+    DEFAULT_DASHBOARD_LAYOUT
+  );
+  const [showLayoutCustomizer, setShowLayoutCustomizer] = useState(false);
+
+  useEffect(() => {
+    setDashboardLayout(loadDashboardLayout());
+  }, []);
+
+  const updateDashboardLayout = useCallback(
+    (updater: (prev: DashboardLayoutConfig) => DashboardLayoutConfig) => {
+      setDashboardLayout((prev) => {
+        const next = updater(prev);
+        saveDashboardLayout(next);
+        return next;
+      });
+    },
+    []
+  );
+
+  const resolvedGrid = useMemo(
+    () => resolveDashboardGrid(dashboardLayout),
+    [dashboardLayout]
+  );
 
   const loadMatrix = useCallback(async () => {
     try {
@@ -294,7 +331,11 @@ export default function MatrixWallPage() {
   }, [data]);
 
   return (
-    <NocShell wsState={wsState} activeIncidents={kpis.incidents}>
+    <NocShell
+      wsState={wsState}
+      activeIncidents={kpis.incidents}
+      mainMaxWidth={viewMode === "grid" ? resolvedGrid.containerMaxWidth : null}
+    >
       <div className="space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
@@ -530,150 +571,266 @@ export default function MatrixWallPage() {
             No targets match the current search or filter criteria.
           </div>
         ) : viewMode === "grid" ? (
-          <div className="space-y-6">
-            {targetSections.map((section) => (
-              <section key={section.key} className="space-y-3">
-                {section.title && (
-                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/80 pb-2">
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={`rounded border px-2 py-0.5 text-xs font-mono font-semibold ${
-                          section.badgeClass ?? "border-border bg-elevated text-zinc-200"
-                        }`}
-                      >
-                        {section.title}
-                      </span>
-                      {section.subtitle && (
-                        <span className="hidden sm:inline text-xs text-zinc-400">
-                          {section.subtitle}
-                        </span>
-                      )}
-                    </div>
-                    <span className="text-xs font-mono text-zinc-400">
-                      {section.targets.length} target{section.targets.length === 1 ? "" : "s"}
-                    </span>
-                  </div>
-                )}
+          <div className="space-y-4">
+            {/* Compact Grid Layout & Small-Monitor Readability Toolbar */}
+            <div
+              data-testid="dash-layout-bar"
+              className="rounded-lg border border-border bg-surface/90 p-3 space-y-2.5"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[11px] font-mono font-semibold uppercase tracking-wider text-zinc-400">
+                    Layout
+                  </span>
+                  <LayoutPresetPills
+                    testIdPrefix="dash-layout"
+                    preset={dashboardLayout.preset}
+                    customCols={dashboardLayout.customCols}
+                    onSelectPreset={(preset, cols) =>
+                      updateDashboardLayout((prev) => ({
+                        ...prev,
+                        preset,
+                        customCols: cols ?? prev.customCols,
+                      }))
+                    }
+                  />
+                </div>
 
-                <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-                  {section.targets.map((t: Target) => {
-                    const assignedCells = data.probes
-                      .map((p) => ({ probe: p, cell: cellIndex.get(`${t.id}:${p.id}`) }))
-                      .filter((item): item is { probe: typeof item.probe; cell: MatrixCell } =>
-                        Boolean(item.cell)
-                      );
-                    return (
-                      <article
-                        key={t.id}
-                        data-testid="grid-target-card"
-                        className="rounded-lg border border-border bg-surface p-4 space-y-3"
-                      >
-                        <div className="flex flex-wrap items-start justify-between gap-2">
-                          <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    data-testid="dash-probe-layout-btn"
+                    aria-pressed={dashboardLayout.probeLayout === "single"}
+                    onClick={() =>
+                      updateDashboardLayout((prev) => ({
+                        ...prev,
+                        probeLayout: prev.probeLayout === "single" ? "auto" : "single",
+                      }))
+                    }
+                    className={`rounded border px-2.5 py-1 font-mono text-[11px] transition-colors ${
+                      dashboardLayout.probeLayout === "single"
+                        ? "border-cyan-500 bg-cyan-500 font-semibold text-zinc-950"
+                        : "border-border bg-elevated text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                    }`}
+                  >
+                    1 Probe / Row
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="dash-layout-customize-btn"
+                    aria-expanded={showLayoutCustomizer}
+                    onClick={() => setShowLayoutCustomizer((prev) => !prev)}
+                    className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 font-mono text-[11px] transition-colors ${
+                      showLayoutCustomizer || !isDefaultDashboardLayout(dashboardLayout)
+                        ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-300"
+                        : "border-border bg-elevated text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                    }`}
+                  >
+                    <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>
+                      Width &amp; Height
+                      {dashboardLayout.widthSpec !== "auto" || dashboardLayout.chartHeight > 0
+                        ? ` (${
+                            dashboardLayout.widthSpec === "full"
+                              ? "100%"
+                              : dashboardLayout.widthSpec
+                          }${
+                            dashboardLayout.chartHeight > 0
+                              ? ` · ${dashboardLayout.chartHeight}px`
+                              : ""
+                          })`
+                        : ""}
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              {showLayoutCustomizer && (
+                <div className="border-t border-border/60 pt-2.5">
+                  <DisplaySizeControls
+                    testIdPrefix="dash-layout"
+                    widthSpec={dashboardLayout.widthSpec}
+                    onChangeWidthSpec={(widthSpec) =>
+                      updateDashboardLayout((prev) => ({ ...prev, widthSpec }))
+                    }
+                    allowAutoWidth
+                    showRowCardWidth={dashboardLayout.preset === "single-row"}
+                    rowCardWidth={dashboardLayout.rowCardWidth}
+                    onChangeRowCardWidth={(rowCardWidth) =>
+                      updateDashboardLayout((prev) => ({ ...prev, rowCardWidth }))
+                    }
+                    chartHeight={dashboardLayout.chartHeight}
+                    onChangeChartHeight={(chartHeight) =>
+                      updateDashboardLayout((prev) => ({ ...prev, chartHeight }))
+                    }
+                    compact
+                    onReset={() =>
+                      updateDashboardLayout(() => ({ ...DEFAULT_DASHBOARD_LAYOUT }))
+                    }
+                  />
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-6">
+              {targetSections.map((section) => (
+                <section key={section.key} className="space-y-3">
+                  {section.title && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/80 pb-2">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`rounded border px-2 py-0.5 text-xs font-mono font-semibold ${
+                            section.badgeClass ?? "border-border bg-elevated text-zinc-200"
+                          }`}
+                        >
+                          {section.title}
+                        </span>
+                        {section.subtitle && (
+                          <span className="hidden sm:inline text-xs text-zinc-400">
+                            {section.subtitle}
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-xs font-mono text-zinc-400">
+                        {section.targets.length} target{section.targets.length === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                  )}
+
+                  <div
+                    data-testid="dash-section-grid"
+                    data-layout-preset={dashboardLayout.preset}
+                    style={resolvedGrid.gridStyle}
+                    className={resolvedGrid.gridClassName}
+                  >
+                    {section.targets.map((t: Target) => {
+                      const assignedCells = data.probes
+                        .map((p) => ({ probe: p, cell: cellIndex.get(`${t.id}:${p.id}`) }))
+                        .filter((item): item is { probe: typeof item.probe; cell: MatrixCell } =>
+                          Boolean(item.cell)
+                        );
+                      const probeGridClass =
+                        assignedCells.length <= 1 || dashboardLayout.probeLayout === "single"
+                          ? "grid grid-cols-1 gap-2.5"
+                          : "grid grid-cols-1 gap-2.5 sm:grid-cols-2";
+                      return (
+                        <article
+                          key={t.id}
+                          data-testid="grid-target-card"
+                          style={resolvedGrid.isRowStrip ? resolvedGrid.rowCardStyle : undefined}
+                          className="rounded-lg border border-border bg-surface p-4 space-y-3 flex flex-col justify-between"
+                        >
+                          <div className="flex flex-wrap items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <Link
+                                  href={`/targets/${t.id}`}
+                                  className="truncate text-sm font-semibold text-zinc-100 hover:text-emerald-400 transition-colors"
+                                >
+                                  {formatCleanTargetTitle(t.name, t.probe_type)}
+                                </Link>
+                                <span
+                                  className={`rounded border px-1.5 py-0.5 text-[10px] font-mono uppercase ${
+                                    getProtocolFamilyMeta(t.probe_type).badgeClass
+                                  }`}
+                                >
+                                  {t.probe_type}
+                                </span>
+                              </div>
+                              <p className="mt-0.5 truncate text-xs font-mono text-zinc-400">
+                                {t.host}
+                                {groupBy !== "group" && t.group_id && groupMap.get(t.group_id)
+                                  ? ` · ${groupMap.get(t.group_id)}`
+                                  : ""}
+                              </p>
+                            </div>
                             <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setZoomTargetId(t.id)}
+                                data-testid="grid-zoom-btn"
+                                className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-zinc-200 hover:border-emerald-500/60 hover:text-emerald-300"
+                              >
+                                <Maximize2 className="h-3 w-3" aria-hidden="true" />
+                                <span>Zoom</span>
+                              </button>
+                              <Link
+                                href={`/targets?edit=${t.id}`}
+                                className="rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                              >
+                                Edit
+                              </Link>
                               <Link
                                 href={`/targets/${t.id}`}
-                                className="truncate text-sm font-semibold text-zinc-100 hover:text-emerald-400 transition-colors"
+                                className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-emerald-400 hover:border-emerald-500/60"
                               >
-                                {formatCleanTargetTitle(t.name, t.probe_type)}
+                                <span>Inspect</span>
+                                <ArrowUpRight className="h-3 w-3" aria-hidden="true" />
                               </Link>
-                              <span
-                                className={`rounded border px-1.5 py-0.5 text-[10px] font-mono uppercase ${
-                                  getProtocolFamilyMeta(t.probe_type).badgeClass
-                                }`}
-                              >
-                                {t.probe_type}
-                              </span>
                             </div>
-                            <p className="mt-0.5 truncate text-xs font-mono text-zinc-400">
-                              {t.host}
-                              {groupBy !== "group" && t.group_id && groupMap.get(t.group_id)
-                                ? ` · ${groupMap.get(t.group_id)}`
-                                : ""}
-                            </p>
                           </div>
-                          <div className="flex items-center gap-2">
+
+                          {assignedCells.length === 0 ? (
                             <button
                               type="button"
                               onClick={() => setZoomTargetId(t.id)}
-                              data-testid="grid-zoom-btn"
-                              className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-zinc-200 hover:border-emerald-500/60 hover:text-emerald-300"
+                              className="flex w-full items-center justify-center gap-2 rounded border border-dashed border-border p-4 text-center text-xs font-mono text-zinc-400 cursor-zoom-in hover:border-emerald-500/50 hover:text-zinc-200"
                             >
-                              <Maximize2 className="h-3 w-3" aria-hidden="true" />
-                              <span>Zoom</span>
+                              <Maximize2 className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
+                              <span>Waiting for probe telemetry (Click to open Zoom &amp; MTR)</span>
                             </button>
-                            <Link
-                              href={`/targets?edit=${t.id}`}
-                              className="rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
-                            >
-                              Edit
-                            </Link>
-                            <Link
-                              href={`/targets/${t.id}`}
-                              className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2 py-1 text-[11px] font-medium text-emerald-400 hover:border-emerald-500/60"
-                            >
-                              <span>Inspect</span>
-                              <ArrowUpRight className="h-3 w-3" aria-hidden="true" />
-                            </Link>
-                          </div>
-                        </div>
-
-                        {assignedCells.length === 0 ? (
-                          <button
-                            type="button"
-                            onClick={() => setZoomTargetId(t.id)}
-                            className="flex w-full items-center justify-center gap-2 rounded border border-dashed border-border p-4 text-center text-xs font-mono text-zinc-400 cursor-zoom-in hover:border-emerald-500/50 hover:text-zinc-200"
-                          >
-                            <Maximize2 className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
-                            <span>Waiting for probe telemetry (Click to open Zoom &amp; MTR)</span>
-                          </button>
-                        ) : (
-                          <div
-                            className={
-                              assignedCells.length === 1
-                                ? "grid grid-cols-1"
-                                : "grid grid-cols-1 gap-2.5 sm:grid-cols-2"
-                            }
-                          >
-                            {assignedCells.map(({ probe, cell }) => {
-                              const cellSeries = sparklineToProbeSeries(
-                                probe.id,
-                                probe.name,
-                                probe.location_label || "",
-                                cell.sparkline,
-                                cell.jitter_ms,
-                                cell.warn_ms ?? null,
-                                cell.baseline_ms ?? null
-                              );
-                              return (
-                                <SmokeChartPanel
-                                  key={`${t.id}:${probe.id}`}
-                                  compact
-                                  syncKey="matrix-grid"
-                                  targetName={t.name}
-                                  targetHost={t.host}
-                                  rangeLabel="15m Live"
-                                  baselineMs={cell.baseline_ms ?? null}
-                                  warnMs={resolveEffectiveWarnMs({
-                                    cellWarnMs: cell.warn_ms,
-                                    target: t,
-                                    probeId: probe.id,
-                                    series: cellSeries,
-                                  })}
-                                  showThresholdMeta={false}
-                                  series={cellSeries}
-                                  onZoomClick={() => setZoomTargetId(t.id)}
-                                />
-                              );
-                            })}
-                          </div>
-                        )}
-                      </article>
-                    );
-                  })}
-                </div>
-              </section>
-            ))}
+                          ) : (
+                            <div className={probeGridClass}>
+                              {assignedCells.map(({ probe, cell }) => {
+                                const cellSeries = sparklineToProbeSeries(
+                                  probe.id,
+                                  probe.name,
+                                  probe.location_label || "",
+                                  cell.sparkline,
+                                  cell.jitter_ms,
+                                  cell.warn_ms ?? null,
+                                  cell.baseline_ms ?? null
+                                );
+                                return (
+                                  <SmokeChartPanel
+                                    key={`${t.id}:${probe.id}`}
+                                    compact
+                                    fixedHeight={
+                                      dashboardLayout.chartHeight > 0
+                                        ? dashboardLayout.chartHeight
+                                        : dashboardLayout.preset === "single-row"
+                                        ? 280
+                                        : dashboardLayout.preset === "single-col"
+                                        ? 200
+                                        : undefined
+                                    }
+                                    syncKey="matrix-grid"
+                                    targetName={t.name}
+                                    targetHost={t.host}
+                                    rangeLabel="15m Live"
+                                    baselineMs={cell.baseline_ms ?? null}
+                                    warnMs={resolveEffectiveWarnMs({
+                                      cellWarnMs: cell.warn_ms,
+                                      target: t,
+                                      probeId: probe.id,
+                                      series: cellSeries,
+                                    })}
+                                    showThresholdMeta={false}
+                                    series={cellSeries}
+                                    onZoomClick={() => setZoomTargetId(t.id)}
+                                  />
+                                );
+                              })}
+                            </div>
+                          )}
+                        </article>
+                      );
+                    })}
+                  </div>
+                </section>
+              ))}
+            </div>
           </div>
         ) : (
           <div className="overflow-x-auto rounded-lg border border-border bg-surface">

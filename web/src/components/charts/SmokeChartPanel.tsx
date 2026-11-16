@@ -356,6 +356,19 @@ export function SmokeChartPanel({
   }, [hasData, syncKey, defaultHeight, compact, effectiveFillHeight]);
 
   useEffect(() => {
+    const plot = plotRef.current;
+    const el = containerRef.current;
+    if (!plot || !el || !fixedHeight || fixedHeight <= 0) return;
+    const w = Math.max(el.clientWidth || sizeRef.current.w, compact ? 220 : 300);
+    const measuredH = el.clientHeight > 20 ? el.clientHeight : Math.max(72, fixedHeight - 28);
+    const h = Math.max(72, Math.floor(measuredH));
+    if (w !== sizeRef.current.w || h !== sizeRef.current.h) {
+      sizeRef.current = { w, h };
+      plot.setSize?.({ width: w, height: h });
+    }
+  }, [fixedHeight, compact]);
+
+  useEffect(() => {
     const nextRangeKey = effectiveWindowSec ?? rangeLabel ?? null;
     const rangeChanged = prevWindowKeyRef.current !== nextRangeKey;
     prevWindowKeyRef.current = nextRangeKey;

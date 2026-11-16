@@ -1,5 +1,15 @@
 import type { MatrixCell, Target } from "./api";
 import {
+  clampChartHeight,
+  clampColumnCount,
+  parseWidthSpec,
+  resolveEffectivePixelWidth,
+  VALID_FLOW_MODES,
+  VALID_LAYOUT_PRESETS,
+  type FlowMode,
+  type LayoutPreset,
+} from "./display-layout";
+import {
   groupItemsByProtocol,
   isValidProtocolFamily,
   matchesProtocolAndIpFilter,
@@ -9,6 +19,7 @@ import {
 import type { CellStatus } from "./smoke-math";
 
 export const UNGROUPED_GROUP_TOKEN = "ungrouped";
+export const TV_CONFIG_STORAGE_KEY = "smoker.tv.config.v1";
 
 export type TvOrientation = "landscape" | "portrait";
 export type TvRange = "15m" | "1h" | "3h" | "6h" | "12h" | "24h" | "7d";
@@ -33,6 +44,12 @@ export interface TvWallConfig {
   cardsPerPage: number;
   range: TvRange;
   sound: boolean;
+  layoutMode: LayoutPreset;
+  customCols: number;
+  flowMode: FlowMode;
+  widthSpec: string;
+  rowCardWidth: string;
+  chartHeight: number;
 }
 
 export interface TargetHealthSummary {
@@ -62,6 +79,7 @@ export interface TvGridLayout {
   panelWidth: number;
   panelHeight: number;
   aspectRatio: number;
+  horizontalScroll?: boolean;
 }
 
 const VALID_ROTATE = new Set([0, 10, 15, 30, 60]);
@@ -79,7 +97,133 @@ export const DEFAULT_TV_CONFIG: TvWallConfig = {
   cardsPerPage: 0, // 0 = Auto Best Fit
   range: "3h",
   sound: false,
+  layoutMode: "auto",
+  customCols: 0,
+  flowMode: "auto",
+  widthSpec: "full",
+  rowCardWidth: "auto",
+  chartHeight: 0,
 };
+
+function sanitizeTvWidthSpec(raw: string | null | undefined): string {
+  const parsed = parseWidthSpec(raw, {
+    allowAuto: false,
+    allowFull: true,
+    minPx: 320,
+    maxPx: 2560,
+    minPct: 35,
+    maxPct: 100,
+  });
+  return parsed ? parsed.normalized : DEFAULT_TV_CONFIG.widthSpec;
+}
+
+function sanitizeTvRowCardWidth(raw: string | null | undefined): string {
+  const parsed = parseWidthSpec(raw, {
+    allowAuto: true,
+    allowFull: false,
+    minPx: 280,
+    maxPx: 1600,
+    minPct: 20,
+    maxPct: 100,
+  });
+  return parsed ? parsed.normalized : DEFAULT_TV_CONFIG.rowCardWidth;
+}
+
+export function sanitizeTvConfig(raw: unknown): TvWallConfig {
+  if (!raw || typeof raw !== "object") {
+    return { ...DEFAULT_TV_CONFIG };
+  }
+  const obj = raw as Partial<TvWallConfig>;
+  const orientation: TvOrientation =
+    obj.orientation === "portrait" ? "portrait" : "landscape";
+  const groups = Array.isArray(obj.groups)
+    ? obj.groups.map((s) => String(s).trim()).filter(Boolean)
+    : [];
+  const protocols: ProtocolFamily[] = [];
+  const seenProto = new Set<ProtocolFamily>();
+  if (Array.isArray(obj.protocols)) {
+    for (const part of obj.protocols) {
+      const clean = String(part).trim().toLowerCase();
+      if (isValidProtocolFamily(clean) && !seenProto.has(clean)) {
+        seenProto.add(clean);
+        protocols.push(clean);
+      }
+    }
+  }
+  const ipVersion: IpFamilyFilter =
+    obj.ipVersion === "ipv4" || obj.ipVersion === "ipv6" ? obj.ipVersion : "all";
+  const splitByProtocol = Boolean(obj.splitByProtocol);
+  const rotateSec =
+    typeof obj.rotateSec === "number" && VALID_ROTATE.has(obj.rotateSec)
+      ? obj.rotateSec
+      : DEFAULT_TV_CONFIG.rotateSec;
+  const cardsPerPage =
+    typeof obj.cardsPerPage === "number" && VALID_CARDS.has(obj.cardsPerPage)
+      ? obj.cardsPerPage
+      : DEFAULT_TV_CONFIG.cardsPerPage;
+  const range: TvRange = VALID_RANGES.has(String(obj.range))
+    ? (obj.range as TvRange)
+    : DEFAULT_TV_CONFIG.range;
+  const sound = Boolean(obj.sound);
+  const layoutMode: LayoutPreset = VALID_LAYOUT_PRESETS.has(
+    obj.layoutMode as LayoutPreset
+  )
+    ? (obj.layoutMode as LayoutPreset)
+    : DEFAULT_TV_CONFIG.layoutMode;
+  const rawCols = typeof obj.customCols === "number" ? obj.customCols : Number(obj.customCols);
+  const customCols =
+    Number.isFinite(rawCols) && rawCols > 0 ? clampColumnCount(rawCols, 0) : 0;
+  const flowMode: FlowMode = VALID_FLOW_MODES.has(obj.flowMode as FlowMode)
+    ? (obj.flowMode as FlowMode)
+    : DEFAULT_TV_CONFIG.flowMode;
+  const widthSpec = sanitizeTvWidthSpec(obj.widthSpec);
+  const rowCardWidth = sanitizeTvRowCardWidth(obj.rowCardWidth);
+  const chartHeight = clampChartHeight(
+    obj.chartHeight,
+    DEFAULT_TV_CONFIG.chartHeight
+  );
+
+  return {
+    orientation,
+    groups,
+    protocols,
+    ipVersion,
+    splitByProtocol,
+    rotateSec,
+    cardsPerPage,
+    range,
+    sound,
+    layoutMode,
+    customCols,
+    flowMode,
+    widthSpec,
+    rowCardWidth,
+    chartHeight,
+  };
+}
+
+export function loadTvConfigFromStorage(): TvWallConfig | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(TV_CONFIG_STORAGE_KEY);
+    if (!raw) return null;
+    return sanitizeTvConfig(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+export function saveTvConfigToStorage(cfg: TvWallConfig): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      TV_CONFIG_STORAGE_KEY,
+      JSON.stringify(sanitizeTvConfig(cfg))
+    );
+  } catch {
+    // ignore storage quota errors
+  }
+}
 
 export function parseTvConfig(search: string): TvWallConfig {
   const raw = search.startsWith("?") ? search.slice(1) : search;
@@ -138,6 +282,32 @@ export function parseTvConfig(search: string): TvWallConfig {
   const soundParam = params.get("sound");
   const sound = soundParam === "1" || soundParam === "true";
 
+  const layoutParam = (params.get("layout") ?? "").trim().toLowerCase();
+  const layoutMode: LayoutPreset = VALID_LAYOUT_PRESETS.has(
+    layoutParam as LayoutPreset
+  )
+    ? (layoutParam as LayoutPreset)
+    : DEFAULT_TV_CONFIG.layoutMode;
+
+  const colsRaw = params.get("cols");
+  const colsNum = colsRaw ? Number(colsRaw) : 0;
+  const customCols =
+    Number.isFinite(colsNum) && colsNum > 0
+      ? clampColumnCount(colsNum, 0)
+      : DEFAULT_TV_CONFIG.customCols;
+
+  const flowParam = (params.get("flow") ?? "").trim().toLowerCase();
+  const flowMode: FlowMode = VALID_FLOW_MODES.has(flowParam as FlowMode)
+    ? (flowParam as FlowMode)
+    : DEFAULT_TV_CONFIG.flowMode;
+
+  const widthSpec = sanitizeTvWidthSpec(params.get("width"));
+  const rowCardWidth = sanitizeTvRowCardWidth(params.get("rowW"));
+  const chartHeight = clampChartHeight(
+    params.get("chartH"),
+    DEFAULT_TV_CONFIG.chartHeight
+  );
+
   return {
     orientation,
     groups,
@@ -148,6 +318,12 @@ export function parseTvConfig(search: string): TvWallConfig {
     cardsPerPage,
     range,
     sound,
+    layoutMode,
+    customCols,
+    flowMode,
+    widthSpec,
+    rowCardWidth,
+    chartHeight,
   };
 }
 
@@ -170,6 +346,24 @@ export function serializeTvConfig(cfg: TvWallConfig): string {
   params.set("cards", cfg.cardsPerPage === 0 ? "auto" : String(cfg.cardsPerPage));
   params.set("range", cfg.range);
   params.set("sound", cfg.sound ? "1" : "0");
+  if (cfg.layoutMode !== DEFAULT_TV_CONFIG.layoutMode) {
+    params.set("layout", cfg.layoutMode);
+  }
+  if (cfg.customCols > 0) {
+    params.set("cols", String(clampColumnCount(cfg.customCols, 1)));
+  }
+  if (cfg.flowMode !== DEFAULT_TV_CONFIG.flowMode) {
+    params.set("flow", cfg.flowMode);
+  }
+  if (cfg.widthSpec !== DEFAULT_TV_CONFIG.widthSpec) {
+    params.set("width", cfg.widthSpec);
+  }
+  if (cfg.rowCardWidth !== DEFAULT_TV_CONFIG.rowCardWidth) {
+    params.set("rowW", cfg.rowCardWidth);
+  }
+  if (cfg.chartHeight > 0) {
+    params.set("chartH", String(clampChartHeight(cfg.chartHeight, 0)));
+  }
   return params.toString();
 }
 
@@ -269,21 +463,303 @@ export function selectFocalProbeCell(
   return best;
 }
 
+export function resolveTvFlowMode(
+  cfg: Pick<TvWallConfig, "orientation" | "layoutMode" | "flowMode">,
+  stageWidth: number,
+  stageHeight: number
+): "slides" | "scroll" {
+  if (cfg.flowMode === "slides" || cfg.flowMode === "scroll") {
+    return cfg.flowMode;
+  }
+  if (cfg.layoutMode === "single-row") {
+    return "slides";
+  }
+  const isPortrait = cfg.orientation === "portrait" || stageHeight > stageWidth * 1.15;
+  if (isPortrait || cfg.layoutMode === "single-col") {
+    return "scroll";
+  }
+  return "slides";
+}
+
+function resolveScrollPanelHeight(
+  panelWidth: number,
+  cols: number,
+  safeW: number,
+  customChartH: number
+): number {
+  if (customChartH > 0) return customChartH;
+  const ratio = cols === 1 && safeW >= 1000 ? 3.5 : 2.35;
+  return Math.max(190, Math.min(310, Math.round(panelWidth / ratio)));
+}
+
 export function computeBestFitGrid(input: {
   width: number;
   height: number;
   orientation: TvOrientation;
   cardsOverride?: number;
   maxItems?: number;
+  layoutMode?: LayoutPreset;
+  customCols?: number;
+  chartHeight?: number;
+  widthSpec?: string;
+  rowCardWidth?: string;
+  scrollMode?: boolean;
 }): TvGridLayout {
-  const safeW = Math.max(320, Math.floor(input.width));
+  const baseW = Math.max(320, Math.floor(input.width));
+  const safeW = input.widthSpec
+    ? resolveEffectivePixelWidth(input.widthSpec, baseW)
+    : baseW;
   const safeH = Math.max(300, Math.floor(input.height));
   const isPortrait = input.orientation === "portrait" || safeH > safeW * 1.15;
+  const layoutMode: LayoutPreset = input.layoutMode ?? "auto";
+  const customChartH =
+    input.chartHeight && input.chartHeight > 0
+      ? clampChartHeight(input.chartHeight, 0)
+      : 0;
   const targetMinCardW = 360;
   const idealBalancedCardW = 440;
-  const maxColsCap = isPortrait ? 2 : safeW >= 2400 ? 5 : 4;
+  const maxColsCap = isPortrait ? (safeW < 900 ? 1 : 2) : safeW >= 2400 ? 5 : 4;
   const itemLimit =
     input.maxItems && input.maxItems > 0 ? input.maxItems : undefined;
+
+  if (layoutMode === "single-col") {
+    const cardWidth = safeW;
+    const panelWidth = Math.max(200, cardWidth - CARD_CHROME_W);
+    if (input.scrollMode) {
+      const panelHeight = resolveScrollPanelHeight(panelWidth, 1, safeW, customChartH);
+      const cardHeight = panelHeight + CARD_CHROME_H;
+      const rows = Math.max(1, itemLimit ?? 1);
+      return {
+        cols: 1,
+        rows,
+        cardsPerPage: rows,
+        cardWidth,
+        cardHeight,
+        panelWidth,
+        panelHeight,
+        aspectRatio: Number((panelWidth / Math.max(1, panelHeight)).toFixed(2)),
+      };
+    }
+    const idealPanelH =
+      customChartH > 0
+        ? customChartH
+        : Math.max(150, Math.min(280, Math.round(panelWidth / 3.2)));
+    const idealCardH = idealPanelH + CARD_CHROME_H;
+    const rawRows =
+      input.cardsOverride && input.cardsOverride > 0
+        ? input.cardsOverride
+        : Math.max(1, Math.floor((safeH + GRID_GAP_PX) / (idealCardH + GRID_GAP_PX)));
+    const rows = itemLimit ? Math.min(rawRows, itemLimit) : Math.max(1, rawRows);
+    const maxFitCardH = Math.floor((safeH - GRID_GAP_PX * (rows - 1)) / rows);
+    const panelHeight = Math.max(
+      MIN_PANEL_H,
+      Math.min(idealPanelH, maxFitCardH - CARD_CHROME_H)
+    );
+    const cardHeight = panelHeight + CARD_CHROME_H;
+    return {
+      cols: 1,
+      rows,
+      cardsPerPage: rows,
+      cardWidth,
+      cardHeight,
+      panelWidth,
+      panelHeight,
+      aspectRatio: Number((panelWidth / Math.max(1, panelHeight)).toFixed(2)),
+    };
+  }
+
+  if (layoutMode === "single-row") {
+    const parsedRowW =
+      input.rowCardWidth && input.rowCardWidth !== "auto"
+        ? parseWidthSpec(input.rowCardWidth, {
+            allowAuto: false,
+            allowFull: false,
+            minPx: 280,
+            maxPx: 1600,
+            minPct: 20,
+            maxPct: 100,
+          })
+        : null;
+
+    let cols: number;
+    let cardWidth: number;
+    let horizontalScroll = false;
+
+    if (input.customCols && input.customCols > 0) {
+      cols = clampColumnCount(input.customCols, 2);
+      if (itemLimit) cols = Math.min(cols, itemLimit);
+      const naturalW = Math.floor((safeW - GRID_GAP_PX * (cols - 1)) / cols);
+      if (parsedRowW) {
+        const explicitW =
+          parsedRowW.kind === "percent"
+            ? Math.floor((safeW * parsedRowW.value) / 100) - GRID_GAP_PX
+            : parsedRowW.value;
+        if (cols * explicitW + GRID_GAP_PX * (cols - 1) > safeW) {
+          cardWidth = Math.max(240, explicitW);
+          horizontalScroll = true;
+        } else {
+          cardWidth = Math.max(240, Math.min(naturalW, explicitW));
+        }
+      } else {
+        cardWidth = naturalW;
+      }
+    } else if (parsedRowW) {
+      if (parsedRowW.kind === "percent") {
+        cols = Math.max(1, Math.min(6, Math.round(100 / parsedRowW.value)));
+        if (itemLimit) cols = Math.min(cols, itemLimit);
+        cardWidth = Math.max(240, Math.floor((safeW * parsedRowW.value) / 100) - GRID_GAP_PX);
+        horizontalScroll =
+          cols * cardWidth + GRID_GAP_PX * Math.max(0, cols - 1) > safeW;
+      } else {
+        cardWidth = parsedRowW.value;
+        const fitCols = Math.max(
+          1,
+          Math.floor((safeW + GRID_GAP_PX) / (cardWidth + GRID_GAP_PX))
+        );
+        const desiredCols = itemLimit ? Math.max(fitCols, itemLimit) : Math.max(fitCols, 1);
+        cols = itemLimit ? Math.min(desiredCols, itemLimit) : fitCols;
+        horizontalScroll =
+          cols * cardWidth + GRID_GAP_PX * Math.max(0, cols - 1) > safeW;
+      }
+    } else {
+      const baseAutoCols = isPortrait
+        ? 1
+        : safeW >= 1800
+        ? 4
+        : safeW >= 1150
+        ? 3
+        : safeW >= 720
+        ? 2
+        : 1;
+      cols = itemLimit ? Math.min(baseAutoCols, itemLimit) : baseAutoCols;
+      cardWidth = Math.floor((safeW - GRID_GAP_PX * (cols - 1)) / cols);
+    }
+
+    const panelWidth = Math.max(200, cardWidth - CARD_CHROME_W);
+    const maxRowPanelH = Math.max(MIN_PANEL_H, safeH - CARD_CHROME_H);
+    const panelHeight =
+      customChartH > 0
+        ? Math.max(MIN_PANEL_H, Math.min(customChartH, maxRowPanelH))
+        : maxRowPanelH;
+    const cardHeight = panelHeight + CARD_CHROME_H;
+    return {
+      cols,
+      rows: 1,
+      cardsPerPage: horizontalScroll ? Math.max(cols, itemLimit ?? 24) : cols,
+      cardWidth,
+      cardHeight,
+      panelWidth,
+      panelHeight,
+      aspectRatio: Number((panelWidth / Math.max(1, panelHeight)).toFixed(2)),
+      horizontalScroll,
+    };
+  }
+
+  if (layoutMode === "cols") {
+    const cols = clampColumnCount(
+      input.customCols,
+      isPortrait && safeW < 900 ? 1 : 2
+    );
+    const cardWidth =
+      cols === 1
+        ? safeW
+        : Math.floor((safeW - GRID_GAP_PX * (cols - 1)) / cols);
+    const panelWidth = Math.max(200, cardWidth - CARD_CHROME_W);
+    if (input.scrollMode) {
+      const panelHeight = resolveScrollPanelHeight(
+        panelWidth,
+        cols,
+        safeW,
+        customChartH
+      );
+      const cardHeight = panelHeight + CARD_CHROME_H;
+      const rows = Math.max(1, Math.ceil((itemLimit ?? cols) / cols));
+      return {
+        cols,
+        rows,
+        cardsPerPage: rows * cols,
+        cardWidth,
+        cardHeight,
+        panelWidth,
+        panelHeight,
+        aspectRatio: Number((panelWidth / Math.max(1, panelHeight)).toFixed(2)),
+      };
+    }
+
+    const targetCount =
+      input.cardsOverride && input.cardsOverride > 0
+        ? itemLimit
+          ? Math.min(input.cardsOverride, itemLimit)
+          : input.cardsOverride
+        : 0;
+    const idealPanelH =
+      customChartH > 0
+        ? customChartH
+        : Math.round(panelWidth / (cols === 1 ? 3.2 : TARGET_GRAPH_RATIO));
+    const idealCardH = idealPanelH + CARD_CHROME_H;
+    let rows =
+      targetCount > 0
+        ? Math.max(1, Math.ceil(targetCount / cols))
+        : Math.max(1, Math.floor((safeH + GRID_GAP_PX) / (idealCardH + GRID_GAP_PX)));
+    if (itemLimit && targetCount === 0) {
+      rows = Math.min(rows, Math.max(1, Math.ceil(itemLimit / cols)));
+    }
+    const maxFitCardH = Math.floor((safeH - GRID_GAP_PX * (rows - 1)) / rows);
+    const panelHeight = Math.max(
+      MIN_PANEL_H,
+      Math.min(idealPanelH, maxFitCardH - CARD_CHROME_H)
+    );
+    const cardHeight = panelHeight + CARD_CHROME_H;
+    return {
+      cols,
+      rows,
+      cardsPerPage:
+        input.cardsOverride && input.cardsOverride > 0
+          ? input.cardsOverride
+          : cols * rows,
+      cardWidth,
+      cardHeight,
+      panelWidth,
+      panelHeight,
+      aspectRatio: Number((panelWidth / Math.max(1, panelHeight)).toFixed(2)),
+    };
+  }
+
+  if (input.scrollMode) {
+    const autoCols = isPortrait
+      ? safeW < 900
+        ? 1
+        : 2
+      : safeW >= 1400
+      ? 3
+      : safeW >= 760
+      ? 2
+      : 1;
+    const cols = itemLimit ? Math.min(autoCols, itemLimit) : autoCols;
+    const cardWidth =
+      cols === 1
+        ? safeW
+        : Math.floor((safeW - GRID_GAP_PX * (cols - 1)) / cols);
+    const panelWidth = Math.max(200, cardWidth - CARD_CHROME_W);
+    const panelHeight = resolveScrollPanelHeight(
+      panelWidth,
+      cols,
+      safeW,
+      customChartH
+    );
+    const cardHeight = panelHeight + CARD_CHROME_H;
+    const rows = Math.max(1, Math.ceil((itemLimit ?? cols) / cols));
+    return {
+      cols,
+      rows,
+      cardsPerPage: rows * cols,
+      cardWidth,
+      cardHeight,
+      panelWidth,
+      panelHeight,
+      aspectRatio: Number((panelWidth / Math.max(1, panelHeight)).toFixed(2)),
+    };
+  }
 
   if (input.cardsOverride && input.cardsOverride > 0) {
     const targetCount = itemLimit
@@ -294,15 +770,17 @@ export function computeBestFitGrid(input: {
 
     const maxTryCols = Math.min(
       Math.max(1, targetCount),
-      isPortrait ? 2 : 4
+      maxColsCap
     );
     for (let cols = 1; cols <= maxTryCols; cols++) {
       const rows = Math.max(1, Math.ceil(targetCount / cols));
       const rawCardW = (safeW - GRID_GAP_PX * (cols - 1)) / cols;
-      const cardWidth =
-        cols === 1 ? Math.min(Math.floor(rawCardW), 1120) : Math.floor(rawCardW);
+      const cardWidth = cols === 1 ? safeW : Math.floor(rawCardW);
       const panelWidth = Math.max(200, cardWidth - CARD_CHROME_W);
-      const idealPanelH = Math.round(panelWidth / TARGET_GRAPH_RATIO);
+      const idealPanelH =
+        customChartH > 0
+          ? customChartH
+          : Math.round(panelWidth / TARGET_GRAPH_RATIO);
       const maxFitCardH = Math.floor(
         (safeH - GRID_GAP_PX * (rows - 1)) / rows
       );
@@ -349,10 +827,12 @@ export function computeBestFitGrid(input: {
     if (cols > 1 && rawCardW < targetMinCardW) {
       continue;
     }
-    const cardWidth =
-      cols === 1 ? Math.min(Math.floor(rawCardW), 1120) : Math.floor(rawCardW);
+    const cardWidth = cols === 1 ? safeW : Math.floor(rawCardW);
     const panelWidth = Math.max(200, cardWidth - CARD_CHROME_W);
-    const idealPanelH = Math.round(panelWidth / TARGET_GRAPH_RATIO);
+    const idealPanelH =
+      customChartH > 0
+        ? customChartH
+        : Math.round(panelWidth / TARGET_GRAPH_RATIO);
     const idealCardH = idealPanelH + CARD_CHROME_H;
 
     let rows = Math.max(
@@ -363,7 +843,13 @@ export function computeBestFitGrid(input: {
 
     // On ultra-short screens (e.g. 1024x600), gently allow 2 rows of slightly wider strips
     // instead of wasting nearly half the screen on a single row.
-    if (rows === 1 && safeH >= 470 && cols >= 2 && (!itemLimit || itemLimit > cols)) {
+    if (
+      customChartH === 0 &&
+      rows === 1 &&
+      safeH >= 470 &&
+      cols >= 2 &&
+      (!itemLimit || itemLimit > cols)
+    ) {
       const twoRowCardH = Math.floor((safeH - GRID_GAP_PX) / 2);
       const twoRowPanelH = twoRowCardH - CARD_CHROME_H;
       if (twoRowPanelH >= 145 && panelWidth / twoRowPanelH <= 3.1) {
@@ -417,7 +903,10 @@ export function computeBestFitGrid(input: {
   const panelWidth = Math.max(200, safeW - CARD_CHROME_W);
   const panelHeight = Math.max(
     MIN_PANEL_H,
-    Math.min(Math.round(panelWidth / TARGET_GRAPH_RATIO), safeH - CARD_CHROME_H)
+    Math.min(
+      customChartH > 0 ? customChartH : Math.round(panelWidth / TARGET_GRAPH_RATIO),
+      safeH - CARD_CHROME_H
+    )
   );
   return {
     cols: 1,
@@ -438,6 +927,7 @@ export function partitionTargetsForTv(
     Partial<Pick<TvWallConfig, "protocols" | "ipVersion" | "splitByProtocol">>,
   effectiveCardsPerPage?: number
 ): {
+  allSummaries: TargetHealthSummary[];
   pinnedAlerts: TargetHealthSummary[];
   highlightItems: TargetHealthSummary[];
   pages: TargetHealthSummary[][];
@@ -535,6 +1025,7 @@ export function partitionTargetsForTv(
   }
 
   return {
+    allSummaries: summaries,
     pinnedAlerts,
     highlightItems,
     pages,

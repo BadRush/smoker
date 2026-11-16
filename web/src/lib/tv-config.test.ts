@@ -1,8 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
   computeBestFitGrid,
+  loadTvConfigFromStorage,
   parseTvConfig,
   partitionTargetsForTv,
+  resolveTvFlowMode,
+  saveTvConfigToStorage,
   selectFocalProbeCell,
   serializeTvConfig,
   UNGROUPED_GROUP_TOKEN,
@@ -59,6 +62,10 @@ function makeCell(
 }
 
 describe("tv-config helpers", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
   it("parses and serializes URL query parameters cleanly", () => {
     const cfg = parseTvConfig(
       "?orientation=portrait&groups=g1,g2&rotate=30&cards=8&range=6h&sound=1"
@@ -73,12 +80,38 @@ describe("tv-config helpers", () => {
       cardsPerPage: 8,
       range: "6h",
       sound: true,
+      layoutMode: "auto",
+      customCols: 0,
+      flowMode: "auto",
+      widthSpec: "full",
+      rowCardWidth: "auto",
+      chartHeight: 0,
     });
 
     const qs = serializeTvConfig(cfg);
     expect(qs).toBe(
       "orientation=portrait&groups=g1%2Cg2&rotate=30&cards=8&range=6h&sound=1"
     );
+
+    const layoutCfg = parseTvConfig(
+      "?layout=single-row&cols=3&flow=slides&width=960px&rowW=480px&chartH=260"
+    );
+    expect(layoutCfg.layoutMode).toBe("single-row");
+    expect(layoutCfg.customCols).toBe(3);
+    expect(layoutCfg.flowMode).toBe("slides");
+    expect(layoutCfg.widthSpec).toBe("960px");
+    expect(layoutCfg.rowCardWidth).toBe("480px");
+    expect(layoutCfg.chartHeight).toBe(260);
+    const layoutQs = serializeTvConfig(layoutCfg);
+    expect(layoutQs).toContain("layout=single-row");
+    expect(layoutQs).toContain("cols=3");
+    expect(layoutQs).toContain("flow=slides");
+    expect(layoutQs).toContain("width=960px");
+    expect(layoutQs).toContain("rowW=480px");
+    expect(layoutQs).toContain("chartH=260");
+
+    saveTvConfigToStorage(layoutCfg);
+    expect(loadTvConfigFromStorage()).toEqual(layoutCfg);
 
     const protoCfg = parseTvConfig(
       "?groups=ungrouped,g-custom&protocols=icmp,dns&ip=ipv6&split=protocol"
@@ -165,6 +198,106 @@ describe("tv-config helpers", () => {
     expect(manualSix.cardsPerPage).toBe(6);
     expect(manualSix.aspectRatio).toBeGreaterThanOrEqual(2.1);
     expect(manualSix.aspectRatio).toBeLessThanOrEqual(2.6);
+
+    // Narrow portrait (<900px) uses 1 column cleanly downwards; wider portrait allows 2 cols
+    const narrowPortrait = computeBestFitGrid({
+      width: 720,
+      height: 1200,
+      orientation: "portrait",
+      scrollMode: true,
+    });
+    expect(narrowPortrait.cols).toBe(1);
+    expect(narrowPortrait.cardWidth).toBe(720);
+    expect(narrowPortrait.panelHeight).toBeGreaterThanOrEqual(190);
+
+    // Single-col full removes 1120px cap and spans entire effective stage width
+    const fullSingleCol = computeBestFitGrid({
+      width: 1900,
+      height: 988,
+      orientation: "landscape",
+      layoutMode: "single-col",
+      scrollMode: true,
+    });
+    expect(fullSingleCol.cols).toBe(1);
+    expect(fullSingleCol.cardWidth).toBe(1900);
+    expect(fullSingleCol.panelHeight).toBeGreaterThanOrEqual(200);
+
+    // Single-row landscape forces 1 horizontal row with full height utilization
+    const singleRow = computeBestFitGrid({
+      width: 1280,
+      height: 640,
+      orientation: "landscape",
+      layoutMode: "single-row",
+      customCols: 2,
+    });
+    expect(singleRow.rows).toBe(1);
+    expect(singleRow.cols).toBe(2);
+    expect(singleRow.panelHeight).toBeGreaterThan(300);
+
+    // Explicit rowCardWidth triggers horizontalScroll when exceeding container width
+    const singleRowScroll = computeBestFitGrid({
+      width: 1000,
+      height: 600,
+      orientation: "landscape",
+      layoutMode: "single-row",
+      rowCardWidth: "480px",
+      maxItems: 5,
+    });
+    expect(singleRowScroll.rows).toBe(1);
+    expect(singleRowScroll.cardWidth).toBe(480);
+    expect(singleRowScroll.horizontalScroll).toBe(true);
+
+    // Custom widthSpec + chartHeight constraints
+    const customBox = computeBestFitGrid({
+      width: 1900,
+      height: 988,
+      orientation: "landscape",
+      layoutMode: "single-col",
+      widthSpec: "960px",
+      chartHeight: 280,
+      scrollMode: true,
+    });
+    expect(customBox.cols).toBe(1);
+    expect(customBox.cardWidth).toBe(960);
+    expect(customBox.panelHeight).toBe(280);
+  });
+
+  it("resolves flow mode automatically from orientation and layout preset", () => {
+    expect(
+      resolveTvFlowMode(
+        { orientation: "landscape", layoutMode: "auto", flowMode: "auto" },
+        1280,
+        720
+      )
+    ).toBe("slides");
+    expect(
+      resolveTvFlowMode(
+        { orientation: "portrait", layoutMode: "auto", flowMode: "auto" },
+        720,
+        1280
+      )
+    ).toBe("scroll");
+    expect(
+      resolveTvFlowMode(
+        { orientation: "landscape", layoutMode: "single-col", flowMode: "auto" },
+        1280,
+        720
+      )
+    ).toBe("scroll");
+    expect(
+      resolveTvFlowMode(
+        { orientation: "landscape", layoutMode: "single-row", flowMode: "auto" },
+        1280,
+        720
+      )
+    ).toBe("slides");
+    expect(
+      resolveTvFlowMode(
+        { orientation: "portrait", layoutMode: "single-col", flowMode: "slides" },
+        720,
+        1280
+      )
+    ).toBe("slides");
   });
 
   it("selects worst impaired probe or preferred probe cleanly", () => {

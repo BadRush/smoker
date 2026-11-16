@@ -137,6 +137,7 @@ const SNAPSHOT: MatrixSnapshot = {
 
 describe("MatrixWallPage (Dashboard)", () => {
   beforeEach(() => {
+    window.localStorage.clear();
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
@@ -193,5 +194,74 @@ describe("MatrixWallPage (Dashboard)", () => {
     const modal = await screen.findByTestId("tv-zoom-modal");
     expect(modal).toBeInTheDocument();
     expect(modal).toHaveTextContent("dns cloudflare");
+  });
+
+  it("switches Charts Grid between 1-Col Full, 1-Row horizontal, custom width/height, 1 Probe/Row, and persists to localStorage", async () => {
+    const user = userEvent.setup();
+    render(<MatrixWallPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Custom Ping Host")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: /charts grid/i }));
+    expect(await screen.findByTestId("dash-layout-bar")).toBeInTheDocument();
+
+    // Switch to 1 Col Full
+    await user.click(screen.getByTestId("dash-layout-preset-single-col"));
+    const grids = screen.getAllByTestId("dash-section-grid");
+    expect(grids[0]).toHaveAttribute("data-layout-preset", "single-col");
+    expect(grids[0].className).toContain("grid-cols-1");
+
+    // Toggle 1 Probe / Row
+    const probeBtn = screen.getByTestId("dash-probe-layout-btn");
+    await user.click(probeBtn);
+    expect(probeBtn).toHaveAttribute("aria-pressed", "true");
+
+    // Open Width & Height customizer
+    await user.click(screen.getByTestId("dash-layout-customize-btn"));
+    expect(await screen.findByTestId("dash-layout-size-controls")).toBeInTheDocument();
+
+    // Set Full 100% display width and verify <main> removes 1600px cap
+    await user.click(screen.getByTestId("dash-layout-width-full"));
+    const mainEl = screen.getByRole("main");
+    expect(mainEl).toHaveStyle({ maxWidth: "100%" });
+
+    // Apply custom px width via input
+    const widthInput = screen.getByTestId("dash-layout-width-input");
+    await user.clear(widthInput);
+    await user.type(widthInput, "960");
+    await user.click(screen.getByTestId("dash-layout-width-apply-btn"));
+    expect(mainEl).toHaveStyle({ maxWidth: "960px" });
+
+    // Select 280px chart height
+    await user.click(screen.getByTestId("dash-layout-height-280"));
+    const panels = screen.getAllByTestId("smoke-chart-panel");
+    expect(panels[0]).toHaveStyle({ height: "280px" });
+
+    // Switch to 1 Row horizontal strip with 640px card width
+    await user.click(screen.getByTestId("dash-layout-preset-single-row"));
+    expect(screen.getAllByTestId("dash-section-grid")[0]).toHaveAttribute(
+      "data-layout-preset",
+      "single-row"
+    );
+    await user.click(screen.getByTestId("dash-layout-rowwidth-640px"));
+    const cards = screen.getAllByTestId("grid-target-card");
+    expect(cards[0]).toHaveStyle({ width: "640px" });
+
+    // Persisted in localStorage
+    const saved = window.localStorage.getItem("smoker.dashboard.layout.v1");
+    expect(saved).toContain('"preset":"single-row"');
+    expect(saved).toContain('"widthSpec":"960px"');
+    expect(saved).toContain('"rowCardWidth":"640px"');
+    expect(saved).toContain('"chartHeight":280');
+    expect(saved).toContain('"probeLayout":"single"');
+
+    // Reset restores defaults
+    await user.click(screen.getByTestId("dash-layout-reset-btn"));
+    expect(screen.getAllByTestId("dash-section-grid")[0]).toHaveAttribute(
+      "data-layout-preset",
+      "auto"
+    );
   });
 });

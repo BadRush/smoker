@@ -8,6 +8,7 @@ import {
   Check,
   Copy,
   Flame,
+  LayoutGrid,
   Maximize2,
   Pause,
   Pin,
@@ -20,6 +21,10 @@ import {
 } from "lucide-react";
 import { SmokeChartPanel } from "@/components/charts/SmokeChartPanel";
 import { TargetZoomModal } from "@/components/charts/TargetZoomModal";
+import {
+  DisplaySizeControls,
+  LayoutPresetPills,
+} from "@/components/layout/DisplaySizeControls";
 import { ProtocolFilterChips } from "@/components/targets/ProtocolFilterChips";
 import {
   apiRequest,
@@ -29,9 +34,14 @@ import {
 } from "@/lib/api";
 import { formatDateTime24 } from "@/lib/date-format";
 import {
+  parseWidthSpec,
+  type FlowMode,
+} from "@/lib/display-layout";
+import {
   formatCleanTargetTitle,
   getProtocolFamily,
   getProtocolFamilyMeta,
+  groupItemsByProtocol,
   PROTOCOL_FAMILIES,
   type IpFamilyFilter,
   type ProtocolFamily,
@@ -49,9 +59,12 @@ import {
 import {
   computeBestFitGrid,
   DEFAULT_TV_CONFIG,
+  loadTvConfigFromStorage,
   MANUAL_CARD_OPTIONS,
   parseTvConfig,
   partitionTargetsForTv,
+  resolveTvFlowMode,
+  saveTvConfigToStorage,
   selectFocalProbeCell,
   serializeTvConfig,
   TV_RANGES,
@@ -140,13 +153,19 @@ function FocalTargetCard({
   return (
     <article
       data-testid={isHighlight ? "tv-highlight-card" : "tv-target-card"}
-      style={{
-        height: layout.cardHeight,
-        maxWidth: layout.cols === 1 ? layout.cardWidth : undefined,
-      }}
-      className={`flex w-full shrink-0 flex-col justify-between gap-1 rounded-lg border p-2 overflow-hidden ${
-        layout.cols === 1 ? "mx-auto" : ""
-      } ${cardBorderClass}`}
+      style={
+        layout.horizontalScroll
+          ? {
+              height: layout.cardHeight,
+              width: layout.cardWidth,
+              minWidth: layout.cardWidth,
+              flexShrink: 0,
+            }
+          : {
+              height: layout.cardHeight,
+            }
+      }
+      className={`flex w-full shrink-0 flex-col justify-between gap-1 rounded-lg border p-2 overflow-hidden ${cardBorderClass}`}
     >
       {/* Compact Header (2 tight rows: Target + Status, Host + Multi-Probe Switcher) */}
       <div className="flex shrink-0 flex-col gap-0.5">
@@ -303,6 +322,7 @@ export default function NocTvWallboardPage() {
   const [countdown, setCountdown] = useState(DEFAULT_TV_CONFIG.rotateSec);
   const [paused, setPaused] = useState(false);
   const [showDrawer, setShowDrawer] = useState(false);
+  const [showLayoutBar, setShowLayoutBar] = useState(false);
   const [copied, setCopied] = useState(false);
   const [clockText, setClockText] = useState<string>("");
   const [simTargetId, setSimTargetId] = useState<string>("");
@@ -373,16 +393,19 @@ export default function NocTvWallboardPage() {
     };
   }, []);
 
-  // Hydrate initial config from window.location.search on mount
+  // Hydrate initial config from window.location.search or localStorage fallback on mount
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const initial = parseTvConfig(window.location.search);
+    const hasSearch = window.location.search.length > 1;
+    const initial = hasSearch
+      ? parseTvConfig(window.location.search)
+      : loadTvConfigFromStorage() ?? DEFAULT_TV_CONFIG;
     setCfg(initial);
     setCountdown(initial.rotateSec);
     setUrlHydrated(true);
   }, []);
 
-  // Sync config updates to URL query parameters without triggering router navigation
+  // Sync config updates to URL query parameters and localStorage without triggering router navigation
   const updateConfig = useCallback(
     (updater: (prev: TvWallConfig) => TvWallConfig, resetPage = true) => {
       setCfg((prev) => {
@@ -391,6 +414,7 @@ export default function NocTvWallboardPage() {
           const qs = serializeTvConfig(next);
           const nextUrl = `${window.location.pathname}?${qs}`;
           window.history.replaceState(null, "", nextUrl);
+          saveTvConfigToStorage(next);
         }
         return next;
       });
@@ -516,6 +540,62 @@ export default function NocTvWallboardPage() {
     return map;
   }, [data]);
 
+  const filteredTargets = useMemo(() => {
+    if (!data) return [];
+    const q = searchQuery.trim().toLowerCase();
+    return data.targets.filter((t) => {
+      if (impairedOnly) {
+        const hasImpaired = data.cells.some(
+          (c) =>
+            c.target_id === t.id &&
+            (c.status === "down" || c.status === "loss" || c.status === "degraded")
+        );
+        if (!hasImpaired) return false;
+      }
+      if (!q) return true;
+      const gName = t.group_id ? (groupMap.get(t.group_id) ?? "").toLowerCase() : "ungrouped";
+      return (
+        t.name.toLowerCase().includes(q) ||
+        t.host.toLowerCase().includes(q) ||
+        t.probe_type.toLowerCase().includes(q) ||
+        gName.includes(q)
+      );
+    });
+  }, [data, searchQuery, impairedOnly, groupMap]);
+
+  const effectiveFlow = useMemo(
+    () => resolveTvFlowMode(cfg, stageBox.width, stageBox.height),
+    [cfg, stageBox.width, stageBox.height]
+  );
+
+  const parsedWidthSpec = useMemo(
+    () =>
+      parseWidthSpec(cfg.widthSpec, {
+        allowAuto: false,
+        allowFull: true,
+        minPx: 320,
+        maxPx: 2560,
+        minPct: 35,
+        maxPct: 100,
+      }),
+    [cfg.widthSpec]
+  );
+
+  const stageContainerStyle = useMemo(
+    () =>
+      !parsedWidthSpec || parsedWidthSpec.kind === "full"
+        ? undefined
+        : { maxWidth: parsedWidthSpec.cssValue },
+    [parsedWidthSpec]
+  );
+
+  const prePartitioned = useMemo(() => {
+    if (!data) {
+      return { totalFiltered: 0 };
+    }
+    return partitionTargetsForTv(filteredTargets, data.cells, cfg, 12);
+  }, [data, filteredTargets, cfg]);
+
   const gridLayout = useMemo(
     () =>
       computeBestFitGrid({
@@ -523,8 +603,30 @@ export default function NocTvWallboardPage() {
         height: stageBox.height,
         orientation: cfg.orientation,
         cardsOverride: cfg.cardsPerPage > 0 ? cfg.cardsPerPage : undefined,
+        layoutMode: cfg.layoutMode,
+        customCols: cfg.customCols,
+        chartHeight: cfg.chartHeight,
+        widthSpec: cfg.widthSpec,
+        rowCardWidth: cfg.rowCardWidth,
+        scrollMode: effectiveFlow === "scroll",
+        maxItems:
+          prePartitioned.totalFiltered > 0
+            ? prePartitioned.totalFiltered
+            : undefined,
       }),
-    [stageBox.width, stageBox.height, cfg.orientation, cfg.cardsPerPage]
+    [
+      stageBox.width,
+      stageBox.height,
+      cfg.orientation,
+      cfg.cardsPerPage,
+      cfg.layoutMode,
+      cfg.customCols,
+      cfg.chartHeight,
+      cfg.widthSpec,
+      cfg.rowCardWidth,
+      effectiveFlow,
+      prePartitioned.totalFiltered,
+    ]
   );
 
   const toggleProtocolFilter = useCallback(
@@ -572,32 +674,10 @@ export default function NocTvWallboardPage() {
     return data.targets.filter((t) => !t.group_id).length;
   }, [data]);
 
-  const filteredTargets = useMemo(() => {
-    if (!data) return [];
-    const q = searchQuery.trim().toLowerCase();
-    return data.targets.filter((t) => {
-      if (impairedOnly) {
-        const hasImpaired = data.cells.some(
-          (c) =>
-            c.target_id === t.id &&
-            (c.status === "down" || c.status === "loss" || c.status === "degraded")
-        );
-        if (!hasImpaired) return false;
-      }
-      if (!q) return true;
-      const gName = t.group_id ? (groupMap.get(t.group_id) ?? "").toLowerCase() : "ungrouped";
-      return (
-        t.name.toLowerCase().includes(q) ||
-        t.host.toLowerCase().includes(q) ||
-        t.probe_type.toLowerCase().includes(q) ||
-        gName.includes(q)
-      );
-    });
-  }, [data, searchQuery, impairedOnly, groupMap]);
-
   const partitioned = useMemo(() => {
     if (!data) {
       return {
+        allSummaries: [],
         pinnedAlerts: [],
         highlightItems: [],
         pages: [[]],
@@ -672,15 +752,17 @@ export default function NocTvWallboardPage() {
     items: [],
   };
 
-  // Batch fetch historical quantile SmokePing series for the active wallboard slide
-  const visibleIdsKey = useMemo(
-    () =>
-      activeSlide.items
-        .map((it) => it.target.id)
-        .sort()
-        .join(","),
-    [activeSlide.items]
-  );
+  // Batch fetch historical quantile SmokePing series for visible wallboard cards
+  const visibleIdsKey = useMemo(() => {
+    const items =
+      effectiveFlow === "scroll" && activeSlide.kind !== "highlight"
+        ? partitioned.allSummaries
+        : activeSlide.items;
+    return items
+      .map((it) => it.target.id)
+      .sort()
+      .join(",");
+  }, [effectiveFlow, activeSlide.kind, activeSlide.items, partitioned.allSummaries]);
 
   const loadVisibleSeries = useCallback(async () => {
     if (!urlHydrated || !visibleIdsKey) return;
@@ -777,6 +859,10 @@ export default function NocTvWallboardPage() {
           setShowSearch(false);
           return;
         }
+        if (showLayoutBar) {
+          setShowLayoutBar(false);
+          return;
+        }
         if (showDrawer) {
           setShowDrawer(false);
         }
@@ -788,7 +874,7 @@ export default function NocTvWallboardPage() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [zoomTargetId, showSearch, showDrawer]);
+  }, [zoomTargetId, showSearch, showLayoutBar, showDrawer]);
 
   const kpis = useMemo(() => {
     if (!data) return { probesOnline: 0, totalProbes: 0, healthyTargets: 0 };
@@ -841,6 +927,12 @@ export default function NocTvWallboardPage() {
           cfg.cardsPerPage > 0
             ? Math.min(cfg.cardsPerPage, Math.max(1, activeSlide.items.length))
             : undefined,
+        layoutMode: cfg.layoutMode,
+        customCols: cfg.customCols,
+        chartHeight: cfg.chartHeight,
+        widthSpec: cfg.widthSpec,
+        rowCardWidth: cfg.rowCardWidth,
+        scrollMode: effectiveFlow === "scroll",
         maxItems: Math.max(1, activeSlide.items.length),
       }),
     [
@@ -848,6 +940,12 @@ export default function NocTvWallboardPage() {
       stageBox.height,
       cfg.orientation,
       cfg.cardsPerPage,
+      cfg.layoutMode,
+      cfg.customCols,
+      cfg.chartHeight,
+      cfg.widthSpec,
+      cfg.rowCardWidth,
+      effectiveFlow,
       activeSlide.items.length,
     ]
   );
@@ -855,24 +953,43 @@ export default function NocTvWallboardPage() {
   const activeLayout =
     activeSlide.kind === "highlight" ? spotlightLayout : gridLayout;
 
+  const isCustomLayoutActive =
+    cfg.layoutMode !== DEFAULT_TV_CONFIG.layoutMode ||
+    cfg.customCols !== DEFAULT_TV_CONFIG.customCols ||
+    cfg.flowMode !== DEFAULT_TV_CONFIG.flowMode ||
+    cfg.widthSpec !== DEFAULT_TV_CONFIG.widthSpec ||
+    cfg.rowCardWidth !== DEFAULT_TV_CONFIG.rowCardWidth ||
+    cfg.chartHeight !== DEFAULT_TV_CONFIG.chartHeight;
+
+  const layoutBadgeText = useMemo(() => {
+    if (cfg.layoutMode === "single-col") return "1-Col";
+    if (cfg.layoutMode === "single-row") return "1-Row";
+    if (cfg.layoutMode === "cols" && cfg.customCols > 0) return `${cfg.customCols}-Col`;
+    return `${gridLayout.cols}-Col`;
+  }, [cfg.layoutMode, cfg.customCols, gridLayout.cols]);
+
   return (
     <div
       data-testid="noc-tv-root"
       data-orientation={cfg.orientation}
+      data-flow={effectiveFlow}
+      data-layout={cfg.layoutMode}
       className="flex h-screen w-screen flex-col overflow-hidden bg-canvas text-zinc-100 select-none"
     >
       {/* Top TV Display Bar */}
-      <header className="flex h-12 shrink-0 items-center justify-between gap-1.5 xl:gap-2 border-b border-border bg-surface px-3 xl:px-4 overflow-hidden">
-        <div className="flex items-center gap-2 min-w-0">
-          <div className="flex items-center gap-2 min-w-0">
+      <header className="flex h-12 shrink-0 items-center justify-between gap-1.5 xl:gap-2 border-b border-border bg-surface px-2.5 sm:px-3 xl:px-4 overflow-hidden">
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-emerald-500/15 border border-emerald-500/40 text-emerald-400">
               <Activity className="h-3.5 w-3.5" aria-hidden="true" />
             </span>
             <h1
               aria-label="Smoker TV Display"
-              className="truncate text-xs xl:text-sm font-bold tracking-wider uppercase text-zinc-100"
+              className="whitespace-nowrap text-xs xl:text-sm font-bold tracking-wider uppercase text-zinc-100"
             >
-              <span className="hidden xl:inline">Smoker </span>TV Display
+              <span className="hidden 2xl:inline">Smoker </span>
+              <span>TV</span>
+              <span className="hidden md:inline"> Display</span>
             </h1>
           </div>
 
@@ -891,13 +1008,13 @@ export default function NocTvWallboardPage() {
             {wsState === "connected" ? "LIVE" : "SYNC"}
           </span>
 
-          <span className="hidden xl:inline-block rounded border border-border bg-elevated px-2 py-0.5 text-[11px] font-mono uppercase text-zinc-300">
+          <span className="hidden 2xl:inline-block rounded border border-border bg-elevated px-2 py-0.5 text-[11px] font-mono uppercase text-zinc-300">
             {cfg.orientation === "portrait" ? "Portrait 9:16" : "Landscape 16:9"}
           </span>
         </div>
 
         {/* Center KPIs & Graph Range Selector */}
-        <div className="flex items-center gap-2 xl:gap-4 min-w-0 shrink-0">
+        <div className="flex items-center gap-2 xl:gap-4 min-w-0 shrink">
           <div className="hidden 2xl:flex items-center gap-4 text-xs font-mono tabular-nums">
             <div>
               <span className="text-zinc-400 mr-1.5">PROBES</span>
@@ -930,7 +1047,7 @@ export default function NocTvWallboardPage() {
             role="group"
             aria-label="TV Graph time range"
             data-testid="tv-range-selector"
-            className="hidden sm:inline-flex items-center rounded border border-border bg-canvas/80 p-0.5"
+            className="hidden lg:inline-flex items-center rounded border border-border bg-canvas/80 p-0.5"
           >
             {TV_RANGES.map((r) => (
               <button
@@ -950,7 +1067,7 @@ export default function NocTvWallboardPage() {
           </div>
 
           {clockText && (
-            <div className="hidden xl:block border-l border-border pl-3 text-xs font-mono tabular-nums text-zinc-300">
+            <div className="hidden 2xl:block border-l border-border pl-3 text-xs font-mono tabular-nums text-zinc-300">
               {clockText}
             </div>
           )}
@@ -975,7 +1092,10 @@ export default function NocTvWallboardPage() {
               }`}
             >
               <Flame className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-              <span>SPOTLIGHT ({partitioned.highlightItems.length})</span>
+              <span>
+                <span className="hidden xl:inline">SPOTLIGHT </span>(
+                {partitioned.highlightItems.length})
+              </span>
             </button>
           )}
 
@@ -986,13 +1106,15 @@ export default function NocTvWallboardPage() {
               setCountdown(cfg.rotateSec);
             }}
             aria-label="Next TV Display slide"
-            className="flex items-center gap-1 rounded border border-border bg-elevated px-2 xl:px-2.5 py-1 text-[11px] xl:text-xs font-mono tabular-nums text-zinc-200 hover:border-zinc-500"
+            className="flex items-center gap-1 rounded border border-border bg-elevated px-1.5 sm:px-2 xl:px-2.5 py-1 text-[11px] xl:text-xs font-mono tabular-nums text-zinc-200 hover:border-zinc-500"
           >
             <span>
-              {activeSlide.label} · {safeSlideIdx + 1}/{totalSlides}
+              {effectiveFlow === "scroll" && activeSlide.kind !== "highlight"
+                ? `SCROLL · ${partitioned.totalFiltered}`
+                : `${activeSlide.label} · ${safeSlideIdx + 1}/${totalSlides}`}
             </span>
-            {cfg.rotateSec > 0 && totalSlides > 1 && !paused && (
-              <span className="text-zinc-400">· {countdown}s</span>
+            {cfg.rotateSec > 0 && totalSlides > 1 && !paused && effectiveFlow === "slides" && (
+              <span className="hidden sm:inline text-zinc-400">· {countdown}s</span>
             )}
           </button>
 
@@ -1020,7 +1142,7 @@ export default function NocTvWallboardPage() {
                 ? "Resume rotation"
                 : "Pause rotation"
             }
-            className="inline-flex items-center justify-center rounded border border-border bg-elevated p-1.5 text-zinc-200 hover:border-zinc-500"
+            className="hidden sm:inline-flex items-center justify-center rounded border border-border bg-elevated p-1.5 text-zinc-200 hover:border-zinc-500"
           >
             {cfg.rotateSec === 0 || paused ? (
               <Play className="h-3.5 w-3.5" aria-hidden="true" />
@@ -1033,7 +1155,7 @@ export default function NocTvWallboardPage() {
             type="button"
             onClick={() => updateConfig((prev) => ({ ...prev, sound: !prev.sound }), false)}
             aria-label={cfg.sound ? "Mute alert chime" : "Enable alert chime"}
-            className={`inline-flex items-center justify-center rounded border p-1.5 ${
+            className={`hidden md:inline-flex items-center justify-center rounded border p-1.5 ${
               cfg.sound
                 ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
                 : "border-border bg-elevated text-zinc-300"
@@ -1044,6 +1166,23 @@ export default function NocTvWallboardPage() {
             ) : (
               <VolumeX className="h-3.5 w-3.5" aria-hidden="true" />
             )}
+          </button>
+
+          <button
+            type="button"
+            data-testid="tv-layout-toggle-btn"
+            aria-label="Configure display layout, columns, and custom width"
+            aria-expanded={showLayoutBar}
+            aria-pressed={showLayoutBar || isCustomLayoutActive}
+            onClick={() => setShowLayoutBar((prev) => !prev)}
+            className={`inline-flex items-center gap-1 rounded border px-1.5 xl:px-2 py-1 text-[11px] font-mono ${
+              showLayoutBar || isCustomLayoutActive
+                ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-300"
+                : "border-border bg-elevated text-zinc-200 hover:border-zinc-500"
+            }`}
+          >
+            <LayoutGrid className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <span className="hidden sm:inline">{layoutBadgeText}</span>
           </button>
 
           <button
@@ -1099,7 +1238,7 @@ export default function NocTvWallboardPage() {
             type="button"
             onClick={handleToggleFullscreen}
             aria-label="Toggle fullscreen"
-            className="hidden sm:inline-flex items-center justify-center rounded border border-border bg-elevated p-1.5 text-zinc-200 hover:border-zinc-500"
+            className="hidden lg:inline-flex items-center justify-center rounded border border-border bg-elevated p-1.5 text-zinc-200 hover:border-zinc-500"
           >
             <Maximize2 className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
@@ -1111,24 +1250,26 @@ export default function NocTvWallboardPage() {
             className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2 xl:px-2.5 py-1 text-[11px] xl:text-xs font-medium text-zinc-100 hover:border-emerald-500/50"
           >
             <Settings2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-            <span>
+            <span className="hidden sm:inline">
               Configure<span className="hidden xl:inline"> TV</span>
             </span>
           </button>
 
           <Link
             href="/"
-            className="hidden sm:inline-flex items-center rounded border border-border bg-elevated px-2 xl:px-2.5 py-1 text-[11px] xl:text-xs font-medium text-zinc-300 hover:text-zinc-100"
+            className="hidden md:inline-flex items-center rounded border border-border bg-elevated px-2 xl:px-2.5 py-1 text-[11px] xl:text-xs font-medium text-zinc-300 hover:text-zinc-100"
           >
             Dashboard
           </Link>
         </div>
       </header>
 
-      {/* Main Fit-to-Screen Wallboard Body */}
+      {/* Main Fit-to-Screen or Vertical-Scroll Wallboard Body */}
       <main
         ref={mainRef}
-        className="flex flex-1 min-h-0 flex-col gap-2 p-2.5 overflow-hidden"
+        className={`flex flex-1 min-h-0 flex-col gap-2 p-2.5 ${
+          effectiveFlow === "scroll" ? "overflow-y-auto" : "overflow-hidden"
+        }`}
       >
         {error && (
           <div
@@ -1136,6 +1277,177 @@ export default function NocTvWallboardPage() {
             className="shrink-0 rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300"
           >
             {error}
+          </div>
+        )}
+
+        {/* Collapsible Quick Layout, Columns & Custom Width/Height Bar */}
+        {showLayoutBar && (
+          <div
+            data-testid="tv-layout-bar"
+            className="shrink-0 rounded-md border border-border bg-surface/95 px-3 py-2.5 text-xs shadow-lg space-y-2.5"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <LayoutPresetPills
+                  testIdPrefix="tv-layout"
+                  preset={cfg.layoutMode}
+                  customCols={cfg.customCols}
+                  onSelectPreset={(layoutMode, cols) =>
+                    updateConfig((prev) => ({
+                      ...prev,
+                      layoutMode,
+                      customCols: cols !== undefined ? cols : prev.customCols,
+                    }))
+                  }
+                />
+
+                {cfg.layoutMode === "single-row" && (
+                  <div
+                    role="group"
+                    aria-label="1-Row card columns"
+                    className="inline-flex items-center gap-1 border-l border-border pl-2"
+                  >
+                    <span className="font-mono text-[10px] text-zinc-400">Row Cols:</span>
+                    {[0, 2, 3, 4].map((cnt) => (
+                      <button
+                        key={cnt}
+                        type="button"
+                        aria-pressed={cfg.customCols === cnt}
+                        data-testid={`tv-layout-rowcols-${cnt}`}
+                        onClick={() =>
+                          updateConfig((prev) => ({ ...prev, customCols: cnt }))
+                        }
+                        className={`rounded border px-1.5 py-0.5 font-mono text-[10px] ${
+                          cfg.customCols === cnt
+                            ? "border-cyan-500 bg-cyan-500 font-semibold text-zinc-950"
+                            : "border-border bg-elevated text-zinc-300"
+                        }`}
+                      >
+                        {cnt === 0 ? "Auto" : cnt}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <div
+                  role="group"
+                  aria-label="Orientation"
+                  className="inline-flex items-center rounded border border-border bg-elevated p-0.5"
+                >
+                  {(["landscape", "portrait"] as TvOrientation[]).map((ori) => (
+                    <button
+                      key={ori}
+                      type="button"
+                      aria-pressed={cfg.orientation === ori}
+                      data-testid={`tv-layout-ori-${ori}`}
+                      onClick={() =>
+                        updateConfig((prev) => ({ ...prev, orientation: ori }))
+                      }
+                      className={`rounded px-2 py-0.5 font-mono text-[10px] uppercase ${
+                        cfg.orientation === ori
+                          ? "bg-emerald-500 font-semibold text-zinc-950"
+                          : "text-zinc-300 hover:text-zinc-100"
+                      }`}
+                    >
+                      {ori}
+                    </button>
+                  ))}
+                </div>
+
+                <div
+                  role="group"
+                  aria-label="Flow mode"
+                  className="inline-flex items-center rounded border border-border bg-elevated p-0.5"
+                >
+                  {(
+                    [
+                      { id: "auto", label: `Auto (${effectiveFlow})` },
+                      { id: "scroll", label: "Scroll ↓" },
+                      { id: "slides", label: "Slides" },
+                    ] as Array<{ id: FlowMode; label: string }>
+                  ).map((fm) => (
+                    <button
+                      key={fm.id}
+                      type="button"
+                      aria-pressed={cfg.flowMode === fm.id}
+                      data-testid={`tv-layout-flow-${fm.id}`}
+                      onClick={() =>
+                        updateConfig((prev) => ({ ...prev, flowMode: fm.id }))
+                      }
+                      className={`rounded px-2 py-0.5 font-mono text-[10px] ${
+                        cfg.flowMode === fm.id
+                          ? "bg-cyan-500 font-semibold text-zinc-950"
+                          : "text-zinc-300 hover:text-zinc-100"
+                      }`}
+                    >
+                      {fm.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <button
+                type="button"
+                aria-label="Close layout bar"
+                onClick={() => setShowLayoutBar(false)}
+                className="rounded p-1 text-zinc-400 hover:text-zinc-100"
+              >
+                <X className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1 lg:hidden border-t border-border/60 pt-2">
+              <span className="mr-1 font-mono text-[10px] uppercase text-zinc-400">
+                Range:
+              </span>
+              {TV_RANGES.map((r) => (
+                <button
+                  key={r}
+                  type="button"
+                  aria-pressed={cfg.range === r}
+                  onClick={() => updateConfig((prev) => ({ ...prev, range: r }), false)}
+                  className={`rounded border px-2 py-0.5 font-mono text-[10px] ${
+                    cfg.range === r
+                      ? "border-emerald-500 bg-emerald-500 font-semibold text-zinc-950"
+                      : "border-border bg-elevated text-zinc-300"
+                  }`}
+                >
+                  {r}
+                </button>
+              ))}
+            </div>
+
+            <div className="border-t border-border/60 pt-2">
+              <DisplaySizeControls
+                testIdPrefix="tv-layout"
+                widthSpec={cfg.widthSpec}
+                onChangeWidthSpec={(widthSpec) =>
+                  updateConfig((prev) => ({ ...prev, widthSpec }))
+                }
+                allowAutoWidth={false}
+                showRowCardWidth={cfg.layoutMode === "single-row"}
+                rowCardWidth={cfg.rowCardWidth}
+                onChangeRowCardWidth={(rowCardWidth) =>
+                  updateConfig((prev) => ({ ...prev, rowCardWidth }))
+                }
+                chartHeight={cfg.chartHeight}
+                onChangeChartHeight={(chartHeight) =>
+                  updateConfig((prev) => ({ ...prev, chartHeight }))
+                }
+                compact
+                onReset={() =>
+                  updateConfig((prev) => ({
+                    ...prev,
+                    layoutMode: DEFAULT_TV_CONFIG.layoutMode,
+                    customCols: DEFAULT_TV_CONFIG.customCols,
+                    flowMode: DEFAULT_TV_CONFIG.flowMode,
+                    widthSpec: DEFAULT_TV_CONFIG.widthSpec,
+                    rowCardWidth: DEFAULT_TV_CONFIG.rowCardWidth,
+                    chartHeight: DEFAULT_TV_CONFIG.chartHeight,
+                  }))
+                }
+              />
+            </div>
           </div>
         )}
 
@@ -1251,6 +1563,12 @@ export default function NocTvWallboardPage() {
           </div>
         )}
 
+        <div
+          style={stageContainerStyle}
+          className={`mx-auto flex w-full flex-col gap-2 ${
+            effectiveFlow === "scroll" ? "shrink-0 pb-2" : "flex-1 min-h-0 overflow-hidden"
+          }`}
+        >
         {activeSlide.kind === "highlight" ? (
           /* Dedicated Highlight & Multi-Probe Spotlight Page (locked 7:3 focal graphs) */
           <section
@@ -1258,7 +1576,10 @@ export default function NocTvWallboardPage() {
             data-testid="tv-highlight-page"
             data-cols={spotlightLayout.cols}
             data-rows={spotlightLayout.rows}
-            className="flex flex-1 min-h-0 flex-col gap-2 overflow-hidden"
+            data-flow={effectiveFlow}
+            className={`flex flex-col gap-2 ${
+              effectiveFlow === "scroll" ? "" : "flex-1 min-h-0 overflow-hidden"
+            }`}
           >
             <div className="flex shrink-0 items-center justify-between gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs">
               <div className="flex items-center gap-2 font-bold uppercase tracking-wide text-amber-300 min-w-0">
@@ -1273,10 +1594,20 @@ export default function NocTvWallboardPage() {
             </div>
 
             <div
-              style={{
-                gridTemplateColumns: `repeat(${spotlightLayout.cols}, minmax(0, 1fr))`,
-              }}
-              className="grid flex-1 min-h-0 content-start items-start gap-2.5 overflow-hidden"
+              style={
+                spotlightLayout.horizontalScroll
+                  ? undefined
+                  : {
+                      gridTemplateColumns: `repeat(${spotlightLayout.cols}, minmax(0, 1fr))`,
+                    }
+              }
+              className={
+                spotlightLayout.horizontalScroll
+                  ? "flex flex-nowrap flex-1 min-h-0 items-start gap-2.5 overflow-x-auto pb-2"
+                  : `grid content-start items-start gap-2.5 ${
+                      effectiveFlow === "scroll" ? "" : "flex-1 min-h-0 overflow-hidden"
+                    }`
+              }
             >
               {activeSlide.items.map((item) => (
                 <FocalTargetCard
@@ -1295,20 +1626,22 @@ export default function NocTvWallboardPage() {
               ))}
             </div>
           </section>
-        ) : (
-          /* Clean Auto Best-Fit 7:3 TV Display Grid */
-          <section
-            aria-label="Monitored hosts TV display"
-            data-testid="tv-cards-grid"
-            data-cols={gridLayout.cols}
-            data-rows={gridLayout.rows}
-            style={{
-              gridTemplateColumns: `repeat(${gridLayout.cols}, minmax(0, 1fr))`,
-            }}
-            className="grid flex-1 min-h-0 content-start items-start gap-2.5 overflow-hidden"
-          >
-            {activeSlide.items.length === 0 ? (
-              <div className="col-span-full flex min-h-[220px] flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-border bg-surface text-sm font-mono text-zinc-400">
+        ) : (() => {
+          const gridItems =
+            effectiveFlow === "scroll"
+              ? partitioned.allSummaries
+              : activeSlide.items;
+
+          if (gridItems.length === 0) {
+            return (
+              <section
+                aria-label="Monitored hosts TV display"
+                data-testid="tv-cards-grid"
+                data-cols={gridLayout.cols}
+                data-rows={gridLayout.rows}
+                data-flow={effectiveFlow}
+                className="flex flex-1 min-h-[220px] flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-border bg-surface text-sm font-mono text-zinc-400"
+              >
                 <span>No active targets match the selected group or protocol filters.</span>
                 {(cfg.groups.length > 0 ||
                   cfg.protocols.length > 0 ||
@@ -1332,9 +1665,83 @@ export default function NocTvWallboardPage() {
                     Reset Filters
                   </button>
                 )}
-              </div>
-            ) : (
-              activeSlide.items.map((item) => (
+              </section>
+            );
+          }
+
+          if (effectiveFlow === "scroll" && cfg.splitByProtocol) {
+            const protoSections = groupItemsByProtocol(gridItems, (it) => it.target);
+            return (
+              <section
+                aria-label="Monitored hosts TV display"
+                data-testid="tv-cards-grid"
+                data-cols={gridLayout.cols}
+                data-rows={gridLayout.rows}
+                data-flow={effectiveFlow}
+                className="space-y-4 pb-2"
+              >
+                {protoSections.map((sec) => (
+                  <div key={sec.family.id} className="space-y-2">
+                    <div className="flex items-center justify-between border-b border-border/70 pb-1">
+                      <span
+                        className={`rounded border px-2 py-0.5 text-xs font-mono font-semibold ${sec.family.badgeClass}`}
+                      >
+                        {sec.family.label}
+                      </span>
+                      <span className="font-mono text-[11px] text-zinc-400">
+                        {sec.items.length} host{sec.items.length === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                    <div
+                      style={{
+                        gridTemplateColumns: `repeat(${gridLayout.cols}, minmax(0, 1fr))`,
+                      }}
+                      className="grid content-start items-start gap-2.5"
+                    >
+                      {sec.items.map((item) => (
+                        <FocalTargetCard
+                          key={item.target.id}
+                          item={item}
+                          layout={gridLayout}
+                          range={cfg.range}
+                          probeMap={probeMap}
+                          groupMap={groupMap}
+                          seriesByTarget={seriesByTarget}
+                          selectedProbeId={selectedProbeByTarget[item.target.id]}
+                          onSelectProbe={handleSelectProbe}
+                          onZoomTarget={handleOpenZoomTarget}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </section>
+            );
+          }
+
+          return (
+            <section
+              aria-label="Monitored hosts TV display"
+              data-testid="tv-cards-grid"
+              data-cols={gridLayout.cols}
+              data-rows={gridLayout.rows}
+              data-flow={effectiveFlow}
+              style={
+                gridLayout.horizontalScroll
+                  ? undefined
+                  : {
+                      gridTemplateColumns: `repeat(${gridLayout.cols}, minmax(0, 1fr))`,
+                    }
+              }
+              className={
+                gridLayout.horizontalScroll
+                  ? "flex flex-nowrap flex-1 min-h-0 items-start gap-2.5 overflow-x-auto pb-2"
+                  : effectiveFlow === "scroll"
+                  ? "grid content-start items-start gap-2.5"
+                  : "grid flex-1 min-h-0 content-start items-start gap-2.5 overflow-hidden"
+              }
+            >
+              {gridItems.map((item) => (
                 <FocalTargetCard
                   key={item.target.id}
                   item={item}
@@ -1347,10 +1754,11 @@ export default function NocTvWallboardPage() {
                   onSelectProbe={handleSelectProbe}
                   onZoomTarget={handleOpenZoomTarget}
                 />
-              ))
-            )}
-          </section>
-        )}
+              ))}
+            </section>
+          );
+        })()}
+        </div>
       </main>
 
       {/* Compact Friendly Telemetry Legend Strip */}
@@ -1376,10 +1784,12 @@ export default function NocTvWallboardPage() {
           </span>
         </div>
         <span className="hidden sm:inline shrink-0 text-zinc-400">
-          {cfg.cardsPerPage === 0
-            ? `Auto ${activeLayout.cols}×${activeLayout.rows} (${activeLayout.aspectRatio}:1)`
+          {cfg.cardsPerPage === 0 || effectiveFlow === "scroll"
+            ? `${cfg.layoutMode === "auto" ? "Auto" : cfg.layoutMode} ${activeLayout.cols}×${activeLayout.rows} (${activeLayout.aspectRatio}:1)`
             : `Fixed ${activeLayout.cols}×${activeLayout.rows} (${activeLayout.aspectRatio}:1)`}{" "}
-          · {cfg.range} · {partitionSummary(kpis.probesOnline, kpis.totalProbes, data?.active_incidents ?? 0)}
+          · {effectiveFlow}
+          {cfg.widthSpec !== "full" ? ` · ${cfg.widthSpec}` : ""} · {cfg.range} ·{" "}
+          {partitionSummary(kpis.probesOnline, kpis.totalProbes, data?.active_incidents ?? 0)}
         </span>
       </footer>
 
@@ -1479,6 +1889,79 @@ export default function NocTvWallboardPage() {
                     </button>
                   ))}
                 </div>
+              </div>
+
+              {/* Layout Mode, Flow & Custom Width/Height */}
+              <div className="space-y-2.5 rounded-md border border-border bg-canvas p-3">
+                <p className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
+                  Columns, Scroll Flow &amp; Custom Size
+                </p>
+                <LayoutPresetPills
+                  testIdPrefix="tv-drawer-layout"
+                  preset={cfg.layoutMode}
+                  customCols={cfg.customCols}
+                  onSelectPreset={(layoutMode, cols) =>
+                    updateConfig((prev) => ({
+                      ...prev,
+                      layoutMode,
+                      customCols: cols !== undefined ? cols : prev.customCols,
+                    }))
+                  }
+                />
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(
+                    [
+                      { id: "auto", label: "Auto Flow" },
+                      { id: "scroll", label: "Scroll ↓" },
+                      { id: "slides", label: "Slides" },
+                    ] as Array<{ id: FlowMode; label: string }>
+                  ).map((fm) => (
+                    <button
+                      key={fm.id}
+                      type="button"
+                      aria-pressed={cfg.flowMode === fm.id}
+                      onClick={() =>
+                        updateConfig((prev) => ({ ...prev, flowMode: fm.id }))
+                      }
+                      className={`rounded border px-2 py-1 text-[11px] font-mono ${
+                        cfg.flowMode === fm.id
+                          ? "border-cyan-500 bg-cyan-500 font-semibold text-zinc-950"
+                          : "border-border bg-elevated text-zinc-200"
+                      }`}
+                    >
+                      {fm.label}
+                    </button>
+                  ))}
+                </div>
+                <DisplaySizeControls
+                  testIdPrefix="tv-drawer-layout"
+                  widthSpec={cfg.widthSpec}
+                  onChangeWidthSpec={(widthSpec) =>
+                    updateConfig((prev) => ({ ...prev, widthSpec }))
+                  }
+                  allowAutoWidth={false}
+                  showRowCardWidth={cfg.layoutMode === "single-row"}
+                  rowCardWidth={cfg.rowCardWidth}
+                  onChangeRowCardWidth={(rowCardWidth) =>
+                    updateConfig((prev) => ({ ...prev, rowCardWidth }))
+                  }
+                  chartHeight={cfg.chartHeight}
+                  onChangeChartHeight={(chartHeight) =>
+                    updateConfig((prev) => ({ ...prev, chartHeight }))
+                  }
+                  compact
+                  onReset={() =>
+                    updateConfig((prev) => ({
+                      ...prev,
+                      layoutMode: DEFAULT_TV_CONFIG.layoutMode,
+                      customCols: DEFAULT_TV_CONFIG.customCols,
+                      flowMode: DEFAULT_TV_CONFIG.flowMode,
+                      widthSpec: DEFAULT_TV_CONFIG.widthSpec,
+                      rowCardWidth: DEFAULT_TV_CONFIG.rowCardWidth,
+                      chartHeight: DEFAULT_TV_CONFIG.chartHeight,
+                    }))
+                  }
+                />
               </div>
 
               {/* Rotation Interval */}

@@ -22,6 +22,7 @@ interface NocShellProps {
   children: React.ReactNode;
   wsState?: WsState;
   activeIncidents?: number;
+  mainMaxWidth?: string | null;
 }
 
 const NAV_ITEMS = [
@@ -37,6 +38,7 @@ export function NocShell({
   children,
   wsState = "connected",
   activeIncidents = 0,
+  mainMaxWidth,
 }: NocShellProps) {
   const pathname = usePathname();
   const router = useRouter();
@@ -199,7 +201,12 @@ export function NocShell({
         )}
       </header>
 
-      <main className="mx-auto w-full max-w-[1600px] flex-1 px-4 py-6 sm:px-6">
+      <main
+        style={mainMaxWidth ? { maxWidth: mainMaxWidth } : undefined}
+        className={`mx-auto w-full flex-1 px-4 py-6 sm:px-6 ${
+          mainMaxWidth ? "" : "max-w-[1600px]"
+        }`}
+      >
         {children}
       </main>
     </div>
