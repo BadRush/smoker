@@ -3,8 +3,13 @@ package engine
 import (
 	"context"
 	"encoding/binary"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestExtractMTRHost(t *testing.T) {
@@ -134,5 +139,78 @@ func TestIPv6ProberFormattingAndResolution(t *testing.T) {
 	}
 	if _, err := resolveHostIPWithFamily(ctx, "1.1.1.1", "ip6"); err == nil {
 		t.Fatalf("expected resolveHostIPWithFamily(1.1.1.1, ip6) to fail")
+	}
+}
+
+func TestSourceIPBindingAndRandomICMPID(t *testing.T) {
+	t.Parallel()
+
+	// Multiple calls produce non-zero random ICMP IDs (never stuck on PID 1)
+	seen := make(map[int]bool, 32)
+	for i := 0; i < 32; i++ {
+		id := randomICMPID()
+		if id <= 0 || id > 0xffff {
+			t.Fatalf("invalid icmpID: %d", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) < 16 {
+		t.Fatalf("expected high entropy across 32 randomICMPID calls, only got %d unique", len(seen))
+	}
+
+	opts := ProberOptions{SourceIP4: net.ParseIP("127.0.0.1")}
+
+	// Test TCP source IP bind against local listener
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp4: %v", err)
+	}
+	defer ln.Close()
+
+	remoteCh := make(chan string, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			remoteCh <- conn.RemoteAddr().String()
+			_ = conn.Close()
+		}
+	}()
+
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if _, err := ProbeTCPWithOptions(ctx, "tcp", "127.0.0.1", port, time.Second, opts); err != nil {
+		t.Fatalf("ProbeTCPWithOptions failed: %v", err)
+	}
+	gotTCPPeer := <-remoteCh
+	if !strings.HasPrefix(gotTCPPeer, "127.0.0.1:") {
+		t.Fatalf("expected TCP remote addr from 127.0.0.1, got %s", gotTCPPeer)
+	}
+
+	// Test HTTP source IP bind against local HTTP server
+	var gotHTTPPeer string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHTTPPeer = r.RemoteAddr
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if _, err := ProbeHTTPWithOptions(ctx, "tcp", srv.URL, "", time.Second, opts); err != nil {
+		t.Fatalf("ProbeHTTPWithOptions failed: %v", err)
+	}
+	if !strings.HasPrefix(gotHTTPPeer, "127.0.0.1:") {
+		t.Fatalf("expected HTTP remote addr from 127.0.0.1, got %s", gotHTTPPeer)
+	}
+
+	// Test binding two ICMP probers to loopback simultaneously when kernel allows ICMP sockets
+	p1, err1 := NewICMPProberWithOptions(opts)
+	if err1 == nil {
+		defer p1.Close()
+		p2, err2 := NewICMPProberWithOptions(opts)
+		if err2 != nil {
+			t.Fatalf("expected second ICMPProber bound to 127.0.0.1 to open cleanly, got: %v", err2)
+		}
+		defer p2.Close()
 	}
 }

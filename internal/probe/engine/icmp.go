@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +17,22 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
+func randomICMPID() int {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		id := int(binary.BigEndian.Uint16(b[:]))
+		if id == 0 {
+			return 1
+		}
+		return id
+	}
+	fallback := os.Getpid() & 0xffff
+	if fallback == 0 {
+		return 1
+	}
+	return fallback
+}
+
 type icmpSocket struct {
 	conn   *icmp.PacketConn
 	isRaw  bool
@@ -24,7 +42,7 @@ type icmpSocket struct {
 	waiters sync.Map // uint16 -> chan time.Time
 }
 
-func openICMPSocket(isV6 bool) (*icmpSocket, error) {
+func openICMPSocket(isV6 bool, bindIP net.IP) (*icmpSocket, error) {
 	network := "ip4:icmp"
 	fallback := "udp4"
 	addr := "0.0.0.0"
@@ -33,6 +51,13 @@ func openICMPSocket(isV6 bool) (*icmpSocket, error) {
 		fallback = "udp6"
 		addr = "::"
 	}
+	if bindIP != nil {
+		if !isV6 && bindIP.To4() != nil {
+			addr = bindIP.To4().String()
+		} else if isV6 && bindIP.To4() == nil && bindIP.To16() != nil {
+			addr = bindIP.To16().String()
+		}
+	}
 
 	isRaw := true
 	conn, err := icmp.ListenPacket(network, addr)
@@ -40,7 +65,7 @@ func openICMPSocket(isV6 bool) (*icmpSocket, error) {
 		isRaw = false
 		conn, err = icmp.ListenPacket(fallback, addr)
 		if err != nil {
-			return nil, fmt.Errorf("listen %s/%s: %w", network, fallback, err)
+			return nil, fmt.Errorf("listen %s/%s on %s: %w", network, fallback, addr, err)
 		}
 	}
 
@@ -48,7 +73,7 @@ func openICMPSocket(isV6 bool) (*icmpSocket, error) {
 		conn:   conn,
 		isRaw:  isRaw,
 		isV6:   isV6,
-		icmpID: os.Getpid() & 0xffff,
+		icmpID: randomICMPID(),
 	}
 	go s.readLoop()
 	return s, nil
@@ -155,18 +180,23 @@ func (s *icmpSocket) ping(ctx context.Context, ip net.IP, timeout time.Duration)
 }
 
 type ICMPProber struct {
-	mu sync.Mutex
-	v4 *icmpSocket
-	v6 *icmpSocket
+	mu   sync.Mutex
+	opts ProberOptions
+	v4   *icmpSocket
+	v6   *icmpSocket
 }
 
 func NewICMPProber() (*ICMPProber, error) {
-	v4, err := openICMPSocket(false)
+	return NewICMPProberWithOptions(ProberOptions{})
+}
+
+func NewICMPProberWithOptions(opts ProberOptions) (*ICMPProber, error) {
+	v4, err := openICMPSocket(false, opts.SourceIP4)
 	if err != nil {
 		return nil, err
 	}
-	v6, _ := openICMPSocket(true) // Best-effort IPv6 at init; lazily retried on PingIPv6
-	return &ICMPProber{v4: v4, v6: v6}, nil
+	v6, _ := openICMPSocket(true, opts.SourceIP6) // Best-effort IPv6 at init; lazily retried on PingIPv6
+	return &ICMPProber{opts: opts, v4: v4, v6: v6}, nil
 }
 
 func (p *ICMPProber) Close() {
@@ -186,7 +216,7 @@ func (p *ICMPProber) ensureV6() (*icmpSocket, error) {
 	if p.v6 != nil {
 		return p.v6, nil
 	}
-	s, err := openICMPSocket(true)
+	s, err := openICMPSocket(true, p.opts.SourceIP6)
 	if err != nil {
 		return nil, fmt.Errorf("ipv6 icmp unavailable: %w", err)
 	}

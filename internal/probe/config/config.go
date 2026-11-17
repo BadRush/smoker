@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,9 +20,44 @@ type ProbeConfig struct {
 	MaxBufferHours int
 	AgentVersion   string
 	TLSSkipVerify  bool
+	SourceIP4      net.IP
+	SourceIP6      net.IP
+}
+
+func parseSourceIPConfig() (src4, src6 net.IP, err error) {
+	if raw := strings.TrimSpace(os.Getenv("SOURCE_IP")); raw != "" {
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			return nil, nil, fmt.Errorf("invalid SOURCE_IP %q", raw)
+		}
+		if v4 := ip.To4(); v4 != nil {
+			src4 = v4
+		} else {
+			src6 = ip.To16()
+		}
+	}
+	if raw4 := strings.TrimSpace(os.Getenv("SOURCE_IP4")); raw4 != "" {
+		ip := net.ParseIP(raw4)
+		if ip == nil || ip.To4() == nil {
+			return nil, nil, fmt.Errorf("invalid SOURCE_IP4 %q (expected IPv4 address)", raw4)
+		}
+		src4 = ip.To4()
+	}
+	if raw6 := strings.TrimSpace(os.Getenv("SOURCE_IP6")); raw6 != "" {
+		ip := net.ParseIP(raw6)
+		if ip == nil || ip.To4() != nil || ip.To16() == nil {
+			return nil, nil, fmt.Errorf("invalid SOURCE_IP6 %q (expected IPv6 address)", raw6)
+		}
+		src6 = ip.To16()
+	}
+	return src4, src6, nil
 }
 
 func LoadProbe() (ProbeConfig, error) {
+	src4, src6, err := parseSourceIPConfig()
+	if err != nil {
+		return ProbeConfig{}, err
+	}
 	cfg := ProbeConfig{
 		CentralURL:     strings.TrimSpace(os.Getenv("CENTRAL_URL")),
 		ProbeToken:     strings.TrimSpace(os.Getenv("PROBE_TOKEN")),
@@ -30,6 +66,8 @@ func LoadProbe() (ProbeConfig, error) {
 		MaxBufferHours: getEnvInt("MAX_BUFFER_HOURS", 168),
 		AgentVersion:   getEnvDefault("AGENT_VERSION", "1.0.0"),
 		TLSSkipVerify:  strings.EqualFold(getEnvDefault("PROBE_TLS_INSECURE_SKIP_VERIFY", "false"), "true"),
+		SourceIP4:      src4,
+		SourceIP6:      src6,
 	}
 	if cfg.CentralURL == "" {
 		return cfg, fmt.Errorf("CENTRAL_URL is required")

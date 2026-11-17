@@ -1,0 +1,34 @@
+services:
+  smoker-probe:
+    image: smoker-probe:latest
+    build:
+      context: ../..
+      dockerfile: deploy/docker/probe.Dockerfile
+    container_name: ${PROBE_CONTAINER_NAME:-smoker-probe}
+    restart: unless-stopped
+    cap_add:
+      - NET_RAW
+    networks:
+      smoker_macvlan:
+        ipv4_address: ${PROBE_MACVLAN_IP:?PROBE_MACVLAN_IP is required}
+    environment:
+      CENTRAL_URL: ${CENTRAL_URL:?CENTRAL_URL is required (e.g. wss://smoker.example.com/ws/probe or ws://10.x.x.x:8080/ws/probe)}
+      PROBE_TOKEN: ${PROBE_TOKEN:?PROBE_TOKEN is required}
+      PROBE_TLS_INSECURE_SKIP_VERIFY: ${PROBE_TLS_INSECURE_SKIP_VERIFY:-false}
+      SOURCE_IP: ${SOURCE_IP:-}
+      SOURCE_IP4: ${SOURCE_IP4:-}
+      SOURCE_IP6: ${SOURCE_IP6:-}
+      DATA_DIR: /data
+      MAX_BUFFER_MB: ${MAX_BUFFER_MB:-1024}
+      MAX_BUFFER_HOURS: ${MAX_BUFFER_HOURS:-168}
+      AGENT_VERSION: ${AGENT_VERSION:-1.0.0}
+    volumes:
+      - probe_remote_data:/data
+
+networks:
+  smoker_macvlan:
+    external: true
+    name: ${PROBE_MACVLAN_NET:?PROBE_MACVLAN_NET is required}
+
+volumes:
+  probe_remote_data:

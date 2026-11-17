@@ -14,6 +14,7 @@ BACKUP_KEEP="5"
 NO_CACHE="false"
 DO_PRUNE="true"
 SERVICES_CSV=""
+INSTANCE_FILTER=""
 DRY_RUN="false"
 
 usage() {
@@ -24,13 +25,14 @@ Usage:
   ./scripts/update.sh [options]
 
 Options:
-  --role auto|central|probe|all   Target deployment role (default: auto via .env / .probe.env)
+  --role auto|central|probe|all   Target deployment role (default: auto via .env / .probe*.env)
   --branch BRANCH                 Git branch to pull (default: current active branch)
   --skip-pull                     Skip 'git pull --ff-only' and rebuild from local files only
   --stash                         Auto-stash dirty tracked files before 'git pull --ff-only'
   --no-backup                     Skip pre-update TimescaleDB pg_dump backup (Central)
   --backup-keep N                 Number of backups/*.sql.gz files to retain (default: 5)
   --services s1,s2,...            Comma-separated Central services to rebuild/restart (e.g. central,web)
+  --instance NAME                 Update only a single named Remote Probe instance (e.g. pub1 or default)
   --no-cache                      Pass --no-cache to 'docker compose build'
   --no-prune                      Skip 'docker image prune -f' after successful update
   --dry-run                       Show planned actions without modifying git, backups, or containers
@@ -39,7 +41,8 @@ Options:
 Examples:
   ./scripts/update.sh                              # Auto-detect role, backup DB, pull, rebuild & verify
   ./scripts/update.sh --services central,web       # Fast update of backend API + frontend only
-  ./scripts/update.sh --role probe                 # Update standalone Remote Probe node
+  ./scripts/update.sh --role probe                 # Update all Remote Probe container instances on host
+  ./scripts/update.sh --role probe --instance pub1 # Update only .probe.pub1.env instance
   ./scripts/update.sh --stash --no-cache           # Stash local edits, pull, and clean-rebuild
 EOF
 }
@@ -53,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --no-backup) DO_BACKUP="false"; shift ;;
     --backup-keep) BACKUP_KEEP="${2:-}"; shift 2 ;;
     --services) SERVICES_CSV="${2:-}"; shift 2 ;;
+    --instance) INSTANCE_FILTER="${2:-}"; shift 2 ;;
     --no-cache) NO_CACHE="true"; shift ;;
     --no-prune) DO_PRUNE="false"; shift ;;
     --dry-run) DRY_RUN="true"; shift ;;
@@ -89,6 +93,36 @@ read_env_var() {
   fi
 }
 
+list_probe_env_files() {
+  local -a files=()
+  local f base inst
+  if [[ -n "$INSTANCE_FILTER" ]]; then
+    inst="$(echo "$INSTANCE_FILTER" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    if [[ "$inst" == "default" ]]; then
+      [[ -f "${ROOT_DIR}/.probe.env" ]] && echo "${ROOT_DIR}/.probe.env"
+      return
+    fi
+    [[ -f "${ROOT_DIR}/.probe.${inst}.env" ]] && echo "${ROOT_DIR}/.probe.${inst}.env"
+    return
+  fi
+
+  if [[ -f "${ROOT_DIR}/.probe.env" ]]; then
+    files+=("${ROOT_DIR}/.probe.env")
+  fi
+  shopt -s nullglob
+  for f in "${ROOT_DIR}"/.probe.*.env; do
+    base="$(basename "$f")"
+    if [[ "$base" == *.bak.* ]]; then
+      continue
+    fi
+    files+=("$f")
+  done
+  shopt -u nullglob
+  if [[ ${#files[@]} -gt 0 ]]; then
+    printf '%s\n' "${files[@]}"
+  fi
+}
+
 backup_env_files() {
   local ts="$1"
   if [[ -f "${ROOT_DIR}/.env" ]]; then
@@ -100,15 +134,18 @@ backup_env_files() {
       log_info "Backed up .env -> .env.bak.${ts}"
     fi
   fi
-  if [[ -f "${ROOT_DIR}/.probe.env" ]]; then
+  local pfile pbase
+  while IFS= read -r pfile; do
+    [[ -z "$pfile" ]] && continue
+    pbase="$(basename "$pfile")"
     if [[ "$DRY_RUN" == "true" ]]; then
-      log_info "[dry-run] Would back up .probe.env -> .probe.env.bak.${ts}"
+      log_info "[dry-run] Would back up ${pbase} -> ${pbase}.bak.${ts}"
     else
-      cp "${ROOT_DIR}/.probe.env" "${ROOT_DIR}/.probe.env.bak.${ts}"
-      chmod 600 "${ROOT_DIR}/.probe.env.bak.${ts}"
-      log_info "Backed up .probe.env -> .probe.env.bak.${ts}"
+      cp "$pfile" "${pfile}.bak.${ts}"
+      chmod 600 "${pfile}.bak.${ts}"
+      log_info "Backed up ${pbase} -> ${pbase}.bak.${ts}"
     fi
-  fi
+  done < <(list_probe_env_files)
 }
 
 detect_roles() {
@@ -124,7 +161,7 @@ detect_roles() {
   if [[ -f "${ROOT_DIR}/.env" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qE '^smoker-(central|db|web|gateway)$'; then
     has_central="true"
   fi
-  if [[ -f "${ROOT_DIR}/.probe.env" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'smoker-probe'; then
+  if [[ -n "$(list_probe_env_files)" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qE '^smoker-probe($|-)'; then
     has_probe="true"
   fi
 
@@ -135,7 +172,7 @@ detect_roles() {
   elif [[ "$has_central" == "true" ]]; then
     echo "central"
   else
-    log_err "Could not auto-detect Smoker installation (.env or .probe.env not found). Pass --role central|probe or run ./scripts/setup.sh first."
+    log_err "Could not auto-detect Smoker installation (.env or .probe*.env not found). Pass --role central|probe or run ./scripts/setup.sh first."
     exit 1
   fi
 }
@@ -373,8 +410,18 @@ update_central() {
 }
 
 update_probe() {
-  if [[ ! -f "${ROOT_DIR}/.probe.env" ]]; then
-    log_err "Missing .probe.env for Remote Probe role. Run './scripts/setup.sh --role probe' first."
+  local -a probe_files=()
+  local pfile
+  while IFS= read -r pfile; do
+    [[ -n "$pfile" ]] && probe_files+=("$pfile")
+  done < <(list_probe_env_files)
+
+  if [[ ${#probe_files[@]} -eq 0 ]]; then
+    if [[ -n "$INSTANCE_FILTER" ]]; then
+      log_err "No env file found for probe instance '${INSTANCE_FILTER}'."
+    else
+      log_err "Missing .probe.env (or .probe.<instance>.env) for Remote Probe role. Run './scripts/setup.sh --role probe' first."
+    fi
     exit 1
   fi
 
@@ -386,18 +433,40 @@ update_probe() {
   pre_build_cleanup
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    log_info "[dry-run] Would rebuild & restart deploy/docker/probe-agent.compose.yml"
+    log_info "[dry-run] Would build shared smoker-probe:latest image and restart ${#probe_files[@]} instance(s): ${probe_files[*]}"
     return
   fi
 
   export COMPOSE_BAKE=false
-  log_info "Building Remote Probe image..."
-  docker compose -f "${ROOT_DIR}/deploy/docker/probe-agent.compose.yml" --env-file "${ROOT_DIR}/.probe.env" build ${build_flags[@]+"${build_flags[@]}"}
+  log_info "Building shared Remote Probe image (smoker-probe:latest)..."
+  docker compose -f "${ROOT_DIR}/deploy/docker/probe-agent.compose.yml" --env-file "${probe_files[0]}" build ${build_flags[@]+"${build_flags[@]}"}
 
-  log_info "Restarting smoker-probe container (preserving SQLite WAL buffer)..."
-  docker compose -f "${ROOT_DIR}/deploy/docker/probe-agent.compose.yml" --env-file "${ROOT_DIR}/.probe.env" up -d --no-build
-  sleep 3
-  docker logs --tail=10 smoker-probe || true
+  local pbase inst_name cname macvlan_net compose_file
+  for pfile in "${probe_files[@]}"; do
+    pbase="$(basename "$pfile")"
+    cname="$(read_env_var "$pfile" "PROBE_CONTAINER_NAME")"
+    macvlan_net="$(read_env_var "$pfile" "PROBE_MACVLAN_NET")"
+
+    local -a project_args=()
+    if [[ "$pbase" =~ ^\.probe\.(.+)\.env$ ]]; then
+      inst_name="${BASH_REMATCH[1]}"
+      cname="${cname:-smoker-probe-${inst_name}}"
+      project_args=(-p "smoker-probe-${inst_name}")
+    else
+      cname="${cname:-smoker-probe}"
+    fi
+
+    if [[ -n "$macvlan_net" ]]; then
+      compose_file="${ROOT_DIR}/deploy/docker/probe-macvlan.compose.yml"
+    else
+      compose_file="${ROOT_DIR}/deploy/docker/probe-agent.compose.yml"
+    fi
+
+    log_info "Restarting '${cname}' (${pbase}, preserving SQLite WAL buffer)..."
+    docker compose ${project_args[@]+"${project_args[@]}"} -f "$compose_file" --env-file "$pfile" up -d --no-build
+    sleep 2
+    docker logs --tail=5 "$cname" || true
+  done
 }
 
 get_free_mb() {

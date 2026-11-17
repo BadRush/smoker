@@ -36,7 +36,11 @@ func main() {
 	}
 	defer buf.Close()
 
-	icmpProber, err := engine.NewICMPProber()
+	proberOpts := engine.ProberOptions{
+		SourceIP4: cfg.SourceIP4,
+		SourceIP6: cfg.SourceIP6,
+	}
+	icmpProber, err := engine.NewICMPProberWithOptions(proberOpts)
 	if err != nil {
 		slog.Error("init icmp prober failed", "err", err)
 		os.Exit(1)
@@ -45,7 +49,7 @@ func main() {
 
 	clk := clock.NewTracker()
 	client := uplink.NewClient(cfg, buf, clk)
-	scheduler := engine.NewScheduler(icmpProber, clk, client.EnqueueSample, client.TriggerAutoMTR)
+	scheduler := engine.NewSchedulerWithOptions(icmpProber, proberOpts, clk, client.EnqueueSample, client.TriggerAutoMTR)
 	client.SetScheduler(scheduler)
 
 	if snap, err := config.LoadSnapshot(cfg.DataDir); err == nil && len(snap.Targets) > 0 {
@@ -53,7 +57,13 @@ func main() {
 		scheduler.ApplyConfig(ctx, snap.Targets)
 	}
 
-	slog.Info("smoker probe starting", "central_url", cfg.CentralURL, "data_dir", cfg.DataDir)
+	slog.Info(
+		"smoker probe starting",
+		"central_url", cfg.CentralURL,
+		"data_dir", cfg.DataDir,
+		"source_ip4", cfg.SourceIP4,
+		"source_ip6", cfg.SourceIP6,
+	)
 	client.Run(ctx)
 
 	scheduler.StopAll()

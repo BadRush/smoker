@@ -13,11 +13,72 @@ import (
 	"github.com/miekg/dns"
 )
 
+// ProberOptions configures optional outbound source IP bindings for all probe protocols.
+type ProberOptions struct {
+	SourceIP4 net.IP
+	SourceIP6 net.IP
+}
+
+func (o ProberOptions) hasSourceIP() bool {
+	return o.SourceIP4 != nil || o.SourceIP6 != nil
+}
+
+func (o ProberOptions) dialTCPWithSource(ctx context.Context, requestedNet, addr string, timeout time.Duration) (net.Conn, error) {
+	if !o.hasSourceIP() {
+		d := net.Dialer{Timeout: timeout}
+		return d.DialContext(ctx, requestedNet, addr)
+	}
+
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	var resolveFamily string
+	switch {
+	case requestedNet == "tcp6":
+		resolveFamily = "ip6"
+	case requestedNet == "tcp4":
+		resolveFamily = "ip4"
+	case o.SourceIP4 != nil && o.SourceIP6 == nil:
+		resolveFamily = "ip4"
+	case o.SourceIP6 != nil && o.SourceIP4 == nil:
+		resolveFamily = "ip6"
+	default:
+		resolveFamily = "ip"
+	}
+
+	dstIP, err := resolveHostIPWithFamily(ctx, host, resolveFamily)
+	if err != nil {
+		return nil, err
+	}
+
+	var dialNet string
+	var localIP net.IP
+	if v4 := dstIP.To4(); v4 != nil {
+		dialNet = "tcp4"
+		localIP = o.SourceIP4
+	} else {
+		dialNet = "tcp6"
+		localIP = o.SourceIP6
+	}
+
+	d := net.Dialer{Timeout: timeout}
+	if localIP != nil {
+		d.LocalAddr = &net.TCPAddr{IP: localIP}
+	}
+	return d.DialContext(ctx, dialNet, net.JoinHostPort(dstIP.String(), port))
+}
+
 func ProbeTCP(ctx context.Context, host, port string, timeout time.Duration) (time.Duration, error) {
-	return ProbeTCPWithNetwork(ctx, "tcp", host, port, timeout)
+	return ProbeTCPWithOptions(ctx, "tcp", host, port, timeout, ProberOptions{})
 }
 
 func ProbeTCPWithNetwork(ctx context.Context, network, host, port string, timeout time.Duration) (time.Duration, error) {
+	return ProbeTCPWithOptions(ctx, network, host, port, timeout, ProberOptions{})
+}
+
+func ProbeTCPWithOptions(ctx context.Context, network, host, port string, timeout time.Duration, opts ProberOptions) (time.Duration, error) {
 	cleanHost, err := ExtractMTRHost(host)
 	if err != nil {
 		return 0, err
@@ -28,9 +89,8 @@ func ProbeTCPWithNetwork(ctx context.Context, network, host, port string, timeou
 		}
 	}
 	addr := net.JoinHostPort(cleanHost, strings.TrimSpace(port))
-	dialer := net.Dialer{Timeout: timeout}
 	start := time.Now()
-	conn, err := dialer.DialContext(ctx, network, addr)
+	conn, err := opts.dialTCPWithSource(ctx, network, addr, timeout)
 	if err != nil {
 		return 0, err
 	}
@@ -65,12 +125,15 @@ func formatHTTPTargetURL(rawHost, portOrPath string) string {
 }
 
 func ProbeHTTP(ctx context.Context, host, portOrPath string, timeout time.Duration) (time.Duration, error) {
-	return ProbeHTTPWithNetwork(ctx, "tcp", host, portOrPath, timeout)
+	return ProbeHTTPWithOptions(ctx, "tcp", host, portOrPath, timeout, ProberOptions{})
 }
 
 func ProbeHTTPWithNetwork(ctx context.Context, network, host, portOrPath string, timeout time.Duration) (time.Duration, error) {
+	return ProbeHTTPWithOptions(ctx, network, host, portOrPath, timeout, ProberOptions{})
+}
+
+func ProbeHTTPWithOptions(ctx context.Context, network, host, portOrPath string, timeout time.Duration, opts ProberOptions) (time.Duration, error) {
 	targetURL := formatHTTPTargetURL(host, portOrPath)
-	dialer := &net.Dialer{Timeout: timeout}
 	tr := &http.Transport{
 		DisableKeepAlives: true,
 		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
@@ -82,7 +145,7 @@ func ProbeHTTPWithNetwork(ctx context.Context, network, host, portOrPath string,
 					}
 				}
 			}
-			return dialer.DialContext(dialCtx, network, addr)
+			return opts.dialTCPWithSource(dialCtx, network, addr, timeout)
 		},
 	}
 	defer tr.CloseIdleConnections()
@@ -154,10 +217,14 @@ func resolveDNSServerAddr(ctx context.Context, rawHost string, forceV6 bool) (ad
 }
 
 func ProbeDNS(ctx context.Context, resolverHost, portOrPath string, timeout time.Duration) (time.Duration, error) {
-	return ProbeDNSWithFamily(ctx, false, resolverHost, portOrPath, timeout)
+	return ProbeDNSWithOptions(ctx, false, resolverHost, portOrPath, timeout, ProberOptions{})
 }
 
 func ProbeDNSWithFamily(ctx context.Context, forceV6 bool, resolverHost, portOrPath string, timeout time.Duration) (time.Duration, error) {
+	return ProbeDNSWithOptions(ctx, forceV6, resolverHost, portOrPath, timeout, ProberOptions{})
+}
+
+func ProbeDNSWithOptions(ctx context.Context, forceV6 bool, resolverHost, portOrPath string, timeout time.Duration, opts ProberOptions) (time.Duration, error) {
 	domain := "example.com."
 	qtype := dns.TypeA
 	if forceV6 {
@@ -194,6 +261,18 @@ func ProbeDNSWithFamily(ctx context.Context, forceV6 bool, resolverHost, portOrP
 	client := &dns.Client{
 		Net:     netProto,
 		Timeout: timeout,
+	}
+	var srcIP net.IP
+	if netProto == "udp6" && opts.SourceIP6 != nil {
+		srcIP = opts.SourceIP6
+	} else if netProto == "udp4" && opts.SourceIP4 != nil {
+		srcIP = opts.SourceIP4
+	}
+	if srcIP != nil {
+		client.Dialer = &net.Dialer{
+			Timeout:   timeout,
+			LocalAddr: &net.UDPAddr{IP: srcIP},
+		}
 	}
 	resp, rtt, err := client.ExchangeContext(ctx, m, addr)
 	if err != nil {

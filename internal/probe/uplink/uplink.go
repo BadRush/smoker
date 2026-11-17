@@ -61,11 +61,18 @@ func (c *Client) EnqueueSample(rec protocol.SampleRecord) {
 	}
 }
 
+func (c *Client) proberOptions() engine.ProberOptions {
+	return engine.ProberOptions{
+		SourceIP4: c.cfg.SourceIP4,
+		SourceIP6: c.cfg.SourceIP6,
+	}
+}
+
 func (c *Client) TriggerAutoMTR(targetID, host, probeType string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
-	hops, err := engine.RunMTRWithFamily(ctx, host, strings.HasSuffix(probeType, "6"))
+	hops, err := engine.RunMTRWithOptions(ctx, host, strings.HasSuffix(probeType, "6"), c.proberOptions())
 	if err != nil {
 		slog.Warn("auto mtr failed", "target_id", targetID, "host", host, "err", err)
 		return err
@@ -255,7 +262,7 @@ func (c *Client) runOnDemandMTR(req protocol.RunMTRPayload) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	hops, err := engine.RunMTRWithFamily(ctx, req.Host, strings.HasSuffix(req.ProbeType, "6"))
+	hops, err := engine.RunMTRWithOptions(ctx, req.Host, strings.HasSuffix(req.ProbeType, "6"), c.proberOptions())
 	if hops == nil {
 		hops = []protocol.MTRHop{}
 	}

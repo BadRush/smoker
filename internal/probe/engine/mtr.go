@@ -2,12 +2,12 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"math"
 	"net"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +29,13 @@ var (
 	// Limit simultaneous active MTR traces per probe to prevent raw ICMP storms during wide outages.
 	mtrSem       = make(chan struct{}, 2)
 	mtrIDCounter atomic.Uint32
+	mtrIDSeed    = func() uint32 {
+		var b [2]byte
+		if _, err := rand.Read(b[:]); err == nil {
+			return uint32(binary.BigEndian.Uint16(b[:]))
+		}
+		return 0x5A00
+	}()
 )
 
 type mtrReply struct {
@@ -84,25 +91,29 @@ func ExtractMTRHost(raw string) (string, error) {
 
 func nextMTRICMPID() int {
 	seq := mtrIDCounter.Add(1)
-	id := int(((uint32(os.Getpid()) & 0xff) << 8) ^ (seq & 0xffff))
-	if id == 0 {
-		id = 0x5A00 | int(seq&0xff)
-	}
-	return id
+	return int(((seq + mtrIDSeed) & 0x7fff) | 0x8000)
 }
 
-func openMTRSocket(isV6 bool) (*icmp.PacketConn, int, bool, error) {
+func openMTRSocket(isV6 bool, bindIP net.IP) (*icmp.PacketConn, int, bool, error) {
 	if isV6 {
-		if c, err := icmp.ListenPacket("ip6:ipv6-icmp", "::"); err == nil {
+		addr := "::"
+		if bindIP != nil && bindIP.To4() == nil && bindIP.To16() != nil {
+			addr = bindIP.To16().String()
+		}
+		if c, err := icmp.ListenPacket("ip6:ipv6-icmp", addr); err == nil {
 			return c, 58, true, nil
 		}
-		c, err := icmp.ListenPacket("udp6", "::")
+		c, err := icmp.ListenPacket("udp6", addr)
 		return c, 58, false, err
 	}
-	if c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0"); err == nil {
+	addr := "0.0.0.0"
+	if bindIP != nil && bindIP.To4() != nil {
+		addr = bindIP.To4().String()
+	}
+	if c, err := icmp.ListenPacket("ip4:icmp", addr); err == nil {
 		return c, 1, true, nil
 	}
-	c, err := icmp.ListenPacket("udp4", "0.0.0.0")
+	c, err := icmp.ListenPacket("udp4", addr)
 	return c, 1, false, err
 }
 
@@ -119,11 +130,16 @@ func extractPeerIP(peer net.Addr) string {
 
 // RunMTR executes a bounded concurrent TTL-incrementing ICMP traceroute (IPv4/IPv6) with rDNS lookup.
 func RunMTR(ctx context.Context, rawHost string) ([]protocol.MTRHop, error) {
-	return RunMTRWithFamily(ctx, rawHost, false)
+	return RunMTRWithOptions(ctx, rawHost, false, ProberOptions{})
 }
 
 // RunMTRWithFamily executes an ICMP traceroute, forcing AAAA/ICMPv6 resolution when forceIPv6 is true.
 func RunMTRWithFamily(ctx context.Context, rawHost string, forceIPv6 bool) ([]protocol.MTRHop, error) {
+	return RunMTRWithOptions(ctx, rawHost, forceIPv6, ProberOptions{})
+}
+
+// RunMTRWithOptions executes an ICMP traceroute bound to optional IPv4/IPv6 source addresses.
+func RunMTRWithOptions(ctx context.Context, rawHost string, forceIPv6 bool, opts ProberOptions) ([]protocol.MTRHop, error) {
 	host, err := ExtractMTRHost(rawHost)
 	if err != nil {
 		return nil, err
@@ -139,6 +155,8 @@ func RunMTRWithFamily(ctx context.Context, rawHost string, forceIPv6 bool) ([]pr
 	family := "ip"
 	if forceIPv6 {
 		family = "ip6"
+	} else if opts.SourceIP4 != nil && opts.SourceIP6 == nil {
+		family = "ip4"
 	}
 	ip, err := resolveHostIPWithFamily(ctx, host, family)
 	if err != nil {
@@ -147,14 +165,16 @@ func RunMTRWithFamily(ctx context.Context, rawHost string, forceIPv6 bool) ([]pr
 	ip4 := ip.To4()
 	isV6 := ip4 == nil
 	dstIP := ip4
+	bindIP := opts.SourceIP4
 	if isV6 {
 		dstIP = ip.To16()
 		if dstIP == nil {
 			return nil, fmt.Errorf("unsupported destination IP for %s", host)
 		}
+		bindIP = opts.SourceIP6
 	}
 
-	conn, proto, isRaw, err := openMTRSocket(isV6)
+	conn, proto, isRaw, err := openMTRSocket(isV6, bindIP)
 	if err != nil {
 		return nil, err
 	}

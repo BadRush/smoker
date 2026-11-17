@@ -130,3 +130,73 @@ Konfigurasi `.probe.env` dan buffer SQLite WAL (`probe_remote_data`) tetap terja
 | Gagal koneksi ke `wss://` (TLS error) | Sertifikat self-signed atau domain belum mengarah ke Central. Untuk sertifikat internal, set `PROBE_TLS_INSECURE_SKIP_VERIFY=true` di `.probe.env` lalu recreate container. |
 | `init icmp prober failed` / permission denied | Pastikan container dijalankan memakai `deploy/docker/probe-agent.compose.yml` yang menyertakan `cap_add: [NET_RAW]` dan `network_mode: host`. |
 | Target tetap terpantau saat uplink putus | Normal — sampel disimpan sementara di SQLite WAL (`/data/buffer.db`) hingga maksimal `MAX_BUFFER_MB` / `MAX_BUFFER_HOURS` dan dikirim ulang otomatis saat koneksi pulih. |
+
+---
+
+## 5. Multi-Container Probe di 1 Host (Sampling Beberapa IP Publik via MikroTik 1:1 NAT)
+
+Jika Anda ingin memantau target yang sama (misalnya `e1-vhp.com` di AWS) dari **beberapa IP publik / prefix berbeda** melalui **1 server Linux** (misalnya VM `backuper-anycast`) dan **1 gateway MikroTik** — tanpa menjalankan Docker atau script polling di dalam MikroTik — jalankan beberapa container `smoker-probe` ringan pada server tersebut dan petakan tiap source IP lewat `1:1 src-nat` di MikroTik.
+
+> **Catatan Operasional:** Jika menumpang di server backup (`backuper-anycast`), batasi bandwidth backup / traffic-shaping agar lonjakan I/O saat jadwal backup tidak menggeser pembacaan latency probe.
+
+### Persiapan di Smoker Central UI
+Buat Probe terpisah di menu **`/probes` → Add Probe** sesuai jumlah IP publik yang ingin diuji, misalnya:
+- `Probe-PubIP-1` (catat `TOKEN_1`)
+- `Probe-PubIP-2` (catat `TOKEN_2`)
+- `Probe-PubIP-3` (catat `TOKEN_3`)
+
+### Opsi A — `network_mode: host` + Secondary IP & `SOURCE_IP` (Direkomendasikan)
+Pasang IP lokal sekunder (mis. `10.10.0.201`, `10.10.0.202`, `10.10.0.203`) pada interface jaringan host Linux menuju gateway MikroTik, lalu jalankan setup dengan flag `--instance` dan `--source-ip`:
+
+```bash
+./scripts/setup.sh --role probe \
+  --instance pub1 \
+  --source-ip 10.10.0.201 \
+  --central-url "wss://smoker.example.com/ws/probe" \
+  --probe-token "<TOKEN_1>" \
+  --yes
+
+./scripts/setup.sh --role probe \
+  --instance pub2 \
+  --source-ip 10.10.0.202 \
+  --central-url "wss://smoker.example.com/ws/probe" \
+  --probe-token "<TOKEN_2>" \
+  --yes
+```
+
+- Setiap instance menghasilkan file env sendiri (`.probe.pub1.env`, `.probe.pub2.env`), nama container terpisah (`smoker-probe-pub1`, `smoker-probe-pub2`), volume SQLite buffer terisolasi, `ICMP ID` unik otomatis, dan seluruh protokol (`ICMP`, `MTR`, `TCP`, `HTTP`, `DNS`) keluar memakai `SOURCE_IP` masing-masing (sementara koneksi WebSocket ke Central tetap mengikuti routing default OS).
+- Gunakan `--source-ip6` bila juga mengikat alamat IPv6 sumber yang berbeda.
+
+### Opsi B — Docker `macvlan` (`probe-macvlan.compose.yml`)
+Jika tidak ingin menambah secondary IP di OS host, buat network Docker `macvlan` terlebih dahulu pada interface NIC host (mis. `eth0`), lalu jalankan setup dengan `--macvlan-net` dan `--macvlan-ip`:
+
+```bash
+docker network create -d macvlan \
+  --subnet=10.10.0.0/24 --gateway=10.10.0.1 \
+  -o parent=eth0 smoker_macvlan
+
+./scripts/setup.sh --role probe \
+  --instance pub1 \
+  --macvlan-net smoker_macvlan \
+  --macvlan-ip 10.10.0.201 \
+  --central-url "wss://smoker.example.com/ws/probe" \
+  --probe-token "<TOKEN_1>" \
+  --yes
+```
+
+### Konfigurasi 1:1 `src-nat` di Gateway MikroTik
+Pada MikroTik (tetap 1 gateway `10.10.0.1`), arahkan masing-masing IP container ke prefix IP publik yang berbeda (taruh rule spesifik ini di atas rule `masquerade` umum):
+
+```routeros
+/ip firewall nat
+add chain=srcnat src-address=10.10.0.201 action=src-nat to-addresses=<IP_PUBLIK_PREFIX_A> comment="Smoker Probe Pub1"
+add chain=srcnat src-address=10.10.0.202 action=src-nat to-addresses=<IP_PUBLIK_PREFIX_B> comment="Smoker Probe Pub2"
+add chain=srcnat src-address=10.10.0.203 action=src-nat to-addresses=<IP_PUBLIK_PREFIX_C> comment="Smoker Probe Pub3"
+```
+
+### Update Semua Instance Probe Sekaligus
+Saat memperbarui versi Smoker di server multi-container, cukup jalankan:
+```bash
+./scripts/update.sh --role probe
+```
+Script otomatis membangun image `smoker-probe:latest` **satu kali** dan me-restart seluruh instance (`.probe.env` serta `.probe.*.env`) secara berurutan tanpa menghapus SQLite buffer masing-masing. Gunakan `--instance pub1` jika ingin meng-update satu instance saja.

@@ -81,6 +81,7 @@ type targetWorker struct {
 
 type Scheduler struct {
 	icmp      *ICMPProber
+	opts      ProberOptions
 	clk       *clock.Tracker
 	onSample  SampleHandler
 	onAutoMTR AutoMTRHandler
@@ -90,8 +91,13 @@ type Scheduler struct {
 }
 
 func NewScheduler(icmpProber *ICMPProber, clk *clock.Tracker, onSample SampleHandler, onAutoMTR AutoMTRHandler) *Scheduler {
+	return NewSchedulerWithOptions(icmpProber, ProberOptions{}, clk, onSample, onAutoMTR)
+}
+
+func NewSchedulerWithOptions(icmpProber *ICMPProber, opts ProberOptions, clk *clock.Tracker, onSample SampleHandler, onAutoMTR AutoMTRHandler) *Scheduler {
 	return &Scheduler{
 		icmp:      icmpProber,
+		opts:      opts,
 		clk:       clk,
 		onSample:  onSample,
 		onAutoMTR: onAutoMTR,
@@ -166,17 +172,17 @@ func (s *Scheduler) runTargetLoop(ctx context.Context, t protocol.TargetConfig) 
 		case "icmp6":
 			rtt, err = s.icmp.PingIPv6(probeCtx, t.Host, timeout)
 		case "tcp":
-			rtt, err = ProbeTCP(probeCtx, t.Host, t.PortOrPath, timeout)
+			rtt, err = ProbeTCPWithOptions(probeCtx, "tcp", t.Host, t.PortOrPath, timeout, s.opts)
 		case "tcp6":
-			rtt, err = ProbeTCPWithNetwork(probeCtx, "tcp6", t.Host, t.PortOrPath, timeout)
+			rtt, err = ProbeTCPWithOptions(probeCtx, "tcp6", t.Host, t.PortOrPath, timeout, s.opts)
 		case "http":
-			rtt, err = ProbeHTTP(probeCtx, t.Host, t.PortOrPath, timeout)
+			rtt, err = ProbeHTTPWithOptions(probeCtx, "tcp", t.Host, t.PortOrPath, timeout, s.opts)
 		case "http6":
-			rtt, err = ProbeHTTPWithNetwork(probeCtx, "tcp6", t.Host, t.PortOrPath, timeout)
+			rtt, err = ProbeHTTPWithOptions(probeCtx, "tcp6", t.Host, t.PortOrPath, timeout, s.opts)
 		case "dns":
-			rtt, err = ProbeDNS(probeCtx, t.Host, t.PortOrPath, timeout)
+			rtt, err = ProbeDNSWithOptions(probeCtx, false, t.Host, t.PortOrPath, timeout, s.opts)
 		case "dns6":
-			rtt, err = ProbeDNSWithFamily(probeCtx, true, t.Host, t.PortOrPath, timeout)
+			rtt, err = ProbeDNSWithOptions(probeCtx, true, t.Host, t.PortOrPath, timeout, s.opts)
 		default:
 			return
 		}

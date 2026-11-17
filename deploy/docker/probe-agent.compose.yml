@@ -1,9 +1,10 @@
 services:
   smoker-probe:
+    image: smoker-probe:latest
     build:
       context: ../..
       dockerfile: deploy/docker/probe.Dockerfile
-    container_name: smoker-probe
+    container_name: ${PROBE_CONTAINER_NAME:-smoker-probe}
     restart: unless-stopped
     network_mode: host
     cap_add:
@@ -12,6 +13,9 @@ services:
       CENTRAL_URL: ${CENTRAL_URL:?CENTRAL_URL is required (e.g. wss://smoker.example.com/ws/probe or ws://10.x.x.x:8080/ws/probe)}
       PROBE_TOKEN: ${PROBE_TOKEN:?PROBE_TOKEN is required}
       PROBE_TLS_INSECURE_SKIP_VERIFY: ${PROBE_TLS_INSECURE_SKIP_VERIFY:-false}
+      SOURCE_IP: ${SOURCE_IP:-}
+      SOURCE_IP4: ${SOURCE_IP4:-}
+      SOURCE_IP6: ${SOURCE_IP6:-}
       DATA_DIR: /data
       MAX_BUFFER_MB: ${MAX_BUFFER_MB:-1024}
       MAX_BUFFER_HOURS: ${MAX_BUFFER_HOURS:-168}
