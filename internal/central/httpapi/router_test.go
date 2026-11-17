@@ -37,6 +37,7 @@ type fakeStore struct {
 	adminHash     string
 	targets       []db.Target
 	probes        []db.Probe
+	alertRules    []db.AlertRule
 	alertChannels []db.AlertChannel
 }
 
@@ -205,14 +206,53 @@ func (f *fakeStore) QueryBatchTargetSeries(_ context.Context, ids []uuid.UUID, r
 func (f *fakeStore) ListMTRSnapshots(context.Context, uuid.UUID, int) ([]db.MTRSnapshot, error) {
 	return []db.MTRSnapshot{}, nil
 }
-func (f *fakeStore) ListAlertRules(context.Context) ([]db.AlertRule, error) { return []db.AlertRule{}, nil }
-func (f *fakeStore) CreateAlertRule(context.Context, db.AlertRuleInput) (db.AlertRule, error) {
-	return db.AlertRule{}, nil
+func (f *fakeStore) ListAlertRules(context.Context) ([]db.AlertRule, error) { return f.alertRules, nil }
+func (f *fakeStore) CreateAlertRule(_ context.Context, in db.AlertRuleInput) (db.AlertRule, error) {
+	chIDs := in.ChannelIDs
+	if chIDs == nil {
+		chIDs = []uuid.UUID{}
+	}
+	r := db.AlertRule{
+		ID:              uuid.New(),
+		Name:            in.Name,
+		TargetID:        in.TargetID,
+		GroupID:         in.GroupID,
+		Metric:          in.Metric,
+		ThresholdValue:  in.ThresholdValue,
+		DurationSec:     in.DurationSec,
+		QuorumMinProbes: in.QuorumMinProbes,
+		CooldownSec:     in.CooldownSec,
+		ChannelIDs:      chIDs,
+		Enabled:         in.Enabled,
+		CreatedAt:       time.Now().UTC(),
+	}
+	f.alertRules = append(f.alertRules, r)
+	return r, nil
 }
-func (f *fakeStore) UpdateAlertRule(context.Context, uuid.UUID, db.AlertRuleInput) (db.AlertRule, error) {
-	return db.AlertRule{}, nil
+func (f *fakeStore) UpdateAlertRule(_ context.Context, id uuid.UUID, in db.AlertRuleInput) (db.AlertRule, error) {
+	for i, existing := range f.alertRules {
+		if existing.ID == id {
+			chIDs := in.ChannelIDs
+			if chIDs == nil {
+				chIDs = []uuid.UUID{}
+			}
+			existing.Name = in.Name
+			existing.TargetID = in.TargetID
+			existing.GroupID = in.GroupID
+			existing.Metric = in.Metric
+			existing.ThresholdValue = in.ThresholdValue
+			existing.DurationSec = in.DurationSec
+			existing.QuorumMinProbes = in.QuorumMinProbes
+			existing.CooldownSec = in.CooldownSec
+			existing.ChannelIDs = chIDs
+			existing.Enabled = in.Enabled
+			f.alertRules[i] = existing
+			return existing, nil
+		}
+	}
+	return db.AlertRule{}, db.ErrNotFound
 }
-func (f *fakeStore) DeleteAlertRule(context.Context, uuid.UUID) error             { return nil }
+func (f *fakeStore) DeleteAlertRule(context.Context, uuid.UUID) error { return nil }
 func (f *fakeStore) ListAlertChannels(context.Context) ([]db.AlertChannel, error) {
 	return f.alertChannels, nil
 }
@@ -236,6 +276,19 @@ func (f *fakeStore) CreateAlertChannel(_ context.Context, chType, name string, e
 	}
 	f.alertChannels = append(f.alertChannels, ch)
 	return ch, nil
+}
+func (f *fakeStore) UpdateAlertChannel(_ context.Context, id uuid.UUID, name string, enc []byte, hint string, enabled bool) (db.AlertChannel, error) {
+	for i, ch := range f.alertChannels {
+		if ch.ID == id {
+			ch.Name = name
+			ch.ConfigEncrypted = enc
+			ch.ConfigHint = hint
+			ch.Enabled = enabled
+			f.alertChannels[i] = ch
+			return ch, nil
+		}
+	}
+	return db.AlertChannel{}, db.ErrNotFound
 }
 func (f *fakeStore) DeleteAlertChannel(context.Context, uuid.UUID) error      { return nil }
 func (f *fakeStore) ListIncidents(context.Context, int) ([]db.Incident, error) { return []db.Incident{}, nil }
@@ -735,5 +788,54 @@ func TestTelegramAlertChannelWithThreadID(t *testing.T) {
 	}
 	if sec.ThreadID != 7788 {
 		t.Fatalf("expected stored ThreadID=7788, got %d", sec.ThreadID)
+	}
+
+	// Update channel: toggle disabled while preserving bot_token/chat_id/thread_id
+	toggleReq := httptest.NewRequest(http.MethodPut, "/api/alerts/channels/"+ch.ID.String(), bytes.NewBufferString(`{"enabled":false}`))
+	toggleReq.AddCookie(sessionCookie)
+	toggleRec := httptest.NewRecorder()
+	router.ServeHTTP(toggleRec, toggleReq)
+	if toggleRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 toggling channel, got %d (%s)", toggleRec.Code, toggleRec.Body.String())
+	}
+	var toggled db.AlertChannel
+	if err := json.Unmarshal(toggleRec.Body.Bytes(), &toggled); err != nil {
+		t.Fatalf("decode toggled channel: %v", err)
+	}
+	if toggled.Enabled || toggled.Name != "NOC Topic" || toggled.ConfigHint != "chat:-1001234 · thread:7788" {
+		t.Fatalf("expected credentials/hint preserved on toggle, got %+v", toggled)
+	}
+
+	// Update channel: clear thread_id and rename while keeping bot_token empty
+	updReq := httptest.NewRequest(http.MethodPut, "/api/alerts/channels/"+ch.ID.String(), bytes.NewBufferString(`{"name":"NOC Main","chat_id":"-100999","thread_id":null,"enabled":true}`))
+	updReq.AddCookie(sessionCookie)
+	updRec := httptest.NewRecorder()
+	router.ServeHTTP(updRec, updReq)
+	if updRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 updating channel, got %d (%s)", updRec.Code, updRec.Body.String())
+	}
+	var updated db.AlertChannel
+	if err := json.Unmarshal(updRec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decode updated channel: %v", err)
+	}
+	if !updated.Enabled || updated.Name != "NOC Main" || updated.ConfigHint != "chat:-100999" {
+		t.Fatalf("unexpected updated channel: %+v", updated)
+	}
+
+	// Create Global alert rule (target_id=null, group_id=null) with cooldown_sec=0 & channel_ids routing
+	rulePayload := `{"name":"Global Packet Loss","metric":"loss_pct","threshold_value":20,"duration_sec":30,"quorum_min_probes":1,"cooldown_sec":0,"channel_ids":["` + ch.ID.String() + `"]}`
+	ruleReq := httptest.NewRequest(http.MethodPost, "/api/alerts/rules", bytes.NewBufferString(rulePayload))
+	ruleReq.AddCookie(sessionCookie)
+	ruleRec := httptest.NewRecorder()
+	router.ServeHTTP(ruleRec, ruleReq)
+	if ruleRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating global rule, got %d (%s)", ruleRec.Code, ruleRec.Body.String())
+	}
+	var createdRule db.AlertRule
+	if err := json.Unmarshal(ruleRec.Body.Bytes(), &createdRule); err != nil {
+		t.Fatalf("decode global rule: %v", err)
+	}
+	if createdRule.TargetID != nil || createdRule.GroupID != nil || createdRule.CooldownSec != 0 || len(createdRule.ChannelIDs) != 1 || createdRule.ChannelIDs[0] != ch.ID {
+		t.Fatalf("unexpected global rule: %+v", createdRule)
 	}
 }

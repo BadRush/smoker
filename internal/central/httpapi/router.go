@@ -54,6 +54,7 @@ type Store interface {
 	ListAlertChannels(ctx context.Context) ([]db.AlertChannel, error)
 	GetAlertChannel(ctx context.Context, id uuid.UUID) (db.AlertChannel, error)
 	CreateAlertChannel(ctx context.Context, typ, name string, enc []byte, hint string, enabled bool) (db.AlertChannel, error)
+	UpdateAlertChannel(ctx context.Context, id uuid.UUID, name string, enc []byte, hint string, enabled bool) (db.AlertChannel, error)
 	DeleteAlertChannel(ctx context.Context, id uuid.UUID) error
 
 	ListIncidents(ctx context.Context, limit int) ([]db.Incident, error)
@@ -172,6 +173,7 @@ func NewRouter(deps Dependencies) http.Handler {
 
 		pr.Get("/api/alerts/channels", s.handleListAlertChannels)
 		pr.Post("/api/alerts/channels", s.handleCreateAlertChannel)
+		pr.Put("/api/alerts/channels/{id}", s.handleUpdateAlertChannel)
 		pr.Delete("/api/alerts/channels/{id}", s.handleDeleteAlertChannel)
 		pr.Post("/api/alerts/channels/{id}/test", s.handleTestAlertChannel)
 

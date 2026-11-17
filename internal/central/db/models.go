@@ -79,17 +79,18 @@ type Target struct {
 }
 
 type AlertRule struct {
-	ID              uuid.UUID  `json:"id"`
-	Name            string     `json:"name"`
-	TargetID        *uuid.UUID `json:"target_id"`
-	GroupID         *uuid.UUID `json:"group_id"`
-	Metric          string     `json:"metric"`
-	ThresholdValue  float64    `json:"threshold_value"`
-	DurationSec     int        `json:"duration_sec"`
-	QuorumMinProbes int        `json:"quorum_min_probes"`
-	CooldownSec     int        `json:"cooldown_sec"`
-	Enabled         bool       `json:"enabled"`
-	CreatedAt       time.Time  `json:"created_at"`
+	ID              uuid.UUID   `json:"id"`
+	Name            string      `json:"name"`
+	TargetID        *uuid.UUID  `json:"target_id"`
+	GroupID         *uuid.UUID  `json:"group_id"`
+	Metric          string      `json:"metric"`
+	ThresholdValue  float64     `json:"threshold_value"`
+	DurationSec     int         `json:"duration_sec"`
+	QuorumMinProbes int         `json:"quorum_min_probes"`
+	CooldownSec     int         `json:"cooldown_sec"`
+	ChannelIDs      []uuid.UUID `json:"channel_ids"`
+	Enabled         bool        `json:"enabled"`
+	CreatedAt       time.Time   `json:"created_at"`
 }
 
 type AlertChannel struct {
@@ -109,6 +110,7 @@ type Incident struct {
 	TargetID       *uuid.UUID `json:"target_id"`
 	TargetName     string     `json:"target_name"`
 	Status         string     `json:"status"`
+	Severity       string     `json:"severity"`
 	AffectedProbes []string   `json:"affected_probes"`
 	PeakValue      float64    `json:"peak_value"`
 	StartedAt      time.Time  `json:"started_at"`

@@ -528,6 +528,28 @@ paths:
               schema:
                 $ref: '#/components/schemas/AlertChannel'
   /api/alerts/channels/{id}:
+    put:
+      operationId: updateAlertChannel
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertChannelUpdateInput'
+      responses:
+        '200':
+          description: Updated channel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertChannel'
     delete:
       operationId: deleteAlertChannel
       parameters:
@@ -854,7 +876,7 @@ components:
           items: { $ref: '#/components/schemas/MTRHop' }
     AlertRule:
       type: object
-      required: [id, name, metric, threshold_value, duration_sec, quorum_min_probes, cooldown_sec, enabled, created_at]
+      required: [id, name, metric, threshold_value, duration_sec, quorum_min_probes, cooldown_sec, channel_ids, enabled, created_at]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
@@ -865,6 +887,9 @@ components:
         duration_sec: { type: integer }
         quorum_min_probes: { type: integer }
         cooldown_sec: { type: integer }
+        channel_ids:
+          type: array
+          items: { type: string, format: uuid }
         enabled: { type: boolean }
         created_at: { type: string, format: date-time }
     AlertRuleInput:
@@ -879,6 +904,9 @@ components:
         duration_sec: { type: integer }
         quorum_min_probes: { type: integer }
         cooldown_sec: { type: integer }
+        channel_ids:
+          type: array
+          items: { type: string, format: uuid }
         enabled: { type: boolean }
     AlertChannel:
       type: object
@@ -901,9 +929,18 @@ components:
         thread_id: { type: integer, format: int64, nullable: true }
         webhook_url: { type: string }
         enabled: { type: boolean }
+    AlertChannelUpdateInput:
+      type: object
+      properties:
+        name: { type: string }
+        bot_token: { type: string }
+        chat_id: { type: string }
+        thread_id: { type: integer, format: int64, nullable: true }
+        webhook_url: { type: string }
+        enabled: { type: boolean }
     Incident:
       type: object
-      required: [id, rule_id, rule_name, status, affected_probes, peak_value, started_at, summary]
+      required: [id, rule_id, rule_name, status, severity, affected_probes, peak_value, started_at, summary]
       properties:
         id: { type: string, format: uuid }
         rule_id: { type: string, format: uuid }
@@ -911,6 +948,7 @@ components:
         target_id: { type: string, format: uuid, nullable: true }
         target_name: { type: string }
         status: { type: string, enum: [open, resolved] }
+        severity: { type: string, enum: [warn, critical] }
         affected_probes:
           type: array
           items: { type: string }

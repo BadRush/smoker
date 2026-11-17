@@ -3,7 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import AlertsPage from "./page";
-import type { AlertChannel, AlertRule, Incident, Probe, Target } from "@/lib/api";
+import type {
+  AlertChannel,
+  AlertRule,
+  Incident,
+  Probe,
+  Target,
+  TargetGroup,
+} from "@/lib/api";
 
 const mockRouter = { replace: vi.fn(), push: vi.fn() };
 
@@ -41,10 +48,21 @@ const PROBES: Probe[] = [
   },
 ];
 
+const GROUPS: TargetGroup[] = [
+  {
+    id: "g-core",
+    name: "Core Links",
+    parent_id: null,
+    description: "",
+    sort_order: 1,
+    created_at: "",
+  },
+];
+
 const TARGETS: Target[] = [
   {
     id: "t-single",
-    group_id: null,
+    group_id: "g-core",
     name: "Single-Probe Target",
     host: "10.10.10.1",
     probe_type: "icmp",
@@ -74,38 +92,50 @@ const RULES: AlertRule[] = [
     threshold_value: 20,
     duration_sec: 30,
     quorum_min_probes: 2,
-    cooldown_sec: 300,
+    cooldown_sec: 0,
+    channel_ids: [],
     enabled: true,
     created_at: "",
   },
 ];
 
-describe("AlertsPage quorum awareness for per-probe targets", () => {
-  let postBodies: Array<{ url: string; body: unknown }> = [];
+const CHANNELS: AlertChannel[] = [
+  {
+    id: "ch-existing",
+    type: "telegram",
+    name: "NOC Forum",
+    config_hint: "chat:-100123 · thread:456",
+    enabled: true,
+    created_at: "2026-11-16T00:00:00Z",
+  },
+];
+
+describe("AlertsPage quorum, routing, and Telegram channel controls", () => {
+  let requests: Array<{ method: string; url: string; body: unknown }> = [];
 
   beforeEach(() => {
-    postBodies = [];
+    requests = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
-        if (init?.method === "POST") {
-          postBodies.push({
+        const method = init?.method ?? "GET";
+        if (method === "POST" || method === "PUT") {
+          requests.push({
+            method,
             url,
-            body: init.body ? JSON.parse(String(init.body)) : null,
+            body: init?.body ? JSON.parse(String(init.body)) : null,
           });
           if (url === "/api/alerts/channels") {
-            return new Response(
-              JSON.stringify({
-                id: "ch-1",
-                type: "telegram",
-                name: "NOC Forum",
-                config_hint: "chat:-100123 · thread:456",
-                enabled: true,
-                created_at: "2026-11-16T00:00:00Z",
-              }),
-              { status: 201 }
-            );
+            return new Response(JSON.stringify(CHANNELS[0]), { status: 201 });
+          }
+          if (url.startsWith("/api/alerts/channels/")) {
+            return new Response(JSON.stringify(CHANNELS[0]), { status: 200 });
+          }
+          if (url.startsWith("/api/alerts/rules")) {
+            return new Response(JSON.stringify(RULES[0]), {
+              status: method === "POST" ? 201 : 200,
+            });
           }
         }
         if (url === "/api/alerts/incidents") {
@@ -115,10 +145,13 @@ describe("AlertsPage quorum awareness for per-probe targets", () => {
           return new Response(JSON.stringify(RULES), { status: 200 });
         }
         if (url === "/api/alerts/channels") {
-          return new Response(JSON.stringify([] as AlertChannel[]), { status: 200 });
+          return new Response(JSON.stringify(CHANNELS), { status: 200 });
         }
         if (url === "/api/targets") {
           return new Response(JSON.stringify(TARGETS), { status: 200 });
+        }
+        if (url === "/api/groups") {
+          return new Response(JSON.stringify(GROUPS), { status: 200 });
         }
         if (url === "/api/probes") {
           return new Response(JSON.stringify(PROBES), { status: 200 });
@@ -160,7 +193,7 @@ describe("AlertsPage quorum awareness for per-probe targets", () => {
     );
   });
 
-  it("validates and submits optional Telegram thread_id when creating a Telegram channel", async () => {
+  it("validates and submits optional Telegram thread_id and supports editing & toggling channels", async () => {
     const user = userEvent.setup();
     render(<AlertsPage />);
 
@@ -174,16 +207,17 @@ describe("AlertsPage quorum awareness for per-probe targets", () => {
     await user.type(screen.getByLabelText("Telegram thread ID"), "abc");
     await user.click(screen.getByRole("button", { name: "Save Channel" }));
     expect(screen.getByText("Telegram Thread ID must be a positive integer.")).toBeInTheDocument();
-    expect(postBodies).toHaveLength(0);
+    expect(requests).toHaveLength(0);
 
     await user.clear(screen.getByLabelText("Telegram thread ID"));
     await user.type(screen.getByLabelText("Telegram thread ID"), "456");
     await user.click(screen.getByRole("button", { name: "Save Channel" }));
 
     await waitFor(() => {
-      expect(postBodies).toHaveLength(1);
+      expect(requests).toHaveLength(1);
     });
-    expect(postBodies[0]).toEqual({
+    expect(requests[0]).toEqual({
+      method: "POST",
       url: "/api/alerts/channels",
       body: {
         type: "telegram",
@@ -192,6 +226,73 @@ describe("AlertsPage quorum awareness for per-probe targets", () => {
         chat_id: "-100123",
         thread_id: 456,
         webhook_url: "",
+        enabled: true,
+      },
+    });
+
+    // Toggle channel enabled -> PUT /api/alerts/channels/ch-existing
+    await user.click(screen.getByRole("button", { name: "Disable channel NOC Forum" }));
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    expect(requests[1]).toEqual({
+      method: "PUT",
+      url: "/api/alerts/channels/ch-existing",
+      body: { enabled: false },
+    });
+
+    // Edit channel -> pre-fills Chat ID & Thread ID from config_hint without requiring re-typing Bot Token
+    await user.click(screen.getByRole("button", { name: "Edit channel NOC Forum" }));
+    expect((screen.getByLabelText("Telegram chat ID") as HTMLInputElement).value).toBe("-100123");
+    expect((screen.getByLabelText("Telegram thread ID") as HTMLInputElement).value).toBe("456");
+    await user.clear(screen.getByLabelText("Telegram thread ID"));
+    await user.click(screen.getByRole("button", { name: "Update Channel" }));
+    await waitFor(() => {
+      expect(requests).toHaveLength(3);
+    });
+    expect(requests[2]).toEqual({
+      method: "PUT",
+      url: "/api/alerts/channels/ch-existing",
+      body: {
+        name: "NOC Forum",
+        chat_id: "-100123",
+        thread_id: null,
+        enabled: true,
+      },
+    });
+  });
+
+  it("creates Global and Group rules with state-change cooldown (0) default and channel routing", async () => {
+    const user = userEvent.setup();
+    render(<AlertsPage />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Rule scope")).toBeInTheDocument();
+    });
+
+    expect((screen.getByLabelText("Repeat reminder") as HTMLSelectElement).value).toBe("0");
+
+    await user.type(screen.getByLabelText("Rule name"), "Global Down Alert");
+    await user.selectOptions(screen.getByLabelText("Rule scope"), "global");
+    await user.click(screen.getByLabelText("Route to channel NOC Forum"));
+    await user.click(screen.getByRole("button", { name: "Add Rule" }));
+
+    await waitFor(() => {
+      expect(requests).toHaveLength(1);
+    });
+    expect(requests[0]).toEqual({
+      method: "POST",
+      url: "/api/alerts/rules",
+      body: {
+        name: "Global Down Alert",
+        target_id: null,
+        group_id: null,
+        metric: "loss_pct",
+        threshold_value: 20,
+        duration_sec: 30,
+        quorum_min_probes: 2,
+        cooldown_sec: 0,
+        channel_ids: ["ch-existing"],
         enabled: true,
       },
     });

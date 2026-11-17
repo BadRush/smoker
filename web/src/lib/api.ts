@@ -18,6 +18,7 @@ export type AlertRule = components["schemas"]["AlertRule"];
 export type AlertRuleInput = components["schemas"]["AlertRuleInput"];
 export type AlertChannel = components["schemas"]["AlertChannel"];
 export type AlertChannelInput = components["schemas"]["AlertChannelInput"];
+export type AlertChannelUpdateInput = components["schemas"]["AlertChannelUpdateInput"];
 export type Incident = components["schemas"]["Incident"];
 export type SystemSettings = components["schemas"]["SystemSettings"];
 export type SessionInfo = components["schemas"]["SessionInfo"];

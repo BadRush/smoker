@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +17,17 @@ import (
 	"smoker/internal/protocol"
 )
 
+// AlertStore abstracts persistence operations needed by Evaluator.
+type AlertStore interface {
+	ListAlertRules(ctx context.Context) ([]db.AlertRule, error)
+	ListProbes(ctx context.Context) ([]db.Probe, error)
+	ListTargets(ctx context.Context) ([]db.Target, error)
+	ListAlertChannels(ctx context.Context) ([]db.AlertChannel, error)
+	UpsertOpenIncident(ctx context.Context, ruleID uuid.UUID, targetID *uuid.UUID, affectedProbes []string, peak float64, severity string, now time.Time, summary string) (db.Incident, bool, bool, error)
+	ResolveOpenIncident(ctx context.Context, ruleID uuid.UUID, targetID *uuid.UUID, now time.Time) (*db.Incident, error)
+	MarkIncidentNotified(ctx context.Context, id uuid.UUID, now time.Time) error
+}
+
 // QuorumEvalResult is pure domain output used both in production and deterministic unit tests.
 type QuorumEvalResult struct {
 	BreachingProbes []string
@@ -23,16 +35,43 @@ type QuorumEvalResult struct {
 	QuorumMet       bool
 }
 
+// DetermineSeverity maps rule metric and observed peak value to "critical" or "warn".
+func DetermineSeverity(metric string, peak float64) string {
+	switch metric {
+	case "probe_offline":
+		return "critical"
+	case "loss_pct":
+		if peak >= 50 {
+			return "critical"
+		}
+		return "warn"
+	default:
+		return "warn"
+	}
+}
+
 // EvaluateTargetQuorum evaluates how many probes violate a rule's threshold over the sample window.
 func EvaluateTargetQuorum(
 	rule db.AlertRule,
 	probeStats map[string]ingest.WindowStats,
 ) QuorumEvalResult {
+	return EvaluateTargetQuorumWithMinSamples(rule, probeStats, 1)
+}
+
+// EvaluateTargetQuorumWithMinSamples enforces a minimum collected sample guard per probe before triggering.
+func EvaluateTargetQuorumWithMinSamples(
+	rule db.AlertRule,
+	probeStats map[string]ingest.WindowStats,
+	minSamples int,
+) QuorumEvalResult {
+	if minSamples < 1 {
+		minSamples = 1
+	}
 	var breaching []string
 	var peak float64
 
 	for probeName, st := range probeStats {
-		if st.SampleCount == 0 {
+		if st.SampleCount == 0 || st.SampleCount < minSamples {
 			continue
 		}
 		var val float64
@@ -65,15 +104,16 @@ func EvaluateTargetQuorum(
 }
 
 type Evaluator struct {
-	store    *db.Store
-	cache    *ingest.RollingCache
-	hub      *wshub.Hub
-	notifier *Notifier
-	aesKey   []byte
-	now      func() time.Time
+	store        AlertStore
+	cache        *ingest.RollingCache
+	hub          *wshub.Hub
+	notifier     *Notifier
+	aesKey       []byte
+	now          func() time.Time
+	syncDispatch bool
 }
 
-func NewEvaluator(store *db.Store, cache *ingest.RollingCache, hub *wshub.Hub, notifier *Notifier, aesKey []byte, nowFn func() time.Time) *Evaluator {
+func NewEvaluator(store AlertStore, cache *ingest.RollingCache, hub *wshub.Hub, notifier *Notifier, aesKey []byte, nowFn func() time.Time) *Evaluator {
 	if nowFn == nil {
 		nowFn = func() time.Time { return time.Now().UTC() }
 	}
@@ -85,6 +125,10 @@ func NewEvaluator(store *db.Store, cache *ingest.RollingCache, hub *wshub.Hub, n
 		aesKey:   aesKey,
 		now:      nowFn,
 	}
+}
+
+func (e *Evaluator) SetSyncDispatch(sync bool) {
+	e.syncDispatch = sync
 }
 
 func (e *Evaluator) Run(ctx context.Context) {
@@ -151,68 +195,145 @@ func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
 
 			probeStats := make(map[string]ingest.WindowStats)
 			window := time.Duration(rule.DurationSec) * time.Second
+			assignedCount := 0
+			onlineCount := 0
+			reportingCount := 0
+
 			for _, p := range probes {
-				if p.Status == "offline" {
-					continue
-				}
 				if !target.AssignAllProbes && !assigned[p.ID] {
 					continue
 				}
-				probeStats[p.Name] = e.cache.WindowStats(target.ID, p.ID, window, now)
+				assignedCount++
+				if p.Status == "offline" {
+					continue
+				}
+				onlineCount++
+				st := e.cache.WindowStats(target.ID, p.ID, window, now)
+				if st.SampleCount > 0 {
+					reportingCount++
+				}
+				probeStats[p.Name] = st
 			}
 
-			res := EvaluateTargetQuorum(rule, probeStats)
+			effectiveRule := rule
+			if rule.TargetID == nil && assignedCount > 0 && assignedCount < effectiveRule.QuorumMinProbes {
+				effectiveRule.QuorumMinProbes = assignedCount
+			}
+
+			intervalSec := target.IntervalSec
+			if intervalSec < 1 {
+				intervalSec = 1
+			}
+			expectedSamples := rule.DurationSec / intervalSec
+			minSamples := 3
+			if expectedSamples < minSamples {
+				minSamples = expectedSamples
+				if minSamples < 1 {
+					minSamples = 1
+				}
+			}
+
+			res := EvaluateTargetQuorumWithMinSamples(effectiveRule, probeStats, minSamples)
 			tid := target.ID
 			if res.QuorumMet {
-				summary := fmt.Sprintf("%s >= %.2f across %d probes (%v)", rule.Metric, rule.ThresholdValue, len(res.BreachingProbes), res.BreachingProbes)
-				inc, isNew, err := e.store.UpsertOpenIncident(ctx, rule.ID, &tid, res.BreachingProbes, res.PeakValue, now, summary)
+				severity := DetermineSeverity(rule.Metric, res.PeakValue)
+				tempMsg := AlertMessage{
+					Metric:    rule.Metric,
+					Value:     res.PeakValue,
+					Threshold: rule.ThresholdValue,
+				}
+				summary := fmt.Sprintf("%s · %s", formatPlainCondition(tempMsg), strings.Join(res.BreachingProbes, ", "))
+				inc, isNew, escalated, err := e.store.UpsertOpenIncident(ctx, rule.ID, &tid, res.BreachingProbes, res.PeakValue, severity, now, summary)
 				if err != nil {
 					slog.Warn("upsert incident failed", "err", err)
 					continue
 				}
-				shouldNotify := isNew || inc.LastNotifiedAt == nil || now.Sub(*inc.LastNotifiedAt) >= time.Duration(rule.CooldownSec)*time.Second
+
+				shouldNotify := isNew || escalated
+				if !shouldNotify && rule.CooldownSec > 0 {
+					shouldNotify = inc.LastNotifiedAt == nil || now.Sub(*inc.LastNotifiedAt) >= time.Duration(rule.CooldownSec)*time.Second
+				}
 				if shouldNotify {
 					_ = e.store.MarkIncidentNotified(ctx, inc.ID, now)
-					e.dispatchAsync(AlertMessage{
-						Status:         "FIRING",
+					msgStatus := "FIRING"
+					if escalated {
+						msgStatus = "ESCALATED"
+					}
+					var elapsedSec int64
+					if !isNew {
+						elapsedSec = int64(now.Sub(inc.StartedAt).Seconds())
+						if elapsedSec < 0 {
+							elapsedSec = 0
+						}
+					}
+					e.dispatch(ctx, AlertMessage{
+						Status:         msgStatus,
+						Severity:       inc.Severity,
 						RuleName:       rule.Name,
 						TargetName:     target.Name,
+						TargetHost:     target.Host,
 						Metric:         rule.Metric,
 						Value:          res.PeakValue,
+						PeakValue:      inc.PeakValue,
 						Threshold:      rule.ThresholdValue,
 						QuorumCount:    len(res.BreachingProbes),
-						QuorumRequired: rule.QuorumMinProbes,
+						QuorumRequired: effectiveRule.QuorumMinProbes,
+						TotalProbes:    onlineCount,
 						AffectedProbes: res.BreachingProbes,
 						Summary:        summary,
+						StartedAt:      inc.StartedAt.Format(time.RFC3339),
+						DurationSec:    elapsedSec,
 						Timestamp:      now.Format(time.RFC3339),
+						ChannelIDs:     rule.ChannelIDs,
 					})
-					e.hub.BroadcastUI("matrix", protocol.LiveEvent{
-						Type:    "incident_update",
-						Channel: "matrix",
-						Data:    inc,
-					})
+					if e.hub != nil {
+						e.hub.BroadcastUI("matrix", protocol.LiveEvent{
+							Type:    "incident_update",
+							Channel: "matrix",
+							Data:    inc,
+						})
+					}
 				}
 			} else {
+				// Do not falsely mark an open incident as restored when all assigned probes are offline
+				// or none have reported samples yet (e.g., immediately after Central startup).
+				if onlineCount == 0 || reportingCount == 0 {
+					continue
+				}
 				resolved, err := e.store.ResolveOpenIncident(ctx, rule.ID, &tid, now)
 				if err == nil && resolved != nil {
-					e.dispatchAsync(AlertMessage{
+					durSec := int64(now.Sub(resolved.StartedAt).Seconds())
+					if durSec < 0 {
+						durSec = 0
+					}
+					e.dispatch(ctx, AlertMessage{
 						Status:         "RESOLVED",
+						Severity:       "ok",
 						RuleName:       rule.Name,
 						TargetName:     target.Name,
+						TargetHost:     target.Host,
 						Metric:         rule.Metric,
-						Value:          0,
+						Value:          resolved.PeakValue,
+						PeakValue:      resolved.PeakValue,
 						Threshold:      rule.ThresholdValue,
-						QuorumCount:    0,
-						QuorumRequired: rule.QuorumMinProbes,
+						QuorumCount:    len(resolved.AffectedProbes),
+						QuorumRequired: effectiveRule.QuorumMinProbes,
+						TotalProbes:    onlineCount,
 						AffectedProbes: resolved.AffectedProbes,
-						Summary:        fmt.Sprintf("Recovered below threshold %.2f", rule.ThresholdValue),
+						Summary:        fmt.Sprintf("Connection restored after %s", FormatDurationSLA(durSec)),
+						StartedAt:      resolved.StartedAt.Format(time.RFC3339),
+						ResolvedAt:     now.Format(time.RFC3339),
+						DurationSec:    durSec,
 						Timestamp:      now.Format(time.RFC3339),
+						ChannelIDs:     rule.ChannelIDs,
 					})
-					e.hub.BroadcastUI("matrix", protocol.LiveEvent{
-						Type:    "incident_update",
-						Channel: "matrix",
-						Data:    resolved,
-					})
+					if e.hub != nil {
+						e.hub.BroadcastUI("matrix", protocol.LiveEvent{
+							Type:    "incident_update",
+							Channel: "matrix",
+							Data:    resolved,
+						})
+					}
 				}
 			}
 		}
@@ -244,78 +365,127 @@ func (e *Evaluator) evalProbeOffline(ctx context.Context, rule db.AlertRule, pro
 	sort.Strings(offlineNames)
 
 	if len(offlineNames) >= rule.QuorumMinProbes {
-		summary := fmt.Sprintf("%d probe(s) offline >= %ds: %v", len(offlineNames), rule.DurationSec, offlineNames)
-		inc, isNew, err := e.store.UpsertOpenIncident(ctx, rule.ID, nil, offlineNames, maxOfflineSec, now, summary)
+		summary := fmt.Sprintf("Monitoring Probe Offline (offline %s) · %s", formatDurationCompact(int64(maxOfflineSec)), strings.Join(offlineNames, ", "))
+		inc, isNew, escalated, err := e.store.UpsertOpenIncident(ctx, rule.ID, nil, offlineNames, maxOfflineSec, "critical", now, summary)
 		if err != nil {
 			return
 		}
-		if isNew || inc.LastNotifiedAt == nil || now.Sub(*inc.LastNotifiedAt) >= time.Duration(rule.CooldownSec)*time.Second {
+		shouldNotify := isNew || escalated
+		if !shouldNotify && rule.CooldownSec > 0 {
+			shouldNotify = inc.LastNotifiedAt == nil || now.Sub(*inc.LastNotifiedAt) >= time.Duration(rule.CooldownSec)*time.Second
+		}
+		if shouldNotify {
 			_ = e.store.MarkIncidentNotified(ctx, inc.ID, now)
-			e.dispatchAsync(AlertMessage{
+			var elapsedSec int64
+			if !isNew {
+				elapsedSec = int64(now.Sub(inc.StartedAt).Seconds())
+				if elapsedSec < 0 {
+					elapsedSec = 0
+				}
+			}
+			e.dispatch(ctx, AlertMessage{
 				Status:         "FIRING",
+				Severity:       "critical",
 				RuleName:       rule.Name,
-				TargetName:     "Fleet Probes",
+				TargetName:     "Monitoring Probes",
 				Metric:         "probe_offline",
 				Value:          maxOfflineSec,
+				PeakValue:      inc.PeakValue,
 				Threshold:      float64(rule.DurationSec),
 				QuorumCount:    len(offlineNames),
 				QuorumRequired: rule.QuorumMinProbes,
+				TotalProbes:    len(probes),
 				AffectedProbes: offlineNames,
 				Summary:        summary,
+				StartedAt:      inc.StartedAt.Format(time.RFC3339),
+				DurationSec:    elapsedSec,
 				Timestamp:      now.Format(time.RFC3339),
+				ChannelIDs:     rule.ChannelIDs,
 			})
 		}
 	} else {
 		resolved, err := e.store.ResolveOpenIncident(ctx, rule.ID, nil, now)
 		if err == nil && resolved != nil {
-			e.dispatchAsync(AlertMessage{
+			durSec := int64(now.Sub(resolved.StartedAt).Seconds())
+			if durSec < 0 {
+				durSec = 0
+			}
+			e.dispatch(ctx, AlertMessage{
 				Status:         "RESOLVED",
+				Severity:       "ok",
 				RuleName:       rule.Name,
-				TargetName:     "Fleet Probes",
+				TargetName:     "Monitoring Probes",
 				Metric:         "probe_offline",
-				QuorumCount:    len(offlineNames),
+				Value:          resolved.PeakValue,
+				PeakValue:      resolved.PeakValue,
+				Threshold:      float64(rule.DurationSec),
+				QuorumCount:    len(resolved.AffectedProbes),
 				QuorumRequired: rule.QuorumMinProbes,
+				TotalProbes:    len(probes),
 				AffectedProbes: resolved.AffectedProbes,
-				Summary:        "Probes back online",
+				Summary:        fmt.Sprintf("Probes back online after %s", FormatDurationSLA(durSec)),
+				StartedAt:      resolved.StartedAt.Format(time.RFC3339),
+				ResolvedAt:     now.Format(time.RFC3339),
+				DurationSec:    durSec,
 				Timestamp:      now.Format(time.RFC3339),
+				ChannelIDs:     rule.ChannelIDs,
 			})
 		}
 	}
 }
 
-func (e *Evaluator) dispatchAsync(msg AlertMessage) {
+func (e *Evaluator) dispatch(ctx context.Context, msg AlertMessage) {
+	if e.syncDispatch {
+		e.sendToMatchingChannels(ctx, msg)
+		return
+	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		dCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
-
-		channels, err := e.store.ListAlertChannels(ctx)
-		if err != nil {
-			slog.Warn("list alert channels failed", "err", err)
-			return
-		}
-		for _, ch := range channels {
-			if !ch.Enabled {
-				continue
-			}
-			plain, err := auth.DecryptAESGCM(e.aesKey, ch.ConfigEncrypted)
-			if err != nil {
-				slog.Warn("decrypt channel config failed", "channel_id", ch.ID, "err", err)
-				continue
-			}
-			var sec ChannelSecret
-			if err := json.Unmarshal(plain, &sec); err != nil {
-				continue
-			}
-			switch ch.Type {
-			case "telegram":
-				if err := e.notifier.SendTelegram(ctx, sec.BotToken, sec.ChatID, sec.ThreadID, msg); err != nil {
-					slog.Warn("send telegram alert failed", "channel_id", ch.ID, "err", err)
-				}
-			case "webhook":
-				if err := e.notifier.SendWebhook(ctx, sec.WebhookURL, msg); err != nil {
-					slog.Warn("send webhook alert failed", "channel_id", ch.ID, "err", err)
-				}
-			}
-		}
+		e.sendToMatchingChannels(dCtx, msg)
 	}()
+}
+
+func (e *Evaluator) sendToMatchingChannels(ctx context.Context, msg AlertMessage) {
+	channels, err := e.store.ListAlertChannels(ctx)
+	if err != nil {
+		slog.Warn("list alert channels failed", "err", err)
+		return
+	}
+
+	var allowed map[uuid.UUID]bool
+	if len(msg.ChannelIDs) > 0 {
+		allowed = make(map[uuid.UUID]bool, len(msg.ChannelIDs))
+		for _, id := range msg.ChannelIDs {
+			allowed[id] = true
+		}
+	}
+
+	for _, ch := range channels {
+		if !ch.Enabled {
+			continue
+		}
+		if allowed != nil && !allowed[ch.ID] {
+			continue
+		}
+		plain, err := auth.DecryptAESGCM(e.aesKey, ch.ConfigEncrypted)
+		if err != nil {
+			slog.Warn("decrypt channel config failed", "channel_id", ch.ID, "err", err)
+			continue
+		}
+		var sec ChannelSecret
+		if err := json.Unmarshal(plain, &sec); err != nil {
+			continue
+		}
+		switch ch.Type {
+		case "telegram":
+			if err := e.notifier.SendTelegram(ctx, sec.BotToken, sec.ChatID, sec.ThreadID, msg); err != nil {
+				slog.Warn("send telegram alert failed", "channel_id", ch.ID, "err", err)
+			}
+		case "webhook":
+			if err := e.notifier.SendWebhook(ctx, sec.WebhookURL, msg); err != nil {
+				slog.Warn("send webhook alert failed", "channel_id", ch.ID, "err", err)
+			}
+		}
+	}
 }

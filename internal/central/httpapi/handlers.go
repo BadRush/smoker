@@ -903,15 +903,16 @@ func (s *Server) handleSimulateTarget(w http.ResponseWriter, r *http.Request) {
 // --- Alerts ---
 
 type alertRuleReq struct {
-	Name            string     `json:"name"`
-	TargetID        *uuid.UUID `json:"target_id"`
-	GroupID         *uuid.UUID `json:"group_id"`
-	Metric          string     `json:"metric"`
-	ThresholdValue  float64    `json:"threshold_value"`
-	DurationSec     int        `json:"duration_sec"`
-	QuorumMinProbes int        `json:"quorum_min_probes"`
-	CooldownSec     int        `json:"cooldown_sec"`
-	Enabled         *bool      `json:"enabled"`
+	Name            string      `json:"name"`
+	TargetID        *uuid.UUID  `json:"target_id"`
+	GroupID         *uuid.UUID  `json:"group_id"`
+	Metric          string      `json:"metric"`
+	ThresholdValue  float64     `json:"threshold_value"`
+	DurationSec     int         `json:"duration_sec"`
+	QuorumMinProbes int         `json:"quorum_min_probes"`
+	CooldownSec     int         `json:"cooldown_sec"`
+	ChannelIDs      []uuid.UUID `json:"channel_ids"`
+	Enabled         *bool       `json:"enabled"`
 }
 
 func validateAlertRuleReq(req alertRuleReq) (db.AlertRuleInput, string) {
@@ -924,8 +925,13 @@ func validateAlertRuleReq(req alertRuleReq) (db.AlertRuleInput, string) {
 	default:
 		return db.AlertRuleInput{}, "metric must be latency_p95, loss_pct, jitter, probe_offline, or baseline_spike_pct"
 	}
-	if req.Metric != "probe_offline" && req.TargetID == nil && req.GroupID == nil {
-		return db.AlertRuleInput{}, "target_id or group_id is required"
+	targetID := req.TargetID
+	groupID := req.GroupID
+	if req.Metric == "probe_offline" {
+		targetID = nil
+		groupID = nil
+	} else if targetID != nil && groupID != nil {
+		return db.AlertRuleInput{}, "target_id and group_id cannot both be specified"
 	}
 	if req.ThresholdValue < 0 {
 		return db.AlertRuleInput{}, "threshold_value must be >= 0"
@@ -936,8 +942,8 @@ func validateAlertRuleReq(req alertRuleReq) (db.AlertRuleInput, string) {
 	if req.QuorumMinProbes < 1 {
 		return db.AlertRuleInput{}, "quorum_min_probes must be >= 1"
 	}
-	if req.CooldownSec < 10 || req.CooldownSec > 86400 {
-		return db.AlertRuleInput{}, "cooldown_sec must be between 10 and 86400"
+	if req.CooldownSec != 0 && (req.CooldownSec < 10 || req.CooldownSec > 86400) {
+		return db.AlertRuleInput{}, "cooldown_sec must be 0 (off) or between 10 and 86400"
 	}
 	enabled := true
 	if req.Enabled != nil {
@@ -945,13 +951,14 @@ func validateAlertRuleReq(req alertRuleReq) (db.AlertRuleInput, string) {
 	}
 	return db.AlertRuleInput{
 		Name:            name,
-		TargetID:        req.TargetID,
-		GroupID:         req.GroupID,
+		TargetID:        targetID,
+		GroupID:         groupID,
 		Metric:          req.Metric,
 		ThresholdValue:  req.ThresholdValue,
 		DurationSec:     req.DurationSec,
 		QuorumMinProbes: req.QuorumMinProbes,
 		CooldownSec:     req.CooldownSec,
+		ChannelIDs:      req.ChannelIDs,
 		Enabled:         enabled,
 	}, ""
 }
@@ -1055,16 +1062,67 @@ func parseOptionalThreadID(raw json.RawMessage) (int64, error) {
 	return 0, errors.New("thread_id must be a positive integer")
 }
 
-func (s *Server) handleCreateAlertChannel(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Type       string          `json:"type"`
-		Name       string          `json:"name"`
-		BotToken   string          `json:"bot_token"`
-		ChatID     string          `json:"chat_id"`
-		ThreadID   json.RawMessage `json:"thread_id"`
-		WebhookURL string          `json:"webhook_url"`
-		Enabled    *bool           `json:"enabled"`
+type alertChannelReq struct {
+	Type       string          `json:"type"`
+	Name       string          `json:"name"`
+	BotToken   string          `json:"bot_token"`
+	ChatID     string          `json:"chat_id"`
+	ThreadID   json.RawMessage `json:"thread_id"`
+	WebhookURL string          `json:"webhook_url"`
+	Enabled    *bool           `json:"enabled"`
+}
+
+func buildAlertChannelSecret(chType string, req alertChannelReq, existing *alerts.ChannelSecret) (alerts.ChannelSecret, string, string) {
+	var sec alerts.ChannelSecret
+	if existing != nil {
+		sec = *existing
 	}
+	switch chType {
+	case "telegram":
+		botToken := strings.TrimSpace(req.BotToken)
+		if botToken != "" {
+			sec.BotToken = botToken
+		}
+		chatID := strings.TrimSpace(req.ChatID)
+		if chatID != "" {
+			sec.ChatID = chatID
+		}
+		if sec.BotToken == "" || sec.ChatID == "" {
+			return alerts.ChannelSecret{}, "", "bot_token and chat_id are required for Telegram"
+		}
+		if len(req.ThreadID) > 0 {
+			threadID, err := parseOptionalThreadID(req.ThreadID)
+			if err != nil {
+				return alerts.ChannelSecret{}, "", err.Error()
+			}
+			sec.ThreadID = threadID
+		}
+		hint := "chat:" + sec.ChatID
+		if sec.ThreadID > 0 {
+			hint += " · thread:" + strconv.FormatInt(sec.ThreadID, 10)
+		}
+		return sec, hint, ""
+	case "webhook":
+		webhookURL := strings.TrimSpace(req.WebhookURL)
+		if webhookURL != "" {
+			sec.WebhookURL = webhookURL
+		}
+		u, err := url.Parse(sec.WebhookURL)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return alerts.ChannelSecret{}, "", "Valid http(s) webhook_url is required"
+		}
+		tail := u.Path
+		if len(tail) > 6 {
+			tail = "..." + tail[len(tail)-6:]
+		}
+		return sec, u.Scheme + "://" + u.Host + tail, ""
+	default:
+		return alerts.ChannelSecret{}, "", "type must be telegram or webhook"
+	}
+}
+
+func (s *Server) handleCreateAlertChannel(w http.ResponseWriter, r *http.Request) {
+	var req alertChannelReq
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeProblem(w, r, http.StatusBadRequest, "bad_json", "Invalid channel payload")
 		return
@@ -1076,43 +1134,9 @@ func (s *Server) handleCreateAlertChannel(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	var sec alerts.ChannelSecret
-	var hint string
-	switch req.Type {
-	case "telegram":
-		req.BotToken = strings.TrimSpace(req.BotToken)
-		req.ChatID = strings.TrimSpace(req.ChatID)
-		if req.BotToken == "" || req.ChatID == "" {
-			writeProblem(w, r, http.StatusBadRequest, "validation_error", "bot_token and chat_id are required for Telegram")
-			return
-		}
-		threadID, err := parseOptionalThreadID(req.ThreadID)
-		if err != nil {
-			writeProblem(w, r, http.StatusBadRequest, "validation_error", err.Error())
-			return
-		}
-		sec.BotToken = req.BotToken
-		sec.ChatID = req.ChatID
-		sec.ThreadID = threadID
-		hint = "chat:" + req.ChatID
-		if threadID > 0 {
-			hint += " · thread:" + strconv.FormatInt(threadID, 10)
-		}
-	case "webhook":
-		req.WebhookURL = strings.TrimSpace(req.WebhookURL)
-		u, err := url.Parse(req.WebhookURL)
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-			writeProblem(w, r, http.StatusBadRequest, "validation_error", "Valid http(s) webhook_url is required")
-			return
-		}
-		sec.WebhookURL = req.WebhookURL
-		tail := u.Path
-		if len(tail) > 6 {
-			tail = "..." + tail[len(tail)-6:]
-		}
-		hint = u.Scheme + "://" + u.Host + tail
-	default:
-		writeProblem(w, r, http.StatusBadRequest, "validation_error", "type must be telegram or webhook")
+	sec, hint, errMsg := buildAlertChannelSecret(req.Type, req, nil)
+	if errMsg != "" {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", errMsg)
 		return
 	}
 
@@ -1137,6 +1161,68 @@ func (s *Server) handleCreateAlertChannel(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusCreated, ch)
+}
+
+func (s *Server) handleUpdateAlertChannel(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseUUIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	existingCh, err := s.store.GetAlertChannel(r.Context(), id)
+	if err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	plainOld, err := auth.DecryptAESGCM(s.aesKey, existingCh.ConfigEncrypted)
+	if err != nil {
+		writeProblem(w, r, http.StatusInternalServerError, "decrypt_error", "Failed to decrypt existing channel credentials")
+		return
+	}
+	var oldSec alerts.ChannelSecret
+	if err := json.Unmarshal(plainOld, &oldSec); err != nil {
+		writeProblem(w, r, http.StatusInternalServerError, "decode_error", "Corrupt channel configuration")
+		return
+	}
+
+	var req alertChannelReq
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "bad_json", "Invalid channel payload")
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = existingCh.Name
+	}
+	if len(name) > 80 {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", "Channel name must be 1..80 characters")
+		return
+	}
+	sec, hint, errMsg := buildAlertChannelSecret(existingCh.Type, req, &oldSec)
+	if errMsg != "" {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", errMsg)
+		return
+	}
+	plainNew, err := json.Marshal(sec)
+	if err != nil {
+		writeProblem(w, r, http.StatusInternalServerError, "encode_error", "Failed to encode channel secret")
+		return
+	}
+	encNew, err := auth.EncryptAESGCM(s.aesKey, plainNew)
+	if err != nil {
+		writeProblem(w, r, http.StatusInternalServerError, "encrypt_error", "Failed to encrypt channel secret")
+		return
+	}
+	enabled := existingCh.Enabled
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	updated, err := s.store.UpdateAlertChannel(r.Context(), id, name, encNew, hint, enabled)
+	if err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func (s *Server) handleDeleteAlertChannel(w http.ResponseWriter, r *http.Request) {
@@ -1174,13 +1260,14 @@ func (s *Server) handleTestAlertChannel(w http.ResponseWriter, r *http.Request) 
 
 	msg := alerts.AlertMessage{
 		Status:         "TEST",
-		RuleName:       "Smoker Channel Verification",
-		TargetName:     "Test Notification",
+		Severity:       "test",
+		RuleName:       "Channel Verification",
+		TargetName:     ch.Name,
 		Metric:         "latency_p95",
 		QuorumCount:    1,
 		QuorumRequired: 1,
 		AffectedProbes: []string{"Local Central Probe"},
-		Summary:        "Notification pipeline verified successfully from Smoker NOC.",
+		Summary:        "Notification connection verified",
 		Timestamp:      time.Now().UTC().Format(time.RFC3339),
 	}
 

@@ -5,11 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type ChannelSecret struct {
@@ -27,7 +32,7 @@ type Notifier struct {
 func NewNotifier() *Notifier {
 	return &Notifier{
 		client: &http.Client{
-			Timeout: 6 * time.Second,
+			Timeout: 8 * time.Second,
 		},
 		telegramBaseURL: "https://api.telegram.org",
 	}
@@ -41,17 +46,25 @@ func NewNotifierWithHTTP(client *http.Client, telegramBaseURL string) *Notifier 
 }
 
 type AlertMessage struct {
-	Status         string   `json:"status"` // FIRING | RESOLVED | TEST
-	RuleName       string   `json:"rule_name"`
-	TargetName     string   `json:"target_name"`
-	Metric         string   `json:"metric"`
-	Value          float64  `json:"value"`
-	Threshold      float64  `json:"threshold"`
-	QuorumCount    int      `json:"quorum_count"`
-	QuorumRequired int      `json:"quorum_required"`
-	AffectedProbes []string `json:"affected_probes"`
-	Summary        string   `json:"summary"`
-	Timestamp      string   `json:"timestamp"`
+	Status         string      `json:"status"`   // FIRING | ESCALATED | RESOLVED | TEST
+	Severity       string      `json:"severity"` // critical | warn | ok | test
+	RuleName       string      `json:"rule_name"`
+	TargetName     string      `json:"target_name"`
+	TargetHost     string      `json:"target_host,omitempty"`
+	Metric         string      `json:"metric"`
+	Value          float64     `json:"value"`
+	PeakValue      float64     `json:"peak_value,omitempty"`
+	Threshold      float64     `json:"threshold"`
+	QuorumCount    int         `json:"quorum_count"`
+	QuorumRequired int         `json:"quorum_required"`
+	TotalProbes    int         `json:"total_probes,omitempty"`
+	AffectedProbes []string    `json:"affected_probes"`
+	Summary        string      `json:"summary"`
+	StartedAt      string      `json:"started_at,omitempty"`
+	ResolvedAt     string      `json:"resolved_at,omitempty"`
+	DurationSec    int64       `json:"duration_sec,omitempty"`
+	Timestamp      string      `json:"timestamp"`
+	ChannelIDs     []uuid.UUID `json:"channel_ids,omitempty"`
 }
 
 func (n *Notifier) SendTelegram(ctx context.Context, botToken, chatID string, threadID int64, msg AlertMessage) error {
@@ -59,29 +72,12 @@ func (n *Notifier) SendTelegram(ctx context.Context, botToken, chatID string, th
 		return fmt.Errorf("telegram bot_token and chat_id required")
 	}
 
-	emoji := "🔴"
-	if msg.Status == "RESOLVED" {
-		emoji = "🟢"
-	} else if msg.Status == "TEST" {
-		emoji = "🧪"
-	}
-
-	text := fmt.Sprintf(
-		"%s *Smoker Alert [%s]*\n*Rule:* %s\n*Target:* %s\n*Quorum:* %d/%d probes\n*Detail:* %s\n*Time:* %s",
-		emoji,
-		escapeMarkdown(msg.Status),
-		escapeMarkdown(msg.RuleName),
-		escapeMarkdown(msg.TargetName),
-		msg.QuorumCount,
-		msg.QuorumRequired,
-		escapeMarkdown(msg.Summary),
-		escapeMarkdown(msg.Timestamp),
-	)
-
+	text := FormatTelegramHTML(msg)
 	payload := map[string]any{
-		"chat_id":    chatID,
-		"text":       text,
-		"parse_mode": "Markdown",
+		"chat_id":                  chatID,
+		"text":                     text,
+		"parse_mode":               "HTML",
+		"disable_web_page_preview": true,
 	}
 	if threadID > 0 {
 		payload["message_thread_id"] = threadID
@@ -92,23 +88,320 @@ func (n *Notifier) SendTelegram(ctx context.Context, botToken, chatID string, th
 	}
 
 	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", n.telegramBaseURL, url.PathEscape(botToken))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := n.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
 
-	if resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		resp, err := n.client.Do(req)
+		if err != nil {
+			return err
+		}
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		_ = resp.Body.Close()
+
+		if resp.StatusCode < 300 {
+			return nil
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests && attempt == 0 {
+			wait := parseTelegramRetryAfter(resp.Header.Get("Retry-After"), respBody)
+			if wait <= 0 {
+				wait = time.Second
+			}
+			if wait > 5*time.Second {
+				wait = 5 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+				continue
+			}
+		}
+
 		return fmt.Errorf("telegram status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	return nil
+}
+
+func parseTelegramRetryAfter(headerVal string, body []byte) time.Duration {
+	if secs, err := strconv.Atoi(strings.TrimSpace(headerVal)); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	var tgErr struct {
+		Parameters struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	if err := json.Unmarshal(body, &tgErr); err == nil && tgErr.Parameters.RetryAfter > 0 {
+		return time.Duration(tgErr.Parameters.RetryAfter) * time.Second
+	}
+	return 0
+}
+
+// FormatTelegramHTML formats alerts using plain non-jargon English, HTML-safe escaping,
+// SLA start/end/duration fields, and strictly only the ❌, ⚠️, and ✅ icons.
+func FormatTelegramHTML(msg AlertMessage) string {
+	esc := html.EscapeString
+	sev := resolveEffectiveSeverity(msg)
+
+	if msg.Status == "TEST" || sev == "test" {
+		statusText := strings.TrimSpace(msg.Summary)
+		if statusText == "" {
+			statusText = "Notification connection verified"
+		}
+		return strings.Join([]string{
+			"⚠️ <b>[TEST] Notification Check</b>",
+			fmt.Sprintf("<b>Status:</b> %s", esc(statusText)),
+			fmt.Sprintf("<b>Time:</b> %s", esc(formatAlertTimestamp(msg.Timestamp))),
+		}, "\n")
+	}
+
+	targetDisplay := formatTargetDisplay(msg.TargetName, msg.TargetHost)
+	locations := strings.Join(msg.AffectedProbes, ", ")
+	if locations == "" {
+		locations = "All assigned locations"
+	}
+
+	if msg.Status == "RESOLVED" || sev == "ok" {
+		headerTitle := fmt.Sprintf("%s — Connection Restored", targetDisplay)
+		if msg.Metric == "probe_offline" {
+			headerTitle = "Monitoring Probes — Back Online"
+		}
+		lines := []string{
+			fmt.Sprintf("✅ <b>[OK] %s</b>", esc(headerTitle)),
+		}
+		if msg.RuleName != "" {
+			lines = append(lines, fmt.Sprintf("<b>Alert:</b> %s", esc(msg.RuleName)))
+		}
+		lines = append(lines, fmt.Sprintf("<b>Target:</b> %s", esc(targetDisplay)))
+
+		startStr := formatAlertTimestamp(firstNonEmpty(msg.StartedAt, msg.Timestamp))
+		endStr := formatAlertTimestamp(firstNonEmpty(msg.ResolvedAt, msg.Timestamp))
+		lines = append(lines,
+			fmt.Sprintf("<b>Start:</b> %s", esc(startStr)),
+			fmt.Sprintf("<b>End:</b> %s", esc(endStr)),
+		)
+
+		peakVal := msg.PeakValue
+		if peakVal <= 0 {
+			peakVal = msg.Value
+		}
+		durationLine := FormatDurationSLA(msg.DurationSec)
+		if peakText := formatPeakLabel(msg.Metric, peakVal); peakText != "" {
+			durationLine = fmt.Sprintf("%s | Peak: %s", durationLine, peakText)
+		}
+		lines = append(lines, fmt.Sprintf("<b>Duration:</b> %s", esc(durationLine)))
+		lines = append(lines, fmt.Sprintf("<b>Locations:</b> %s", esc(locations)))
+		return strings.Join(lines, "\n")
+	}
+
+	icon := "⚠️"
+	tag := "WARN"
+	if sev == "critical" {
+		icon = "❌"
+		tag = "DOWN"
+	}
+	headerSuffix := ""
+	if msg.Status == "ESCALATED" {
+		headerSuffix = " (Escalated)"
+	}
+
+	lines := []string{
+		fmt.Sprintf("%s <b>[%s] %s%s</b>", icon, tag, esc(targetDisplay), esc(headerSuffix)),
+	}
+	if msg.RuleName != "" {
+		lines = append(lines, fmt.Sprintf("<b>Alert:</b> %s", esc(msg.RuleName)))
+	}
+	lines = append(lines,
+		fmt.Sprintf("<b>Target:</b> %s", esc(targetDisplay)),
+		fmt.Sprintf("<b>Condition:</b> %s", esc(formatPlainCondition(msg))),
+	)
+
+	total := msg.TotalProbes
+	if total < msg.QuorumCount {
+		total = msg.QuorumCount
+	}
+	if msg.QuorumCount > 0 && total > 0 {
+		lines = append(lines, fmt.Sprintf("<b>Detected from:</b> %d of %d locations (%s)", msg.QuorumCount, total, esc(locations)))
+	} else {
+		lines = append(lines, fmt.Sprintf("<b>Detected from:</b> %s", esc(locations)))
+	}
+
+	startTime := firstNonEmpty(msg.StartedAt, msg.Timestamp)
+	lines = append(lines, fmt.Sprintf("<b>Start:</b> %s", esc(formatAlertTimestamp(startTime))))
+
+	if msg.Status == "ESCALATED" || msg.DurationSec > 0 {
+		lines = append(lines,
+			fmt.Sprintf("<b>Elapsed:</b> %s", esc(FormatDurationSLA(msg.DurationSec))),
+			fmt.Sprintf("<b>Updated:</b> %s", esc(formatAlertTimestamp(msg.Timestamp))),
+		)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func resolveEffectiveSeverity(msg AlertMessage) string {
+	switch strings.ToLower(strings.TrimSpace(msg.Severity)) {
+	case "critical":
+		return "critical"
+	case "warn":
+		return "warn"
+	case "ok":
+		return "ok"
+	case "test":
+		return "test"
+	}
+	switch msg.Status {
+	case "RESOLVED":
+		return "ok"
+	case "TEST":
+		return "test"
+	case "ESCALATED":
+		return "critical"
+	default:
+		if msg.Metric == "probe_offline" || (msg.Metric == "loss_pct" && msg.Value >= 50) {
+			return "critical"
+		}
+		return "warn"
+	}
+}
+
+func formatTargetDisplay(name, host string) string {
+	n := strings.TrimSpace(name)
+	h := strings.TrimSpace(host)
+	if n == "" {
+		return h
+	}
+	if h == "" || strings.EqualFold(n, h) {
+		return n
+	}
+	return fmt.Sprintf("%s (%s)", n, h)
+}
+
+func formatPlainCondition(msg AlertMessage) string {
+	switch msg.Metric {
+	case "loss_pct":
+		if msg.Value >= 99.9 {
+			return "Connection Down (100% failed)"
+		}
+		if msg.Value >= 50 {
+			return fmt.Sprintf("Severe Connection Loss (%.1f%% failed, limit %.0f%%)", msg.Value, msg.Threshold)
+		}
+		return fmt.Sprintf("Unstable Connection (%.1f%% packet loss, limit %.0f%%)", msg.Value, msg.Threshold)
+	case "latency_p95":
+		return fmt.Sprintf("Slow Connection (%.0f ms, normal < %.0f ms)", msg.Value, msg.Threshold)
+	case "jitter":
+		return fmt.Sprintf("Unstable Speed (%.0f ms variation, normal < %.0f ms)", msg.Value, msg.Threshold)
+	case "baseline_spike_pct":
+		return fmt.Sprintf("Slower Than Usual (+%.0f%% slower, limit +%.0f%%)", msg.Value, msg.Threshold)
+	case "probe_offline":
+		return fmt.Sprintf("Monitoring Probe Offline (offline %s)", formatDurationCompact(int64(msg.Value)))
+	default:
+		if msg.Summary != "" {
+			return msg.Summary
+		}
+		return "Connection issue detected"
+	}
+}
+
+func formatPeakLabel(metric string, peak float64) string {
+	if peak <= 0 {
+		return ""
+	}
+	switch metric {
+	case "loss_pct":
+		if peak >= 99.9 {
+			return "100% failed"
+		}
+		return fmt.Sprintf("%.1f%% failed", peak)
+	case "latency_p95":
+		return fmt.Sprintf("%.0f ms", peak)
+	case "jitter":
+		return fmt.Sprintf("%.0f ms variation", peak)
+	case "baseline_spike_pct":
+		return fmt.Sprintf("+%.0f%% slower", peak)
+	case "probe_offline":
+		return fmt.Sprintf("offline %s", formatDurationCompact(int64(peak)))
+	default:
+		return ""
+	}
+}
+
+func formatDurationCompact(sec int64) string {
+	if sec < 0 {
+		sec = 0
+	}
+	h := sec / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh %02dm %02ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm %02ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
+}
+
+func FormatDurationSLA(sec int64) string {
+	if sec < 0 {
+		sec = 0
+	}
+	compact := formatDurationCompact(sec)
+	if sec < 60 {
+		return compact
+	}
+	return fmt.Sprintf("%s (%ds)", compact, sec)
+}
+
+func resolveAlertLocation() (*time.Location, string) {
+	tzName := strings.TrimSpace(os.Getenv("ALERT_TIMEZONE"))
+	if tzName == "" {
+		tzName = strings.TrimSpace(os.Getenv("TZ"))
+	}
+	if tzName == "" {
+		tzName = "Asia/Jakarta"
+	}
+	loc, err := time.LoadLocation(tzName)
+	if err != nil {
+		if tzName == "Asia/Jakarta" {
+			return time.FixedZone("WIB", 7*3600), "Asia/Jakarta"
+		}
+		return time.UTC, "UTC"
+	}
+	return loc, tzName
+}
+
+func formatAlertTimestamp(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return raw
+		}
+	}
+	loc, tzName := resolveAlertLocation()
+	localT := t.In(loc)
+	zoneAbbr, _ := localT.Zone()
+	if tzName == "Asia/Jakarta" && (zoneAbbr == "+07" || zoneAbbr == "") {
+		zoneAbbr = "WIB"
+	}
+	return localT.Format("02 Jan 2006 15:04:05") + " " + zoneAbbr
+}
+
+func firstNonEmpty(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
 }
 
 func (n *Notifier) SendWebhook(ctx context.Context, webhookURL string, msg AlertMessage) error {
@@ -116,27 +409,47 @@ func (n *Notifier) SendWebhook(ctx context.Context, webhookURL string, msg Alert
 		return fmt.Errorf("webhook_url required")
 	}
 
-	// Discord-compatible + generic structured JSON payload
-	color := 0xF43F5E // Rose
+	sev := resolveEffectiveSeverity(msg)
+	color := 0xF59E0B // Amber (WARN)
+	tag := "WARN"
+	if sev == "critical" {
+		color = 0xF43F5E // Rose (DOWN)
+		tag = "DOWN"
+	} else if msg.Status == "RESOLVED" || sev == "ok" {
+		color = 0x10B981 // Emerald (OK)
+		tag = "OK"
+	} else if msg.Status == "TEST" || sev == "test" {
+		color = 0x06B6D4 // Cyan (TEST)
+		tag = "TEST"
+	}
+
+	desc := msg.Summary
+	if desc == "" && msg.Status != "RESOLVED" && msg.Status != "TEST" {
+		desc = formatPlainCondition(msg)
+	}
+	fields := []map[string]any{
+		{"name": "Target", "value": formatTargetDisplay(msg.TargetName, msg.TargetHost), "inline": true},
+		{"name": "Detected From", "value": strings.Join(msg.AffectedProbes, ", "), "inline": true},
+	}
+	if msg.StartedAt != "" {
+		fields = append(fields, map[string]any{"name": "Start", "value": formatAlertTimestamp(msg.StartedAt), "inline": true})
+	}
 	if msg.Status == "RESOLVED" {
-		color = 0x10B981 // Emerald
-	} else if msg.Status == "TEST" {
-		color = 0x06B6D4 // Cyan
+		if msg.ResolvedAt != "" {
+			fields = append(fields, map[string]any{"name": "End", "value": formatAlertTimestamp(msg.ResolvedAt), "inline": true})
+		}
+		fields = append(fields, map[string]any{"name": "Duration", "value": FormatDurationSLA(msg.DurationSec), "inline": true})
 	}
 
 	payload := map[string]any{
-		"content": fmt.Sprintf("[%s] %s — %s (%s)", msg.Status, msg.RuleName, msg.TargetName, msg.Summary),
+		"content": fmt.Sprintf("[%s] %s — %s (%s)", tag, msg.RuleName, msg.TargetName, desc),
 		"embeds": []map[string]any{
 			{
-				"title":       fmt.Sprintf("Smoker %s: %s", msg.Status, msg.RuleName),
-				"description": msg.Summary,
+				"title":       fmt.Sprintf("Smoker %s: %s", tag, msg.TargetName),
+				"description": desc,
 				"color":       color,
-				"fields": []map[string]any{
-					{"name": "Target", "value": msg.TargetName, "inline": true},
-					{"name": "Quorum", "value": fmt.Sprintf("%d / %d", msg.QuorumCount, msg.QuorumRequired), "inline": true},
-					{"name": "Affected Probes", "value": strings.Join(msg.AffectedProbes, ", "), "inline": false},
-				},
-				"timestamp": msg.Timestamp,
+				"fields":      fields,
+				"timestamp":   msg.Timestamp,
 			},
 		},
 		"smoker_event": msg,
@@ -164,9 +477,4 @@ func (n *Notifier) SendWebhook(ctx context.Context, webhookURL string, msg Alert
 		return fmt.Errorf("webhook status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	return nil
-}
-
-func escapeMarkdown(s string) string {
-	replacer := strings.NewReplacer("_", "\\_", "*", "\\*", "`", "\\`", "[", "\\[")
-	return replacer.Replace(s)
 }

@@ -366,7 +366,7 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        put?: never;
+        put: operations["updateAlertChannel"];
         post?: never;
         delete: operations["deleteAlertChannel"];
         options?: never;
@@ -638,6 +638,7 @@ export interface components {
             duration_sec: number;
             quorum_min_probes: number;
             cooldown_sec: number;
+            channel_ids: string[];
             enabled: boolean;
             /** Format: date-time */
             created_at: string;
@@ -654,6 +655,7 @@ export interface components {
             duration_sec: number;
             quorum_min_probes: number;
             cooldown_sec: number;
+            channel_ids?: string[];
             enabled?: boolean;
         };
         AlertChannel: {
@@ -678,6 +680,15 @@ export interface components {
             webhook_url?: string;
             enabled?: boolean;
         };
+        AlertChannelUpdateInput: {
+            name?: string;
+            bot_token?: string;
+            chat_id?: string;
+            /** Format: int64 */
+            thread_id?: number | null;
+            webhook_url?: string;
+            enabled?: boolean;
+        };
         Incident: {
             /** Format: uuid */
             id: string;
@@ -689,6 +700,8 @@ export interface components {
             target_name?: string;
             /** @enum {string} */
             status: "open" | "resolved";
+            /** @enum {string} */
+            severity: "warn" | "critical";
             affected_probes: string[];
             peak_value: number;
             /** Format: date-time */
@@ -1445,6 +1458,32 @@ export interface operations {
         responses: {
             /** @description Created channel */
             201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertChannel"];
+                };
+            };
+        };
+    };
+    updateAlertChannel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlertChannelUpdateInput"];
+            };
+        };
+        responses: {
+            /** @description Updated channel */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
