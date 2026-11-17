@@ -1195,7 +1195,7 @@ export default function NocTvWallboardPage() {
             >
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
               <span>
-                <span className="hidden xl:inline">Anomalies </span>(
+                <span className="hidden xl:inline">Alert / Warn </span>(
                 {partitioned.pinnedAlerts.length})
               </span>
             </button>
@@ -1737,11 +1737,11 @@ export default function NocTvWallboardPage() {
               <div className="flex items-center gap-2 font-bold uppercase tracking-wide text-amber-300 min-w-0">
                 <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" aria-hidden="true" />
                 <span className="truncate">
-                  Multi-Probe Highlight &amp; Anomaly Spotlight ({activeSlide.items.length} Hosts · {cfg.range})
+                  Multi-Probe Highlight &amp; Alert / Warn Spotlight ({activeSlide.items.length} Hosts · {cfg.range})
                 </span>
               </div>
               <span className="hidden xl:inline shrink-0 font-mono text-[11px] text-zinc-200">
-                Auto-switches on high latency / loss · Click probe chips to compare paths
+                Highlights loss / down targets · Click probe chips to compare paths
               </span>
             </div>
 
@@ -2499,7 +2499,7 @@ export default function NocTvWallboardPage() {
                     [
                       { id: "off", label: "Off (Default)" },
                       { id: "vip", label: "VIP Only" },
-                      { id: "all", label: "All Anomalies" },
+                      { id: "all", label: "Alert / Warn" },
                     ] as Array<{ id: TvSpotlightMode; label: string }>
                   ).map((sm) => (
                     <button

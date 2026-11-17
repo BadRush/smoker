@@ -222,6 +222,8 @@ func (f *fakeStore) CreateAlertRule(_ context.Context, in db.AlertRuleInput) (db
 		DurationSec:     in.DurationSec,
 		QuorumMinProbes: in.QuorumMinProbes,
 		CooldownSec:     in.CooldownSec,
+		ConfirmSec:      in.ConfirmSec,
+		RecoverSec:      in.RecoverSec,
 		ChannelIDs:      chIDs,
 		Enabled:         in.Enabled,
 		CreatedAt:       time.Now().UTC(),
@@ -244,6 +246,8 @@ func (f *fakeStore) UpdateAlertRule(_ context.Context, id uuid.UUID, in db.Alert
 			existing.DurationSec = in.DurationSec
 			existing.QuorumMinProbes = in.QuorumMinProbes
 			existing.CooldownSec = in.CooldownSec
+			existing.ConfirmSec = in.ConfirmSec
+			existing.RecoverSec = in.RecoverSec
 			existing.ChannelIDs = chIDs
 			existing.Enabled = in.Enabled
 			f.alertRules[i] = existing
@@ -835,7 +839,24 @@ func TestTelegramAlertChannelWithThreadID(t *testing.T) {
 	if err := json.Unmarshal(ruleRec.Body.Bytes(), &createdRule); err != nil {
 		t.Fatalf("decode global rule: %v", err)
 	}
-	if createdRule.TargetID != nil || createdRule.GroupID != nil || createdRule.CooldownSec != 0 || len(createdRule.ChannelIDs) != 1 || createdRule.ChannelIDs[0] != ch.ID {
-		t.Fatalf("unexpected global rule: %+v", createdRule)
+	if createdRule.TargetID != nil || createdRule.GroupID != nil || createdRule.CooldownSec != 0 || createdRule.ConfirmSec != 0 || createdRule.RecoverSec != 45 || len(createdRule.ChannelIDs) != 1 || createdRule.ChannelIDs[0] != ch.ID {
+		t.Fatalf("unexpected global rule defaults: %+v", createdRule)
+	}
+
+	// Update rule with custom hold-down timers (confirm_sec=90, recover_sec=0)
+	updRulePayload := `{"name":"Global Packet Loss","metric":"loss_pct","threshold_value":20,"duration_sec":30,"quorum_min_probes":1,"cooldown_sec":0,"confirm_sec":90,"recover_sec":0,"channel_ids":["` + ch.ID.String() + `"]}`
+	updRuleReq := httptest.NewRequest(http.MethodPut, "/api/alerts/rules/"+createdRule.ID.String(), bytes.NewBufferString(updRulePayload))
+	updRuleReq.AddCookie(sessionCookie)
+	updRuleRec := httptest.NewRecorder()
+	router.ServeHTTP(updRuleRec, updRuleReq)
+	if updRuleRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 updating rule timers, got %d (%s)", updRuleRec.Code, updRuleRec.Body.String())
+	}
+	var updatedRule db.AlertRule
+	if err := json.Unmarshal(updRuleRec.Body.Bytes(), &updatedRule); err != nil {
+		t.Fatalf("decode updated rule: %v", err)
+	}
+	if updatedRule.ConfirmSec != 90 || updatedRule.RecoverSec != 0 {
+		t.Fatalf("expected confirm_sec=90 recover_sec=0, got %+v", updatedRule)
 	}
 }

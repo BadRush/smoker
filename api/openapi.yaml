@@ -876,7 +876,7 @@ components:
           items: { $ref: '#/components/schemas/MTRHop' }
     AlertRule:
       type: object
-      required: [id, name, metric, threshold_value, duration_sec, quorum_min_probes, cooldown_sec, channel_ids, enabled, created_at]
+      required: [id, name, metric, threshold_value, duration_sec, quorum_min_probes, cooldown_sec, confirm_sec, recover_sec, channel_ids, enabled, created_at]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
@@ -887,6 +887,8 @@ components:
         duration_sec: { type: integer }
         quorum_min_probes: { type: integer }
         cooldown_sec: { type: integer }
+        confirm_sec: { type: integer }
+        recover_sec: { type: integer }
         channel_ids:
           type: array
           items: { type: string, format: uuid }
@@ -904,6 +906,8 @@ components:
         duration_sec: { type: integer }
         quorum_min_probes: { type: integer }
         cooldown_sec: { type: integer }
+        confirm_sec: { type: integer }
+        recover_sec: { type: integer }
         channel_ids:
           type: array
           items: { type: string, format: uuid }

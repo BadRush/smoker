@@ -313,9 +313,11 @@ describe("NocTvWallboardPage layout controls", () => {
     const user = userEvent.setup();
     render(<NocTvWallboardPage />);
 
-    // Default Spotlight=off: no tv-spotlight-btn, shows Anomalies (3) button (down + loss + degraded)
+    // Default Spotlight=off: no tv-spotlight-btn, shows Alert / Warn (3) button (down + loss + degraded)
     await waitFor(() => {
-      expect(screen.getByTestId("tv-anomalies-btn")).toHaveTextContent("(3)");
+      expect(screen.getByTestId("tv-anomalies-btn")).toHaveTextContent(
+        /Alert \/ Warn\s*\(3\)/
+      );
     });
     expect(screen.queryByTestId("tv-spotlight-btn")).not.toBeInTheDocument();
     expect(screen.queryByTestId("tv-highlight-page")).not.toBeInTheDocument();

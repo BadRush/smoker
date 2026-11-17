@@ -88,6 +88,8 @@ type AlertRule struct {
 	DurationSec     int         `json:"duration_sec"`
 	QuorumMinProbes int         `json:"quorum_min_probes"`
 	CooldownSec     int         `json:"cooldown_sec"`
+	ConfirmSec      int         `json:"confirm_sec"`
+	RecoverSec      int         `json:"recover_sec"`
 	ChannelIDs      []uuid.UUID `json:"channel_ids"`
 	Enabled         bool        `json:"enabled"`
 	CreatedAt       time.Time   `json:"created_at"`

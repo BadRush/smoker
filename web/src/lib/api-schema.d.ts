@@ -638,6 +638,8 @@ export interface components {
             duration_sec: number;
             quorum_min_probes: number;
             cooldown_sec: number;
+            confirm_sec: number;
+            recover_sec: number;
             channel_ids: string[];
             enabled: boolean;
             /** Format: date-time */
@@ -655,6 +657,8 @@ export interface components {
             duration_sec: number;
             quorum_min_probes: number;
             cooldown_sec: number;
+            confirm_sec?: number;
+            recover_sec?: number;
             channel_ids?: string[];
             enabled?: boolean;
         };

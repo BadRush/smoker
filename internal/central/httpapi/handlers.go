@@ -911,6 +911,8 @@ type alertRuleReq struct {
 	DurationSec     int         `json:"duration_sec"`
 	QuorumMinProbes int         `json:"quorum_min_probes"`
 	CooldownSec     int         `json:"cooldown_sec"`
+	ConfirmSec      *int        `json:"confirm_sec"`
+	RecoverSec      *int        `json:"recover_sec"`
 	ChannelIDs      []uuid.UUID `json:"channel_ids"`
 	Enabled         *bool       `json:"enabled"`
 }
@@ -945,6 +947,20 @@ func validateAlertRuleReq(req alertRuleReq) (db.AlertRuleInput, string) {
 	if req.CooldownSec != 0 && (req.CooldownSec < 10 || req.CooldownSec > 86400) {
 		return db.AlertRuleInput{}, "cooldown_sec must be 0 (off) or between 10 and 86400"
 	}
+	confirmSec := 0
+	if req.ConfirmSec != nil {
+		confirmSec = *req.ConfirmSec
+	}
+	if confirmSec < 0 || confirmSec > 3600 {
+		return db.AlertRuleInput{}, "confirm_sec must be between 0 and 3600"
+	}
+	recoverSec := 45
+	if req.RecoverSec != nil {
+		recoverSec = *req.RecoverSec
+	}
+	if recoverSec < 0 || recoverSec > 3600 {
+		return db.AlertRuleInput{}, "recover_sec must be between 0 and 3600"
+	}
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
@@ -958,6 +974,8 @@ func validateAlertRuleReq(req alertRuleReq) (db.AlertRuleInput, string) {
 		DurationSec:     req.DurationSec,
 		QuorumMinProbes: req.QuorumMinProbes,
 		CooldownSec:     req.CooldownSec,
+		ConfirmSec:      confirmSec,
+		RecoverSec:      recoverSec,
 		ChannelIDs:      req.ChannelIDs,
 		Enabled:         enabled,
 	}, ""

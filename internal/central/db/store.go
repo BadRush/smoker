@@ -740,6 +740,8 @@ type AlertRuleInput struct {
 	DurationSec     int
 	QuorumMinProbes int
 	CooldownSec     int
+	ConfirmSec      int
+	RecoverSec      int
 	ChannelIDs      []uuid.UUID
 	Enabled         bool
 }
@@ -774,7 +776,8 @@ func decodeChannelIDs(raw []byte) []uuid.UUID {
 func (s *Store) ListAlertRules(ctx context.Context) ([]AlertRule, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, target_id, group_id, metric, threshold_value,
-		       duration_sec, quorum_min_probes, cooldown_sec, channel_ids, enabled, created_at
+		       duration_sec, quorum_min_probes, cooldown_sec, confirm_sec, recover_sec,
+		       channel_ids, enabled, created_at
 		FROM alert_rules
 		ORDER BY created_at DESC
 	`)
@@ -788,7 +791,8 @@ func (s *Store) ListAlertRules(ctx context.Context) ([]AlertRule, error) {
 		var rawChannels []byte
 		if err := rows.Scan(
 			&r.ID, &r.Name, &r.TargetID, &r.GroupID, &r.Metric, &r.ThresholdValue,
-			&r.DurationSec, &r.QuorumMinProbes, &r.CooldownSec, &rawChannels, &r.Enabled, &r.CreatedAt,
+			&r.DurationSec, &r.QuorumMinProbes, &r.CooldownSec, &r.ConfirmSec, &r.RecoverSec,
+			&rawChannels, &r.Enabled, &r.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -806,14 +810,18 @@ func (s *Store) CreateAlertRule(ctx context.Context, in AlertRuleInput) (AlertRu
 	var rawChannels []byte
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO alert_rules (id, name, target_id, group_id, metric, threshold_value,
-		                         duration_sec, quorum_min_probes, cooldown_sec, channel_ids, enabled)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		                         duration_sec, quorum_min_probes, cooldown_sec, confirm_sec, recover_sec,
+		                         channel_ids, enabled)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id, name, target_id, group_id, metric, threshold_value,
-		          duration_sec, quorum_min_probes, cooldown_sec, channel_ids, enabled, created_at
+		          duration_sec, quorum_min_probes, cooldown_sec, confirm_sec, recover_sec,
+		          channel_ids, enabled, created_at
 	`, id, in.Name, in.TargetID, in.GroupID, in.Metric, in.ThresholdValue,
-		in.DurationSec, in.QuorumMinProbes, in.CooldownSec, chJSON, in.Enabled).Scan(
+		in.DurationSec, in.QuorumMinProbes, in.CooldownSec, in.ConfirmSec, in.RecoverSec,
+		chJSON, in.Enabled).Scan(
 		&r.ID, &r.Name, &r.TargetID, &r.GroupID, &r.Metric, &r.ThresholdValue,
-		&r.DurationSec, &r.QuorumMinProbes, &r.CooldownSec, &rawChannels, &r.Enabled, &r.CreatedAt,
+		&r.DurationSec, &r.QuorumMinProbes, &r.CooldownSec, &r.ConfirmSec, &r.RecoverSec,
+		&rawChannels, &r.Enabled, &r.CreatedAt,
 	)
 	r.ChannelIDs = decodeChannelIDs(rawChannels)
 	return r, mapPGError(err)
@@ -827,14 +835,18 @@ func (s *Store) UpdateAlertRule(ctx context.Context, id uuid.UUID, in AlertRuleI
 	err := s.pool.QueryRow(ctx, `
 		UPDATE alert_rules
 		SET name = $2, target_id = $3, group_id = $4, metric = $5, threshold_value = $6,
-		    duration_sec = $7, quorum_min_probes = $8, cooldown_sec = $9, channel_ids = $10, enabled = $11
+		    duration_sec = $7, quorum_min_probes = $8, cooldown_sec = $9,
+		    confirm_sec = $10, recover_sec = $11, channel_ids = $12, enabled = $13
 		WHERE id = $1
 		RETURNING id, name, target_id, group_id, metric, threshold_value,
-		          duration_sec, quorum_min_probes, cooldown_sec, channel_ids, enabled, created_at
+		          duration_sec, quorum_min_probes, cooldown_sec, confirm_sec, recover_sec,
+		          channel_ids, enabled, created_at
 	`, id, in.Name, in.TargetID, in.GroupID, in.Metric, in.ThresholdValue,
-		in.DurationSec, in.QuorumMinProbes, in.CooldownSec, chJSON, in.Enabled).Scan(
+		in.DurationSec, in.QuorumMinProbes, in.CooldownSec, in.ConfirmSec, in.RecoverSec,
+		chJSON, in.Enabled).Scan(
 		&r.ID, &r.Name, &r.TargetID, &r.GroupID, &r.Metric, &r.ThresholdValue,
-		&r.DurationSec, &r.QuorumMinProbes, &r.CooldownSec, &rawChannels, &r.Enabled, &r.CreatedAt,
+		&r.DurationSec, &r.QuorumMinProbes, &r.CooldownSec, &r.ConfirmSec, &r.RecoverSec,
+		&rawChannels, &r.Enabled, &r.CreatedAt,
 	)
 	r.ChannelIDs = decodeChannelIDs(rawChannels)
 	return r, mapPGError(err)
@@ -914,6 +926,30 @@ func (s *Store) DeleteAlertChannel(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
+func scanIncidentRows(rows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+}) ([]Incident, error) {
+	out := make([]Incident, 0)
+	for rows.Next() {
+		var inc Incident
+		var rawProbes []byte
+		if err := rows.Scan(
+			&inc.ID, &inc.RuleID, &inc.RuleName, &inc.TargetID, &inc.TargetName,
+			&inc.Status, &inc.Severity, &rawProbes, &inc.PeakValue, &inc.StartedAt, &inc.ResolvedAt,
+			&inc.LastNotifiedAt, &inc.Summary,
+		); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(rawProbes, &inc.AffectedProbes); err != nil {
+			inc.AffectedProbes = []string{}
+		}
+		out = append(out, inc)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListIncidents(ctx context.Context, limit int) ([]Incident, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
@@ -932,23 +968,24 @@ func (s *Store) ListIncidents(ctx context.Context, limit int) ([]Incident, error
 		return nil, err
 	}
 	defer rows.Close()
-	out := make([]Incident, 0)
-	for rows.Next() {
-		var inc Incident
-		var rawProbes []byte
-		if err := rows.Scan(
-			&inc.ID, &inc.RuleID, &inc.RuleName, &inc.TargetID, &inc.TargetName,
-			&inc.Status, &inc.Severity, &rawProbes, &inc.PeakValue, &inc.StartedAt, &inc.ResolvedAt,
-			&inc.LastNotifiedAt, &inc.Summary,
-		); err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal(rawProbes, &inc.AffectedProbes); err != nil {
-			inc.AffectedProbes = []string{}
-		}
-		out = append(out, inc)
+	return scanIncidentRows(rows)
+}
+
+func (s *Store) ListOpenIncidents(ctx context.Context) ([]Incident, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT i.id, i.rule_id, COALESCE(r.name, 'Deleted Rule'), i.target_id,
+		       COALESCE(t.name, 'Fleet / System'), i.status, i.severity, i.affected_probes,
+		       i.peak_value, i.started_at, i.resolved_at, i.last_notified_at, i.summary
+		FROM incidents i
+		LEFT JOIN alert_rules r ON r.id = i.rule_id
+		LEFT JOIN targets t ON t.id = i.target_id
+		WHERE i.status = 'open'
+	`)
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	defer rows.Close()
+	return scanIncidentRows(rows)
 }
 
 func (s *Store) CountOpenIncidents(ctx context.Context) (int, error) {

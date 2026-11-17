@@ -93,6 +93,8 @@ const RULES: AlertRule[] = [
     duration_sec: 30,
     quorum_min_probes: 2,
     cooldown_sec: 0,
+    confirm_sec: 0,
+    recover_sec: 45,
     channel_ids: [],
     enabled: true,
     created_at: "",
@@ -271,9 +273,13 @@ describe("AlertsPage quorum, routing, and Telegram channel controls", () => {
     });
 
     expect((screen.getByLabelText("Repeat reminder") as HTMLSelectElement).value).toBe("0");
+    expect((screen.getByLabelText("Confirm delay") as HTMLSelectElement).value).toBe("0");
+    expect((screen.getByLabelText("Recovery delay") as HTMLSelectElement).value).toBe("45");
 
     await user.type(screen.getByLabelText("Rule name"), "Global Down Alert");
     await user.selectOptions(screen.getByLabelText("Rule scope"), "global");
+    await user.selectOptions(screen.getByLabelText("Confirm delay"), "60");
+    await user.selectOptions(screen.getByLabelText("Recovery delay"), "30");
     await user.click(screen.getByLabelText("Route to channel NOC Forum"));
     await user.click(screen.getByRole("button", { name: "Add Rule" }));
 
@@ -292,6 +298,8 @@ describe("AlertsPage quorum, routing, and Telegram channel controls", () => {
         duration_sec: 30,
         quorum_min_probes: 2,
         cooldown_sec: 0,
+        confirm_sec: 60,
+        recover_sec: 30,
         channel_ids: ["ch-existing"],
         enabled: true,
       },

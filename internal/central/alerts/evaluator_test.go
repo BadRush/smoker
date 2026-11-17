@@ -247,6 +247,17 @@ func (f *fakeAlertStore) ListAlertChannels(context.Context) ([]db.AlertChannel, 
 	defer f.mu.Unlock()
 	return append([]db.AlertChannel(nil), f.channels...), nil
 }
+func (f *fakeAlertStore) ListOpenIncidents(context.Context) ([]db.Incident, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var open []db.Incident
+	for _, inc := range f.incidents {
+		if inc.Status == "open" {
+			open = append(open, inc)
+		}
+	}
+	return open, nil
+}
 func (f *fakeAlertStore) UpsertOpenIncident(_ context.Context, ruleID uuid.UUID, targetID *uuid.UUID, affectedProbes []string, peak float64, severity string, now time.Time, summary string) (db.Incident, bool, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -360,6 +371,8 @@ func TestEvaluatorEscalationOfflineGuardAndChannelRouting(t *testing.T) {
 				DurationSec:     30,
 				QuorumMinProbes: 2, // Higher than 1 assigned probe -> capped cleanly for global rule
 				CooldownSec:     0, // State-change + escalation only (no repeat spam)
+				ConfirmSec:      1, // Quick confirm for escalation/channel test (Auto holddown tested separately)
+				RecoverSec:      0,
 				ChannelIDs:      []uuid.UUID{ch1ID},
 				Enabled:         true,
 			},
@@ -376,9 +389,19 @@ func TestEvaluatorEscalationOfflineGuardAndChannelRouting(t *testing.T) {
 	ev := NewEvaluator(store, cache, nil, NewNotifierWithHTTP(srv.Client(), srv.URL), aesKey, func() time.Time { return now })
 	ev.SetSyncDispatch(true)
 
-	// Cycle 1: 25% loss -> sends [WARN] only to ch1 (thread 101), not thread 202
+	// Cycle 1: enters pending at t0, confirms at t0+2s -> sends [WARN] only to ch1 (thread 101)
 	if err := ev.EvaluateOnce(context.Background()); err != nil {
-		t.Fatalf("EvaluateOnce cycle 1: %v", err)
+		t.Fatalf("EvaluateOnce pending start: %v", err)
+	}
+	if len(sentByThread[101]) != 0 {
+		t.Fatalf("expected 0 messages while pending confirm, got %d", len(sentByThread[101]))
+	}
+	now = now.Add(2 * time.Second)
+	for i := 0; i < 4; i++ {
+		cache.Add(p1ID, t1ID, now.Add(time.Duration(i-5)*time.Second), &rtt, 1000, i == 0, now)
+	}
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("EvaluateOnce cycle 1 confirm: %v", err)
 	}
 	if len(sentByThread[101]) != 1 || len(sentByThread[202]) != 0 {
 		t.Fatalf("expected 1 message in thread 101 and 0 in 202, got 101=%d 202=%d", len(sentByThread[101]), len(sentByThread[202]))
@@ -388,7 +411,7 @@ func TestEvaluatorEscalationOfflineGuardAndChannelRouting(t *testing.T) {
 	}
 
 	// Cycle 2 at +10s with same severity and CooldownSec=0 -> NO duplicate notification
-	now = now.Add(10 * time.Second)
+	now = t0.Add(10 * time.Second)
 	for i := 0; i < 4; i++ {
 		cache.Add(p1ID, t1ID, now.Add(-time.Duration(i+1)*time.Second), &rtt, 1000, i == 0, now)
 	}
@@ -436,5 +459,155 @@ func TestEvaluatorEscalationOfflineGuardAndChannelRouting(t *testing.T) {
 	okMsg := sentByThread[101][2]
 	if !strings.Contains(okMsg, "✅ <b>[OK]") || !strings.Contains(okMsg, "Duration:</b> 2m 05s (125s)") || store.incidents[0].Status != "resolved" {
 		t.Fatalf("expected [OK] with exact SLA duration, got:\n%s", okMsg)
+	}
+}
+
+func TestEvaluatorAntiFalseAlarmHoldDownAndSLATimestamps(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var sent []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		txt, _ := body["text"].(string)
+		mu.Lock()
+		sent = append(sent, txt)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	aesKey := auth.DeriveAESKey("test-aes-secret-at-least-32-chars!!")
+	encCh, _ := auth.EncryptAESGCM(aesKey, []byte(`{"bot_token":"123:ABC","chat_id":"-1001"}`))
+
+	p1ID := uuid.New()
+	tWarnID := uuid.New()
+	tDownID := uuid.New()
+	t0 := time.Date(2026, 11, 17, 4, 0, 0, 0, time.UTC) // 11:00:00 WIB
+	now := t0
+
+	store := &fakeAlertStore{
+		probes: []db.Probe{{ID: p1ID, Name: "Probe-JKT", Status: "online"}},
+		targets: []db.Target{
+			{ID: tWarnID, Name: "Intermittent-Link", Host: "1.1.1.1", IntervalSec: 1, Enabled: true, AssignAllProbes: true},
+			{ID: tDownID, Name: "HardDown-Link", Host: "8.8.8.8", IntervalSec: 1, Enabled: true, AssignAllProbes: true},
+		},
+		channels: []db.AlertChannel{
+			{ID: uuid.New(), Type: "telegram", Name: "Ops", ConfigEncrypted: encCh, Enabled: true},
+		},
+		rules: []db.AlertRule{
+			{
+				ID:              uuid.New(),
+				Name:            "Auto HoldDown Rule",
+				Metric:          "loss_pct",
+				ThresholdValue:  20,
+				DurationSec:     30,
+				QuorumMinProbes: 1,
+				CooldownSec:     0,
+				ConfirmSec:      0,  // Auto Smart: 25s DOWN / 60s WARN
+				RecoverSec:      45, // 45s clean streak required
+				Enabled:         true,
+			},
+		},
+	}
+
+	cache := ingest.NewRollingCache(10 * time.Minute)
+	rtt := int32(20000)
+	ev := NewEvaluator(store, cache, nil, NewNotifierWithHTTP(srv.Client(), srv.URL), aesKey, func() time.Time { return now })
+	ev.SetSyncDispatch(true)
+
+	// 1. Short intermittent blip (< 60s) on tWarn + brief 20s drop (< 25s) on tDown -> ZERO false alarms!
+	for i := 0; i < 4; i++ {
+		cache.Add(p1ID, tWarnID, now.Add(time.Duration(i-5)*time.Second), &rtt, 500, i == 0, now) // 25% loss (WARN -> 60s confirm)
+		cache.Add(p1ID, tDownID, now.Add(time.Duration(i-5)*time.Second), nil, 0, true, now)       // 100% loss (DOWN -> 25s confirm)
+	}
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("blip start eval: %v", err)
+	}
+	now = t0.Add(20 * time.Second)
+	for i := 0; i < 20; i++ {
+		cache.Add(p1ID, tWarnID, now.Add(-time.Duration(i)*time.Second), &rtt, 500, i%4 == 0, now)
+		cache.Add(p1ID, tDownID, now.Add(-time.Duration(i)*time.Second), nil, 0, true, now)
+	}
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("t+20s eval: %v", err)
+	}
+	if len(sent) != 0 || len(store.incidents) != 0 {
+		t.Fatalf("expected 0 false alerts before confirm threshold, sent=%d incidents=%d", len(sent), len(store.incidents))
+	}
+
+	// Recover tDown at t+22s (<25s) and clear cache by advancing window past healthy samples at t+60s -> ZERO incidents for brief blip!
+	// First keep tDown down at t+25s -> confirms [DOWN] with StartedAt = t0!
+	now = t0.Add(25 * time.Second)
+	for i := 0; i < 25; i++ {
+		cache.Add(p1ID, tDownID, now.Add(-time.Duration(i)*time.Second), nil, 0, true, now)
+	}
+	// Make tWarn healthy at t+25s so its <60s blip cancels quietly without creating an incident
+	for i := 0; i < 35; i++ {
+		cache.Add(p1ID, tWarnID, now.Add(-time.Duration(i)*time.Second), &rtt, 500, false, now)
+	}
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("t+25s eval: %v", err)
+	}
+	if len(sent) != 1 || len(store.incidents) != 1 {
+		t.Fatalf("expected only HardDown-Link confirmed at +25s (Intermittent blip cancelled), sent=%d incidents=%d", len(sent), len(store.incidents))
+	}
+	if !strings.Contains(sent[0], "❌ <b>[DOWN] HardDown-Link") || !strings.Contains(sent[0], "Start:</b> 17 Nov 2026 11:00:00 WIB") {
+		t.Fatalf("expected Start timestamp to match initial detection t0 (11:00:00 WIB), got:\n%s", sent[0])
+	}
+
+	// 2. Test flapping recovery on HardDown-Link: recovers briefly at t+60s, drops again at t+90s (<45s recovery wait) -> NO false [OK] spam!
+	now = t0.Add(60 * time.Second)
+	for i := 0; i < 35; i++ {
+		cache.Add(p1ID, tDownID, now.Add(-time.Duration(i)*time.Second), &rtt, 500, false, now)
+	}
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("t+60s recover start: %v", err)
+	}
+	if len(sent) != 1 || store.incidents[0].Status != "open" {
+		t.Fatalf("expected [OK] held back during 45s recovery buffer, sent=%d status=%s", len(sent), store.incidents[0].Status)
+	}
+
+	// Link flaps back to down at t+90s (only 30s healthy < 45s) -> still 1 single incident, still no extra notif
+	now = t0.Add(90 * time.Second)
+	for i := 0; i < 35; i++ {
+		cache.Add(p1ID, tDownID, now.Add(-time.Duration(i)*time.Second), nil, 0, true, now)
+	}
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("t+90s flap: %v", err)
+	}
+	if len(sent) != 1 || store.incidents[0].Status != "open" {
+		t.Fatalf("expected flap during recovery buffer to keep single incident open, sent=%d status=%s", len(sent), store.incidents[0].Status)
+	}
+
+	// 3. Real recovery starts cleanly at t+120s (11:02:00 WIB), confirmed after 45s at t+165s -> SLA Duration must be 2m 00s (120s), End = 11:02:00 WIB!
+	now = t0.Add(120 * time.Second)
+	for i := 0; i < 35; i++ {
+		cache.Add(p1ID, tDownID, now.Add(-time.Duration(i)*time.Second), &rtt, 500, false, now)
+	}
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("t+120s real recover start: %v", err)
+	}
+	if len(sent) != 1 || store.incidents[0].Status != "open" {
+		t.Fatalf("expected recovery buffer still waiting at t+120s, sent=%d", len(sent))
+	}
+
+	now = t0.Add(165 * time.Second)
+	for i := 0; i < 35; i++ {
+		cache.Add(p1ID, tDownID, now.Add(-time.Duration(i)*time.Second), &rtt, 500, false, now)
+	}
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("t+165s recover confirm: %v", err)
+	}
+	if len(sent) != 2 || store.incidents[0].Status != "resolved" {
+		t.Fatalf("expected [OK] sent after 45s clean streak, sent=%d status=%s", len(sent), store.incidents[0].Status)
+	}
+	if !strings.Contains(sent[1], "✅ <b>[OK] HardDown-Link (8.8.8.8) — Connection Restored</b>") ||
+		!strings.Contains(sent[1], "Start:</b> 17 Nov 2026 11:00:00 WIB") ||
+		!strings.Contains(sent[1], "End:</b> 17 Nov 2026 11:02:00 WIB") ||
+		!strings.Contains(sent[1], "Duration:</b> 2m 00s (120s)") {
+		t.Fatalf("expected exact SLA Start/End/Duration in [OK] message, got:\n%s", sent[1])
 	}
 }

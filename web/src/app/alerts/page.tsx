@@ -83,6 +83,8 @@ export default function AlertsPage() {
   const [rDuration, setRDuration] = useState(30);
   const [rQuorum, setRQuorum] = useState(2);
   const [rCooldownSec, setRCooldownSec] = useState(0);
+  const [rConfirmSec, setRConfirmSec] = useState(0);
+  const [rRecoverSec, setRRecoverSec] = useState(45);
   const [rChannelIds, setRChannelIds] = useState<string[]>([]);
   const [rEnabled, setREnabled] = useState(true);
 
@@ -159,6 +161,8 @@ export default function AlertsPage() {
     setRDuration(30);
     setRQuorum(2);
     setRCooldownSec(0);
+    setRConfirmSec(0);
+    setRRecoverSec(45);
     setRChannelIds([]);
     setREnabled(true);
   }
@@ -184,6 +188,8 @@ export default function AlertsPage() {
     setRDuration(rule.duration_sec);
     setRQuorum(rule.quorum_min_probes);
     setRCooldownSec(rule.cooldown_sec ?? 0);
+    setRConfirmSec(rule.confirm_sec ?? 0);
+    setRRecoverSec(rule.recover_sec ?? 45);
     setRChannelIds(rule.channel_ids ?? []);
     setREnabled(rule.enabled);
   }
@@ -212,6 +218,8 @@ export default function AlertsPage() {
       duration_sec: Number(rDuration),
       quorum_min_probes: Number(rQuorum),
       cooldown_sec: Number(rCooldownSec),
+      confirm_sec: Number(rConfirmSec),
+      recover_sec: Number(rRecoverSec),
       channel_ids: rChannelIds,
       enabled: editingRuleId ? rEnabled : true,
     };
@@ -251,6 +259,8 @@ export default function AlertsPage() {
           duration_sec: rule.duration_sec,
           quorum_min_probes: rule.quorum_min_probes,
           cooldown_sec: rule.cooldown_sec,
+          confirm_sec: rule.confirm_sec ?? 0,
+          recover_sec: rule.recover_sec ?? 45,
           channel_ids: rule.channel_ids ?? [],
           enabled: !rule.enabled,
         }),
@@ -627,6 +637,48 @@ export default function AlertsPage() {
                     <option value={900}>Every 15 min</option>
                     <option value={1800}>Every 30 min</option>
                     <option value={3600}>Every 1 hour</option>
+                    {![0, 300, 900, 1800, 3600].includes(rCooldownSec) && (
+                      <option value={rCooldownSec}>Every {rCooldownSec}s</option>
+                    )}
+                  </select>
+                </label>
+
+                <label className="flex items-center justify-between gap-2 text-xs text-zinc-400">
+                  <span>Confirm after (anti-blip):</span>
+                  <select
+                    aria-label="Confirm delay"
+                    value={rConfirmSec}
+                    onChange={(e) => setRConfirmSec(Number(e.target.value))}
+                    className="rounded border border-border bg-canvas px-2 py-1 text-xs text-zinc-100"
+                  >
+                    <option value={0}>Auto (25s Down / 60s Warn)</option>
+                    <option value={10}>10s (Fast)</option>
+                    <option value={25}>25s (Down default)</option>
+                    <option value={60}>60s (Intermittent)</option>
+                    <option value={120}>2 min</option>
+                    <option value={300}>5 min</option>
+                    {![0, 10, 25, 60, 120, 300].includes(rConfirmSec) && (
+                      <option value={rConfirmSec}>{rConfirmSec}s (custom)</option>
+                    )}
+                  </select>
+                </label>
+
+                <label className="flex items-center justify-between gap-2 text-xs text-zinc-400">
+                  <span>Recover after (anti-flap):</span>
+                  <select
+                    aria-label="Recovery delay"
+                    value={rRecoverSec}
+                    onChange={(e) => setRRecoverSec(Number(e.target.value))}
+                    className="rounded border border-border bg-canvas px-2 py-1 text-xs text-zinc-100"
+                  >
+                    <option value={45}>45s stable (Recommended)</option>
+                    <option value={0}>Instant (0s)</option>
+                    <option value={30}>30s stable</option>
+                    <option value={60}>60s stable</option>
+                    <option value={120}>2 min stable</option>
+                    {![0, 30, 45, 60, 120].includes(rRecoverSec) && (
+                      <option value={rRecoverSec}>{rRecoverSec}s (custom)</option>
+                    )}
                   </select>
                 </label>
               </div>
@@ -731,7 +783,9 @@ export default function AlertsPage() {
                       <p className="font-mono text-[11px] text-zinc-400">
                         {r.metric === "latency_p95" ? "High Latency (P95)" : r.metric} &gt;={" "}
                         {r.threshold_value} · {r.duration_sec}s · quorum{" "}
-                        {r.quorum_min_probes} ·{" "}
+                        {r.quorum_min_probes} · confirm{" "}
+                        {(r.confirm_sec ?? 0) === 0 ? "auto (25s/60s)" : `${r.confirm_sec}s`}{" "}
+                        · recover {(r.recover_sec ?? 45)}s ·{" "}
                         {r.cooldown_sec === 0
                           ? "once + restored"
                           : `repeat ${r.cooldown_sec}s`}
