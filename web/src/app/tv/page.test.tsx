@@ -261,21 +261,35 @@ describe("NocTvWallboardPage layout controls", () => {
     expect(screen.getAllByTestId("tv-target-card")).toHaveLength(2);
   });
 
-  it("keeps Auto Spotlight off by default with manual Anomalies badge, and allows enabling VIP Only + Auto-Switch in Drawer", async () => {
+  it("keeps Auto Spotlight off by default with manual Anomalies badge, and only spotlights loss/down targets (ignoring yellow degraded)", async () => {
     const snapWithLoss: MatrixSnapshot = {
       ...TV_SNAPSHOT,
       targets: [
         { ...TV_SNAPSHOT.targets[0], pinned_on_tv: true },
         TV_SNAPSHOT.targets[1],
+        { ...TV_SNAPSHOT.targets[2], pinned_on_tv: true },
       ],
       cells: [
-        TV_SNAPSHOT.cells[0],
+        {
+          ...TV_SNAPSHOT.cells[0],
+          status: "loss",
+          loss_pct: 20,
+          p50_ms: 25,
+          p95_ms: 40,
+        },
         {
           ...TV_SNAPSHOT.cells[1],
           status: "down",
           loss_pct: 100,
           p50_ms: null,
           p95_ms: null,
+        },
+        {
+          ...TV_SNAPSHOT.cells[2],
+          status: "degraded",
+          loss_pct: 0,
+          p50_ms: 180,
+          p95_ms: 220,
         },
       ],
     };
@@ -299,18 +313,18 @@ describe("NocTvWallboardPage layout controls", () => {
     const user = userEvent.setup();
     render(<NocTvWallboardPage />);
 
-    // Default Spotlight=off: no tv-spotlight-btn, shows Anomalies (1) button instead, stays on normal grid
+    // Default Spotlight=off: no tv-spotlight-btn, shows Anomalies (3) button (down + loss + degraded)
     await waitFor(() => {
-      expect(screen.getByTestId("tv-anomalies-btn")).toHaveTextContent("(1)");
+      expect(screen.getByTestId("tv-anomalies-btn")).toHaveTextContent("(3)");
     });
     expect(screen.queryByTestId("tv-spotlight-btn")).not.toBeInTheDocument();
     expect(screen.queryByTestId("tv-highlight-page")).not.toBeInTheDocument();
 
-    // Clicking Anomalies (1) filters the grid to impaired targets manually
+    // Clicking Anomalies (3) filters the grid to all 3 impaired targets (including degraded yellow)
     await user.click(screen.getByTestId("tv-anomalies-btn"));
-    expect(screen.getAllByTestId("tv-target-card")).toHaveLength(1);
+    expect(screen.getAllByTestId("tv-target-card")).toHaveLength(3);
     await user.click(screen.getByTestId("tv-anomalies-btn"));
-    expect(screen.getAllByTestId("tv-target-card")).toHaveLength(2);
+    expect(screen.getAllByTestId("tv-target-card")).toHaveLength(3);
 
     // Open TV Config Drawer -> enable VIP Only spotlight & Auto-Switch
     await user.click(screen.getByRole("button", { name: "Configure TV Display" }));
@@ -321,7 +335,11 @@ describe("NocTvWallboardPage layout controls", () => {
     expect(window.location.search).toContain("spotlight=vip");
     expect(window.location.search).toContain("autoSwitch=1");
 
-    // Spotlight button now shows 1 (the VIP target only, not the non-VIP down target)
+    // Spotlight button shows (1): only VIP target[0] (loss), ignoring non-VIP target[1] (down) and VIP target[2] (degraded yellow)
     expect(screen.getByTestId("tv-spotlight-btn")).toHaveTextContent("(1)");
+
+    // Switching to All Anomalies includes both loss/down targets (2), still ignoring degraded yellow target[2]
+    await user.click(screen.getByTestId("tv-drawer-spotlight-all"));
+    expect(screen.getByTestId("tv-spotlight-btn")).toHaveTextContent("(2)");
   });
 });

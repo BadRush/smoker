@@ -749,11 +749,13 @@ export default function NocTvWallboardPage() {
     }
   }, [data, simTargetId]);
 
-  // Event-Driven Auto-Switch (opt-in) + Audio Chime when a target newly enters an impaired state
+  // Event-Driven Auto-Switch (opt-in) + Audio Chime when a target newly enters a critical (loss/down) state
   useEffect(() => {
     if (!data) return;
-    const currentImpaired = new Set(
-      partitioned.pinnedAlerts.map((a) => a.target.id)
+    const currentLossOrDown = new Set(
+      partitioned.pinnedAlerts
+        .filter((a) => a.worstStatus === "loss" || a.worstStatus === "down")
+        .map((a) => a.target.id)
     );
     const currentCritical = new Set(
       partitioned.pinnedAlerts
@@ -767,15 +769,15 @@ export default function NocTvWallboardPage() {
 
     if (!hasSeededImpairedRef.current) {
       hasSeededImpairedRef.current = true;
-      prevImpairedIdsRef.current = currentImpaired;
+      prevImpairedIdsRef.current = currentLossOrDown;
       prevCriticalIdsRef.current = currentCritical;
       return;
     }
 
-    let hasNewImpaired = false;
-    for (const id of currentImpaired) {
+    let hasNewLossOrDown = false;
+    for (const id of currentLossOrDown) {
       if (!prevImpairedIdsRef.current.has(id)) {
-        hasNewImpaired = true;
+        hasNewLossOrDown = true;
         break;
       }
     }
@@ -786,10 +788,10 @@ export default function NocTvWallboardPage() {
         break;
       }
     }
-    prevImpairedIdsRef.current = currentImpaired;
+    prevImpairedIdsRef.current = currentLossOrDown;
     prevCriticalIdsRef.current = currentCritical;
 
-    if (hasNewImpaired && cfg.sound) {
+    if (hasNewLossOrDown && cfg.sound) {
       playAlertChime();
     }
     if (
@@ -1175,13 +1177,12 @@ export default function NocTvWallboardPage() {
                 {partitioned.highlightItems.length})
               </span>
             </button>
-          ) : cfg.spotlightMode === "off" &&
-            (partitioned.pinnedAlerts.length > 0 || impairedOnly) ? (
+          ) : partitioned.pinnedAlerts.length > 0 || impairedOnly ? (
             <button
               type="button"
               data-testid="tv-anomalies-btn"
               aria-pressed={impairedOnly}
-              title="Click to filter grid to impaired targets only (Auto Spotlight is Off)"
+              title="Click to filter grid to impaired targets (down, loss, high latency)"
               onClick={() => {
                 setImpairedOnly((prev) => !prev);
                 setPageIdx(0);

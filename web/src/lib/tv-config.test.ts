@@ -361,7 +361,7 @@ describe("tv-config helpers", () => {
     expect(offRes.highlightSlideIdx).toBeNull();
     expect(offRes.slides.length).toBe(2);
 
-    // spotlightMode="all" creates dedicated SPOTLIGHT slide with all impaired hosts
+    // spotlightMode="all" creates dedicated SPOTLIGHT slide with down/loss hosts only (ignores degraded/yellow)
     const res = partitionTargetsForTv(targets, cells, {
       groups: [],
       cardsPerPage: 2,
@@ -369,6 +369,7 @@ describe("tv-config helpers", () => {
     });
 
     expect(res.pinnedAlerts.map((a) => a.target.id)).toEqual(["t3", "t4", "t2"]);
+    expect(res.highlightItems.map((h) => h.target.id)).toEqual(["t3", "t4"]);
     expect(res.pages.length).toBe(2);
     expect(res.pages[0].length).toBe(2);
     expect(res.pages[1].length).toBe(2);
@@ -385,25 +386,45 @@ describe("tv-config helpers", () => {
     expect(g1Only.pinnedAlerts.map((a) => a.target.id)).toEqual(["t3", "t2"]);
   });
 
-  it("includes only VIP pinned targets on the highlight slide when spotlightMode is 'vip'", () => {
+  it("includes only VIP pinned targets that are down/loss on the highlight slide when spotlightMode is 'vip'", () => {
     const targets = [
-      makeTarget("t1", "VIP Google DNS", "g1", true),
-      makeTarget("t2", "Regular Host Down", "g1", false),
+      makeTarget("t1", "VIP Healthy DNS", "g1", true),
+      makeTarget("t2", "VIP Degraded Edge", "g1", true),
+      makeTarget("t3", "VIP Lossy Transit", "g1", true),
+      makeTarget("t4", "Regular Host Down", "g1", false),
     ];
     const cells = [
       makeCell("t1", "healthy", 0, 8),
-      makeCell("t2", "down", 100, null),
+      makeCell("t2", "degraded", 0, 180),
+      makeCell("t3", "loss", 20, 45),
+      makeCell("t4", "down", 100, null),
     ];
     const res = partitionTargetsForTv(targets, cells, {
       groups: [],
       cardsPerPage: 6,
       spotlightMode: "vip",
     });
-    expect(res.pinnedAlerts.map((a) => a.target.id)).toEqual(["t2"]);
-    expect(res.highlightItems.map((h) => h.target.id)).toEqual(["t1"]);
+    // pinnedAlerts tracks all anomalies (down, loss, degraded) for manual inspection
+    expect(res.pinnedAlerts.map((a) => a.target.id)).toEqual(["t4", "t3", "t2"]);
+    // highlightItems in 'vip' mode only includes VIP targets that are down or loss
+    expect(res.highlightItems.map((h) => h.target.id)).toEqual(["t3"]);
     expect(res.slides[0].kind).toBe("grid");
     expect(res.slides[1].kind).toBe("highlight");
     expect(res.highlightSlideIdx).toBe(1);
+
+    // When all VIP targets are healthy or only degraded (yellow), no Spotlight slide is created
+    const healthyVipRes = partitionTargetsForTv(
+      [targets[0], targets[1], targets[3]],
+      [cells[0], cells[1], cells[3]],
+      {
+        groups: [],
+        cardsPerPage: 6,
+        spotlightMode: "vip",
+      }
+    );
+    expect(healthyVipRes.highlightItems).toEqual([]);
+    expect(healthyVipRes.highlightSlideIdx).toBeNull();
+    expect(healthyVipRes.slides.length).toBe(1);
   });
 
   it("supports ungrouped targets, protocol focus filtering, and separate protocol slides", () => {

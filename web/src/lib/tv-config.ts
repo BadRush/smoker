@@ -1217,13 +1217,16 @@ export function partitionTargetsForTv(
     spotlightMode === "off"
       ? []
       : summaries
-          .filter((s) =>
-            spotlightMode === "vip" ? s.isPinnedVip : s.isImpaired || s.isPinnedVip
-          )
+          .filter((s) => {
+            const isLossOrDown =
+              s.worstStatus === "down" || s.worstStatus === "loss";
+            if (!isLossOrDown) return false;
+            return spotlightMode === "vip" ? s.isPinnedVip : true;
+          })
           .sort((a, b) => {
             const rankDiff = statusSeverity(b.worstStatus) - statusSeverity(a.worstStatus);
             if (rankDiff !== 0) return rankDiff;
-            if (a.isImpaired !== b.isImpaired) return a.isImpaired ? -1 : 1;
+            if (a.isPinnedVip !== b.isPinnedVip) return a.isPinnedVip ? -1 : 1;
             if (b.maxLossPct !== a.maxLossPct) return b.maxLossPct - a.maxLossPct;
             return (b.maxP95Ms ?? 0) - (a.maxP95Ms ?? 0);
           });
