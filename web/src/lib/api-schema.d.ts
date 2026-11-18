@@ -565,6 +565,7 @@ export interface components {
             targets: components["schemas"]["Target"][];
             cells: components["schemas"]["MatrixCell"][];
             active_incidents: number;
+            brand_name?: string;
             /** Format: date-time */
             generated_at: string;
         };
@@ -621,7 +622,7 @@ export interface components {
             /** Format: date-time */
             captured_at: string;
             /** @enum {string} */
-            trigger_reason: "auto_loss" | "manual";
+            trigger_reason: "auto_loss" | "auto_latency" | "manual";
             hops: components["schemas"]["MTRHop"][];
         };
         AlertRule: {
@@ -718,6 +719,7 @@ export interface components {
             raw_retention_days: number;
             agg_retention_days: number;
             default_quorum_min: number;
+            brand_name?: string;
             /** Format: date-time */
             updated_at: string;
         };
@@ -725,6 +727,7 @@ export interface components {
             raw_retention_days: number;
             agg_retention_days: number;
             default_quorum_min: number;
+            brand_name?: string;
         };
         SeedResult: {
             groups_created: number;

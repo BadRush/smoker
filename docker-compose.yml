@@ -114,6 +114,9 @@ services:
     container_name: smoker-probe-local
     restart: unless-stopped
     network_mode: host
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     depends_on:
       gateway:
         condition: service_healthy

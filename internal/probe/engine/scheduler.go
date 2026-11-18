@@ -12,43 +12,64 @@ import (
 )
 
 const (
-	mtrRollingWindowSize = 15
-	autoMTRCooldown      = 2 * time.Minute
-	autoMTRRetryBackoff  = 30 * time.Second
+	mtrRollingWindowSize  = 15
+	autoMTRRepeatInterval = 15 * time.Minute
+	autoMTRRearmCooldown  = 2 * time.Minute
+	autoMTRRetryBackoff   = 30 * time.Second
+	autoMTRRecoverSamples = 5
 )
 
 type SampleHandler func(protocol.SampleRecord)
-type AutoMTRHandler func(targetID, host, probeType string) error
+type AutoMTRHandler func(targetID, host, probeType, reason string) error
 
 type lossTracker struct {
-	mu              sync.Mutex
-	consecutiveLoss int
-	ring            [mtrRollingWindowSize]bool
-	ringPos         int
-	ringCount       int
-	windowLosses    int
-	lastAutoMTR     time.Time
+	mu                  sync.Mutex
+	consecutiveImpaired int
+	consecutiveHealthy  int
+	ring                [mtrRollingWindowSize]bool
+	lossRing            [mtrRollingWindowSize]bool
+	ringPos             int
+	ringCount           int
+	windowImpaired      int
+	windowLosses        int
+	inIncident          bool
+	lastAutoMTR         time.Time
 }
 
-func (l *lossTracker) record(isLoss bool, threshold int, now time.Time) bool {
+func (l *lossTracker) record(isLoss, isHighLatency bool, threshold int, now time.Time) (bool, string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	isImpaired := isLoss || isHighLatency
+
 	if l.ringCount == mtrRollingWindowSize {
 		if l.ring[l.ringPos] {
+			l.windowImpaired--
+		}
+		if l.lossRing[l.ringPos] {
 			l.windowLosses--
 		}
 	} else {
 		l.ringCount++
 	}
-	l.ring[l.ringPos] = isLoss
+	l.ring[l.ringPos] = isImpaired
+	l.lossRing[l.ringPos] = isLoss
 	l.ringPos = (l.ringPos + 1) % mtrRollingWindowSize
 	if isLoss {
 		l.windowLosses++
-		l.consecutiveLoss++
+	}
+
+	if isImpaired {
+		l.windowImpaired++
+		l.consecutiveImpaired++
+		l.consecutiveHealthy = 0
 	} else {
-		l.consecutiveLoss = 0
-		return false
+		l.consecutiveImpaired = 0
+		l.consecutiveHealthy++
+		if l.inIncident && l.consecutiveHealthy >= autoMTRRecoverSamples {
+			l.inIncident = false
+		}
+		return false, ""
 	}
 
 	effThresh := threshold
@@ -56,21 +77,63 @@ func (l *lossTracker) record(isLoss bool, threshold int, now time.Time) bool {
 		effThresh = 1
 	}
 
-	if l.consecutiveLoss < effThresh && l.windowLosses < effThresh {
-		return false
+	if l.consecutiveImpaired < effThresh && l.windowImpaired < effThresh {
+		return false, ""
 	}
-	if !l.lastAutoMTR.IsZero() && now.Sub(l.lastAutoMTR) <= autoMTRCooldown {
-		return false
+
+	if l.inIncident {
+		// Edge-triggered anti-spam: while continuously impaired, only re-capture at most once every 15m
+		if !l.lastAutoMTR.IsZero() && now.Sub(l.lastAutoMTR) < autoMTRRepeatInterval {
+			return false, ""
+		}
+	} else {
+		// Minimum cooldown between distinct flapping incidents
+		if !l.lastAutoMTR.IsZero() && now.Sub(l.lastAutoMTR) < autoMTRRearmCooldown {
+			return false, ""
+		}
+		l.inIncident = true
 	}
+
 	l.lastAutoMTR = now
-	return true
+	reason := "auto_latency"
+	if isLoss || l.windowLosses > 0 {
+		reason = "auto_loss"
+	}
+	return true, reason
 }
 
-// markFailed shortens cooldown on transient MTR error so next retry happens after 30s instead of 2m.
+// markFailed shortens cooldown on transient MTR error so next retry happens after 30s instead of 15m.
 func (l *lossTracker) markFailed(now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.lastAutoMTR = now.Add(-(autoMTRCooldown - autoMTRRetryBackoff))
+	l.inIncident = false
+	l.lastAutoMTR = now.Add(-(autoMTRRearmCooldown - autoMTRRetryBackoff))
+}
+
+func computeDynamicWarnMs(baselineMs float64, explicitWarnMs int) float64 {
+	if explicitWarnMs > 0 {
+		return float64(explicitWarnMs)
+	}
+	if baselineMs <= 0 {
+		return 0
+	}
+	var factor, minDelta float64
+	if baselineMs < 10 {
+		factor = 2.5
+		minDelta = 12
+	} else if baselineMs < 60 {
+		factor = 1.85
+		minDelta = 22
+	} else {
+		factor = 1.55
+		minDelta = 40
+	}
+	scaled := baselineMs * factor
+	shifted := baselineMs + minDelta
+	if scaled > shifted {
+		return math.Round(scaled)
+	}
+	return math.Round(shifted)
 }
 
 type targetWorker struct {
@@ -158,6 +221,8 @@ func (s *Scheduler) runTargetLoop(ctx context.Context, t protocol.TargetConfig) 
 
 	var hasPrevRTT bool
 	var prevRTTUs int32
+	var healthyCount int
+	var baselineMs float64
 	var tracker lossTracker
 
 	execute := func() {
@@ -193,15 +258,18 @@ func (s *Scheduler) runTargetLoop(ctx context.Context, t protocol.TargetConfig) 
 			TargetID:    t.ID,
 		}
 
+		now := time.Now()
 		if err != nil {
 			rec.IsLoss = true
 			hasPrevRTT = false
-			if t.AutoMTROnLoss && tracker.record(true, t.MTRLossThreshold, time.Now()) && s.onAutoMTR != nil {
-				go func(targetID, host, probeType string) {
-					if mtrErr := s.onAutoMTR(targetID, host, probeType); mtrErr != nil {
-						tracker.markFailed(time.Now())
-					}
-				}(t.ID, t.Host, t.ProbeType)
+			if t.AutoMTROnLoss && s.onAutoMTR != nil {
+				if shouldRun, reason := tracker.record(true, false, t.MTRLossThreshold, now); shouldRun {
+					go func(targetID, host, probeType, trigReason string) {
+						if mtrErr := s.onAutoMTR(targetID, host, probeType, trigReason); mtrErr != nil {
+							tracker.markFailed(time.Now())
+						}
+					}(t.ID, t.Host, t.ProbeType, reason)
+				}
 			}
 		} else {
 			rttUs := int32(rtt.Microseconds())
@@ -214,7 +282,34 @@ func (s *Scheduler) runTargetLoop(ctx context.Context, t protocol.TargetConfig) 
 			}
 			prevRTTUs = rttUs
 			hasPrevRTT = true
-			tracker.record(false, t.MTRLossThreshold, time.Now())
+
+			rttMs := float64(rttUs) / 1000.0
+			healthyCount++
+			if baselineMs <= 0 || healthyCount == 1 {
+				baselineMs = rttMs
+			} else if rttMs < baselineMs {
+				baselineMs = baselineMs*0.65 + rttMs*0.35
+			} else if healthyCount <= 5 {
+				baselineMs = baselineMs*0.8 + rttMs*0.2
+			}
+
+			effBaseline := 0.0
+			if healthyCount >= 5 {
+				effBaseline = baselineMs
+			}
+			warnMs := computeDynamicWarnMs(effBaseline, t.LatencyWarnMs)
+			isHighLat := warnMs > 0 && rttMs >= warnMs
+			if !isHighLat && healthyCount > 5 && rttMs > baselineMs {
+				baselineMs = baselineMs*0.98 + rttMs*0.02
+			}
+
+			if shouldRun, reason := tracker.record(false, isHighLat, t.MTRLossThreshold, now); shouldRun && t.AutoMTROnLoss && s.onAutoMTR != nil {
+				go func(targetID, host, probeType, trigReason string) {
+					if mtrErr := s.onAutoMTR(targetID, host, probeType, trigReason); mtrErr != nil {
+						tracker.markFailed(time.Now())
+					}
+				}(t.ID, t.Host, t.ProbeType, reason)
+			}
 		}
 
 		s.onSample(rec)

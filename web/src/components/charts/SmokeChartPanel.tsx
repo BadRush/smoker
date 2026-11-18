@@ -1,6 +1,13 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Camera, Check, Download, Maximize2, RotateCcw } from "lucide-react";
 import type uPlot from "uplot";
 import { formatAxisTicks24, formatDateTime24 } from "@/lib/date-format";
@@ -44,6 +51,13 @@ async function getUPlot(): Promise<UPlotCtor> {
   return uplotLoader;
 }
 
+export type ExportButtonState = "idle" | "copied" | "downloaded" | "error";
+
+export interface SmokeChartPanelHandle {
+  exportPng: () => Promise<void>;
+  resetZoom: () => void;
+}
+
 interface SmokeChartPanelProps {
   series: ProbeSeriesInput;
   syncKey: string;
@@ -54,11 +68,16 @@ interface SmokeChartPanelProps {
   targetHost?: string;
   rangeLabel?: string;
   windowSec?: number | null;
+  intervalSec?: number | null;
   baselineMs?: number | null;
   warnMs?: number | null;
   showThresholdMeta?: boolean;
   enableExport?: boolean;
+  hideActions?: boolean;
+  probeBadgeTestId?: string;
   onZoomClick?: () => void;
+  onZoomStateChange?: (isZoomed: boolean) => void;
+  onExportStateChange?: (state: ExportButtonState) => void;
 }
 
 interface HoverReadout {
@@ -70,22 +89,33 @@ interface HoverReadout {
   loss: number;
 }
 
-export function SmokeChartPanel({
-  series,
-  syncKey,
-  compact = false,
-  fillHeight = false,
-  fixedHeight,
-  targetName,
-  targetHost,
-  rangeLabel,
-  windowSec,
-  baselineMs,
-  warnMs,
-  showThresholdMeta,
-  enableExport = true,
-  onZoomClick,
-}: SmokeChartPanelProps) {
+export const SmokeChartPanel = forwardRef<
+  SmokeChartPanelHandle,
+  SmokeChartPanelProps
+>(function SmokeChartPanel(
+  {
+    series,
+    syncKey,
+    compact = false,
+    fillHeight = false,
+    fixedHeight,
+    targetName,
+    targetHost,
+    rangeLabel,
+    windowSec,
+    intervalSec,
+    baselineMs,
+    warnMs,
+    showThresholdMeta,
+    enableExport = true,
+    hideActions = false,
+    probeBadgeTestId,
+    onZoomClick,
+    onZoomStateChange,
+    onExportStateChange,
+  },
+  ref
+) {
   const effectiveFillHeight = fillHeight || (fixedHeight !== undefined && fixedHeight > 0);
   const defaultHeight = compact ? (effectiveFillHeight ? 96 : 132) : 210;
   const shouldShowMeta = showThresholdMeta ?? !compact;
@@ -101,6 +131,11 @@ export function SmokeChartPanel({
   warnMsRef.current = effectiveWarnMs;
   const windowSecRef = useRef<number | null>(effectiveWindowSec);
   windowSecRef.current = effectiveWindowSec;
+  const onZoomStateChangeRef = useRef(onZoomStateChange);
+  onZoomStateChangeRef.current = onZoomStateChange;
+  const onExportStateChangeRef = useRef(onExportStateChange);
+  onExportStateChangeRef.current = onExportStateChange;
+
   const [isZoomed, setIsZoomed] = useState(false);
   const isZoomedRef = useRef(false);
   const programmaticScaleRef = useRef(false);
@@ -118,7 +153,18 @@ export function SmokeChartPanel({
   }, [series]);
 
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const [exportState, setExportState] = useState<"idle" | "copied" | "downloaded" | "error">("idle");
+  const [exportState, setExportState] = useState<ExportButtonState>("idle");
+
+  const updateZoomState = (zoomed: boolean) => {
+    isZoomedRef.current = zoomed;
+    setIsZoomed(zoomed);
+    onZoomStateChangeRef.current?.(zoomed);
+  };
+
+  const updateExportState = (state: ExportButtonState) => {
+    setExportState(state);
+    onExportStateChangeRef.current?.(state);
+  };
 
   const displayReadout: HoverReadout = useMemo(() => {
     const idx = hoverIdx !== null && hoverIdx < series.timestamps.length ? hoverIdx : latestIdx;
@@ -144,8 +190,7 @@ export function SmokeChartPanel({
       windowSecRef.current
     );
     if (!plot || !bounds) return;
-    isZoomedRef.current = false;
-    setIsZoomed(false);
+    updateZoomState(false);
     programmaticScaleRef.current = true;
     try {
       plot.setScale?.("x", { min: bounds[0], max: bounds[1] });
@@ -155,7 +200,7 @@ export function SmokeChartPanel({
   }
 
   async function handleExportPng() {
-    if (!containerRef.current) return;
+    if (!containerRef.current && series.timestamps.length === 0) return;
     try {
       const outcome = await exportSmokeChartPng({
         chartContainer: containerRef.current,
@@ -165,13 +210,18 @@ export function SmokeChartPanel({
         rangeLabel,
         warnMs: effectiveWarnMs,
       });
-      setExportState(outcome);
-      setTimeout(() => setExportState("idle"), 2000);
+      updateExportState(outcome);
+      setTimeout(() => updateExportState("idle"), 2000);
     } catch {
-      setExportState("error");
-      setTimeout(() => setExportState("idle"), 2000);
+      updateExportState("error");
+      setTimeout(() => updateExportState("idle"), 2000);
     }
   }
+
+  useImperativeHandle(ref, () => ({
+    exportPng: handleExportPng,
+    resetZoom: handleResetZoom,
+  }));
 
   useEffect(() => {
     const el = containerRef.current;
@@ -297,8 +347,7 @@ export function SmokeChartPanel({
               const max = u.scales.x?.max;
               if (min === undefined || max === undefined) return;
               const zoomed = min > bounds[0] + 2 || max < bounds[1] - 2;
-              isZoomedRef.current = zoomed;
-              setIsZoomed(zoomed);
+              updateZoomState(zoomed);
             },
           ],
         },
@@ -360,7 +409,7 @@ export function SmokeChartPanel({
     const el = containerRef.current;
     if (!plot || !el || !fixedHeight || fixedHeight <= 0) return;
     const w = Math.max(el.clientWidth || sizeRef.current.w, compact ? 220 : 300);
-    const measuredH = el.clientHeight > 20 ? el.clientHeight : Math.max(72, fixedHeight - 28);
+    const measuredH = el.clientHeight > 20 ? el.clientHeight : Math.max(72, fixedHeight - 24);
     const h = Math.max(72, Math.floor(measuredH));
     if (w !== sizeRef.current.w || h !== sizeRef.current.h) {
       sizeRef.current = { w, h };
@@ -374,8 +423,7 @@ export function SmokeChartPanel({
     prevWindowKeyRef.current = nextRangeKey;
 
     if (rangeChanged) {
-      isZoomedRef.current = false;
-      setIsZoomed(false);
+      updateZoomState(false);
     }
 
     if (plotRef.current && series.timestamps.length > 0) {
@@ -415,6 +463,10 @@ export function SmokeChartPanel({
     warnMs: effectiveWarnMs,
   });
 
+  const showTopActionBar =
+    !hideActions &&
+    Boolean(isZoomed || onZoomClick || (enableExport && hasData) || (!compact && displayReadout.ts));
+
   return (
     <section
       aria-label={`Latency smoke chart from ${series.probe_name}`}
@@ -422,109 +474,18 @@ export function SmokeChartPanel({
       style={fixedHeight && fixedHeight > 0 ? { height: fixedHeight } : undefined}
       className={
         fixedHeight && fixedHeight > 0
-          ? "group flex shrink-0 min-h-0 flex-col rounded border border-border/40 bg-canvas/35 px-2 py-1 overflow-hidden"
+          ? "group flex shrink-0 min-h-0 flex-col gap-1 overflow-hidden"
           : effectiveFillHeight
-          ? "group flex flex-1 min-h-0 flex-col rounded border border-border/40 bg-canvas/35 px-2 py-1 overflow-hidden"
+          ? "group flex flex-1 min-h-0 flex-col gap-1 overflow-hidden"
           : compact
-          ? "group rounded-md border border-border/60 bg-canvas/45 p-2.5"
-          : "group rounded-lg border border-border bg-surface p-4"
+          ? "group flex flex-col gap-1.5"
+          : "group rounded-lg border border-border bg-surface p-4 space-y-2.5"
       }
     >
-      <div
-        className={
-          effectiveFillHeight
-            ? "mb-1 flex shrink-0 flex-nowrap items-center justify-between gap-1.5 min-w-0"
-            : compact
-            ? "mb-1.5 flex flex-wrap items-center justify-between gap-2 min-w-0"
-            : "mb-3 flex flex-wrap items-center justify-between gap-3 min-w-0"
-        }
-      >
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2 min-w-0">
-            <h3
-              className={
-                compact
-                  ? "truncate text-xs font-semibold text-zinc-200"
-                  : "truncate text-sm font-semibold text-zinc-100"
-              }
-            >
-              {series.probe_name}
-            </h3>
-            {!compact && series.location_label && (
-              <span className="rounded border border-border bg-elevated px-2 py-0.5 text-[11px] font-mono text-zinc-400">
-                {series.location_label}
-              </span>
-            )}
-          </div>
-        </div>
-
-        <div className="flex min-w-0 shrink items-center justify-end gap-1.5">
-          <div
-            className={
-              compact
-                ? "flex min-w-0 shrink items-center gap-1.5 overflow-hidden whitespace-nowrap text-[10px] sm:text-[11px] font-mono tabular-nums"
-                : "flex flex-wrap items-center gap-4 text-xs font-mono tabular-nums"
-            }
-          >
-            {!compact && displayReadout.ts && (
-              <span className="text-zinc-400">
-                {formatDateTime24(displayReadout.ts)}
-              </span>
-            )}
-            {!compact && (
-              <div title="Minimum RTT — best observed path latency">
-                <span className="text-zinc-400 mr-1 cursor-help">BEST</span>
-                <span className="text-zinc-200">{formatMs(displayReadout.min)}</span>
-              </div>
-            )}
-            <div title="Typical median latency (50th percentile)">
-              <span className="text-zinc-400 mr-1 cursor-help">NORMAL</span>
-              <span
-                className={
-                  readoutSeverity === "critical"
-                    ? "text-rose-400 font-semibold"
-                    : readoutSeverity === "warn"
-                    ? "text-amber-400 font-semibold"
-                    : "text-emerald-400 font-semibold"
-                }
-              >
-                {formatMs(displayReadout.p50)}
-              </span>
-            </div>
-            {shouldShowMeta && effectiveBaselineMs !== null && (
-              <div title="Learned best-path baseline RTT from this probe">
-                <span className="text-zinc-400 mr-1 cursor-help">BASE</span>
-                <span className="text-zinc-200">{formatMs(effectiveBaselineMs)}</span>
-              </div>
-            )}
-            {shouldShowMeta && effectiveWarnMs !== null && (
-              <div title="Auto-computed latency warning threshold for this probe">
-                <span className="text-zinc-400 mr-1 cursor-help">WARN</span>
-                <span className="text-amber-300">{formatMs(effectiveWarnMs)}</span>
-              </div>
-            )}
-            <div title="High-water latency (95th percentile, excl. top 5% spikes)">
-              <span className="text-zinc-400 mr-1 cursor-help">HIGH</span>
-              <span className="text-cyan-400">{formatMs(displayReadout.p95)}</span>
-            </div>
-            {!compact && (
-              <div title="Round-trip delay variation (stability)">
-                <span className="text-zinc-400 mr-1 cursor-help">JITTER</span>
-                <span className="text-zinc-300">{formatMs(displayReadout.jitter)}</span>
-              </div>
-            )}
-            <div title="Packet loss percentage">
-              <span className="text-zinc-400 mr-1 cursor-help">LOSS</span>
-              <span
-                className={
-                  displayReadout.loss > 0
-                    ? "text-rose-400 font-semibold"
-                    : "text-zinc-300"
-                }
-              >
-                {formatLoss(displayReadout.loss)}
-              </span>
-            </div>
+      {showTopActionBar && (
+        <div className="flex shrink-0 items-center justify-between gap-2 min-w-0">
+          <div className="min-w-0 flex-1 font-mono text-xs text-zinc-400 truncate">
+            {!compact && displayReadout.ts ? formatDateTime24(displayReadout.ts) : null}
           </div>
 
           <div className="flex shrink-0 items-center gap-1">
@@ -592,88 +553,182 @@ export function SmokeChartPanel({
             )}
           </div>
         </div>
-      </div>
+      )}
 
-      {series.timestamps.length === 0 ? (
-        onZoomClick ? (
-          <button
-            type="button"
-            onClick={onZoomClick}
-            data-testid="smoke-chart-empty-zoom"
-            style={effectiveFillHeight ? undefined : { height: defaultHeight }}
-            className={`${
-              effectiveFillHeight ? "flex-1 min-h-[72px]" : ""
-            } flex w-full flex-col items-center justify-center rounded border border-dashed border-border bg-canvas/50 px-2 text-center text-xs font-mono text-zinc-400 cursor-zoom-in transition-colors hover:border-emerald-500/40 hover:text-zinc-200`}
-          >
-            <span>Waiting for telemetry samples from this probe...</span>
-            <span className="mt-1 inline-flex items-center gap-1 text-[10px] text-emerald-400">
-              <Maximize2 className="h-3 w-3" aria-hidden="true" />
-              Click to zoom &amp; inspect MTR
-            </span>
-          </button>
+      {/* Clean Graph Box (No text or buttons inside graph area) */}
+      <div
+        className={
+          effectiveFillHeight
+            ? "flex flex-1 min-h-0 flex-col rounded border border-border/40 bg-canvas/35 px-1.5 py-0.5 overflow-hidden"
+            : compact
+            ? "rounded border border-border/50 bg-canvas/40 px-2 py-1 overflow-hidden"
+            : "rounded-md border border-border/60 bg-canvas/40 p-2 overflow-hidden"
+        }
+      >
+        {series.timestamps.length === 0 ? (
+          onZoomClick ? (
+            <button
+              type="button"
+              onClick={onZoomClick}
+              data-testid="smoke-chart-empty-zoom"
+              style={effectiveFillHeight ? undefined : { height: defaultHeight }}
+              className={`${
+                effectiveFillHeight ? "flex-1 min-h-[72px]" : ""
+              } flex w-full flex-col items-center justify-center rounded border border-dashed border-border bg-canvas/50 px-2 text-center text-xs font-mono text-zinc-400 cursor-zoom-in transition-colors hover:border-emerald-500/40 hover:text-zinc-200`}
+            >
+              <span>Waiting for telemetry samples from this probe...</span>
+              <span className="mt-1 inline-flex items-center gap-1 text-[10px] text-emerald-400">
+                <Maximize2 className="h-3 w-3" aria-hidden="true" />
+                Click to zoom &amp; inspect MTR
+              </span>
+            </button>
+          ) : (
+            <div
+              style={effectiveFillHeight ? undefined : { height: defaultHeight }}
+              className={
+                effectiveFillHeight
+                  ? "flex flex-1 min-h-[72px] items-center justify-center rounded border border-dashed border-border bg-canvas/50 text-xs font-mono text-zinc-400"
+                  : "flex items-center justify-center rounded border border-dashed border-border bg-canvas/50 text-xs font-mono text-zinc-400"
+              }
+            >
+              Waiting for telemetry samples from this probe...
+            </div>
+          )
         ) : (
           <div
-            style={effectiveFillHeight ? undefined : { height: defaultHeight }}
-            className={
-              effectiveFillHeight
-                ? "flex flex-1 min-h-[72px] items-center justify-center rounded border border-dashed border-border bg-canvas/50 text-xs font-mono text-zinc-400"
-                : "flex items-center justify-center rounded border border-dashed border-border bg-canvas/50 text-xs font-mono text-zinc-400"
-            }
-          >
-            Waiting for telemetry samples from this probe...
-          </div>
-        )
-      ) : (
-        <div
-          ref={containerRef}
-          onDoubleClick={handleResetZoom}
-          onPointerDown={(e) => {
-            if (e.pointerType === "mouse" && e.button !== 0) return;
-            suppressNextClickRef.current = false;
-            pointerDownPosRef.current = { x: e.clientX ?? 0, y: e.clientY ?? 0 };
-          }}
-          onMouseDown={(e) => {
-            if (e.button !== 0 || pointerDownPosRef.current) return;
-            suppressNextClickRef.current = false;
-            pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
-          }}
-          onPointerCancel={() => {
-            pointerDownPosRef.current = null;
-            suppressNextClickRef.current = false;
-          }}
-          onPointerUp={(e) => {
-            const start = pointerDownPosRef.current;
-            pointerDownPosRef.current = null;
-            if (!start) return;
-            const dx = Math.abs((e.clientX ?? 0) - start.x);
-            const dy = Math.abs((e.clientY ?? 0) - start.y);
-            if (dx >= 8 || dy >= 8) {
-              suppressNextClickRef.current = true;
-            }
-          }}
-          onMouseUp={(e) => {
-            const start = pointerDownPosRef.current;
-            if (!start) return;
-            pointerDownPosRef.current = null;
-            const dx = Math.abs(e.clientX - start.x);
-            const dy = Math.abs(e.clientY - start.y);
-            if (dx >= 8 || dy >= 8) {
-              suppressNextClickRef.current = true;
-            }
-          }}
-          onClick={() => {
-            if (suppressNextClickRef.current) {
+            ref={containerRef}
+            onDoubleClick={handleResetZoom}
+            onPointerDown={(e) => {
+              if (e.pointerType === "mouse" && e.button !== 0) return;
               suppressNextClickRef.current = false;
-              return;
-            }
-            onZoomClick?.();
-          }}
-          style={effectiveFillHeight ? undefined : { minHeight: defaultHeight }}
-          className={`${
-            effectiveFillHeight ? "flex-1 min-h-[72px] w-full overflow-hidden" : "w-full"
-          } ${onZoomClick ? "cursor-zoom-in" : ""}`}
-        />
-      )}
+              pointerDownPosRef.current = { x: e.clientX ?? 0, y: e.clientY ?? 0 };
+            }}
+            onMouseDown={(e) => {
+              if (e.button !== 0 || pointerDownPosRef.current) return;
+              suppressNextClickRef.current = false;
+              pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
+            }}
+            onPointerCancel={() => {
+              pointerDownPosRef.current = null;
+              suppressNextClickRef.current = false;
+            }}
+            onPointerUp={(e) => {
+              const start = pointerDownPosRef.current;
+              pointerDownPosRef.current = null;
+              if (!start) return;
+              const dx = Math.abs((e.clientX ?? 0) - start.x);
+              const dy = Math.abs((e.clientY ?? 0) - start.y);
+              if (dx >= 8 || dy >= 8) {
+                suppressNextClickRef.current = true;
+              }
+            }}
+            onMouseUp={(e) => {
+              const start = pointerDownPosRef.current;
+              if (!start) return;
+              pointerDownPosRef.current = null;
+              const dx = Math.abs(e.clientX - start.x);
+              const dy = Math.abs(e.clientY - start.y);
+              if (dx >= 8 || dy >= 8) {
+                suppressNextClickRef.current = true;
+              }
+            }}
+            onClick={() => {
+              if (suppressNextClickRef.current) {
+                suppressNextClickRef.current = false;
+                return;
+              }
+              onZoomClick?.();
+            }}
+            style={effectiveFillHeight ? undefined : { minHeight: defaultHeight }}
+            className={`${
+              effectiveFillHeight ? "flex-1 min-h-[72px] w-full overflow-hidden" : "w-full"
+            } ${onZoomClick ? "cursor-zoom-in" : ""}`}
+          />
+        )}
+      </div>
+
+      {/* Bottom Footer Row: Probe Info (Bottom-Left) + NORMAL/HIGH/LOSS Readouts (Bottom-Right) */}
+      <div
+        className={
+          compact
+            ? "flex h-[18px] shrink-0 items-center justify-between gap-2 border-t border-border/50 pt-0.5 text-[10px] sm:text-[11px] font-mono tabular-nums min-w-0"
+            : "flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-2 text-xs font-mono tabular-nums min-w-0"
+        }
+      >
+        <div className="min-w-0 flex-1 truncate text-zinc-400">
+          <span
+            data-testid={probeBadgeTestId}
+            className={compact ? "font-medium text-zinc-300" : "font-semibold text-zinc-100"}
+          >
+            {series.probe_name}
+          </span>
+          {series.location_label ? ` · ${series.location_label}` : ""}
+          {intervalSec ? ` · Every ${intervalSec}s` : ""}
+        </div>
+
+        <div
+          className={
+            compact
+              ? "flex min-w-0 shrink-0 items-center gap-2 overflow-hidden whitespace-nowrap"
+              : "flex flex-wrap items-center gap-4"
+          }
+        >
+          {!compact && (
+            <div title="Minimum RTT — best observed path latency">
+              <span className="text-zinc-400 mr-1 cursor-help">BEST</span>
+              <span className="text-zinc-200">{formatMs(displayReadout.min)}</span>
+            </div>
+          )}
+          <div title="Typical median latency (50th percentile)">
+            <span className="text-zinc-400 mr-1 cursor-help">NORMAL</span>
+            <span
+              className={
+                readoutSeverity === "critical"
+                  ? "text-rose-400 font-semibold"
+                  : readoutSeverity === "warn"
+                  ? "text-amber-400 font-semibold"
+                  : "text-emerald-400 font-semibold"
+              }
+            >
+              {formatMs(displayReadout.p50)}
+            </span>
+          </div>
+          {shouldShowMeta && effectiveBaselineMs !== null && (
+            <div title="Learned best-path baseline RTT from this probe">
+              <span className="text-zinc-400 mr-1 cursor-help">BASE</span>
+              <span className="text-zinc-200">{formatMs(effectiveBaselineMs)}</span>
+            </div>
+          )}
+          {shouldShowMeta && effectiveWarnMs !== null && (
+            <div title="Auto-computed latency warning threshold for this probe">
+              <span className="text-zinc-400 mr-1 cursor-help">WARN</span>
+              <span className="text-amber-300">{formatMs(effectiveWarnMs)}</span>
+            </div>
+          )}
+          <div title="High-water latency (95th percentile, excl. top 5% spikes)">
+            <span className="text-zinc-400 mr-1 cursor-help">HIGH</span>
+            <span className="text-cyan-400">{formatMs(displayReadout.p95)}</span>
+          </div>
+          {!compact && (
+            <div title="Round-trip delay variation (stability)">
+              <span className="text-zinc-400 mr-1 cursor-help">JITTER</span>
+              <span className="text-zinc-300">{formatMs(displayReadout.jitter)}</span>
+            </div>
+          )}
+          <div title="Packet loss percentage">
+            <span className="text-zinc-400 mr-1 cursor-help">LOSS</span>
+            <span
+              className={
+                displayReadout.loss > 0
+                  ? "text-rose-400 font-semibold"
+                  : "text-zinc-300"
+              }
+            >
+              {formatLoss(displayReadout.loss)}
+            </span>
+          </div>
+        </div>
+      </div>
     </section>
   );
-}
+});

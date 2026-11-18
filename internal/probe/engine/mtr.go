@@ -103,6 +103,16 @@ func openMTRSocket(isV6 bool, bindIP net.IP) (*icmp.PacketConn, int, bool, error
 		if c, err := icmp.ListenPacket("ip6:ipv6-icmp", addr); err == nil {
 			return c, 58, true, nil
 		}
+		if c, err := icmp.ListenPacket("udp6", addr); err == nil {
+			return c, 58, false, nil
+		}
+		if addr != "::" {
+			if c, err := icmp.ListenPacket("ip6:ipv6-icmp", "::"); err == nil {
+				return c, 58, true, nil
+			}
+			c, err := icmp.ListenPacket("udp6", "::")
+			return c, 58, false, err
+		}
 		c, err := icmp.ListenPacket("udp6", addr)
 		return c, 58, false, err
 	}
@@ -112,6 +122,16 @@ func openMTRSocket(isV6 bool, bindIP net.IP) (*icmp.PacketConn, int, bool, error
 	}
 	if c, err := icmp.ListenPacket("ip4:icmp", addr); err == nil {
 		return c, 1, true, nil
+	}
+	if c, err := icmp.ListenPacket("udp4", addr); err == nil {
+		return c, 1, false, nil
+	}
+	if addr != "0.0.0.0" {
+		if c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0"); err == nil {
+			return c, 1, true, nil
+		}
+		c, err := icmp.ListenPacket("udp4", "0.0.0.0")
+		return c, 1, false, err
 	}
 	c, err := icmp.ListenPacket("udp4", addr)
 	return c, 1, false, err
@@ -450,7 +470,10 @@ func resolveHopHosts(parentCtx context.Context, hops []protocol.MTRHop) {
 			defer wg.Done()
 			names, err := net.DefaultResolver.LookupAddr(ctx, ipAddr)
 			if err != nil || len(names) == 0 {
-				return
+				names, err = fallbackPublicDNSResolver.LookupAddr(ctx, ipAddr)
+				if err != nil || len(names) == 0 {
+					return
+				}
 			}
 			host := strings.TrimSuffix(strings.TrimSpace(names[0]), ".")
 			if host == "" {

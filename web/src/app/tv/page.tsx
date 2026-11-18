@@ -5,8 +5,10 @@ import Link from "next/link";
 import {
   Activity,
   AlertTriangle,
+  Camera,
   Check,
   Copy,
+  Download,
   Flame,
   LayoutGrid,
   Maximize2,
@@ -14,13 +16,18 @@ import {
   Pin,
   Play,
   Radio,
+  RotateCcw,
   Search,
   Settings2,
   Volume2,
   VolumeX,
   X,
 } from "lucide-react";
-import { SmokeChartPanel } from "@/components/charts/SmokeChartPanel";
+import {
+  SmokeChartPanel,
+  type ExportButtonState,
+  type SmokeChartPanelHandle,
+} from "@/components/charts/SmokeChartPanel";
 import { TargetZoomModal } from "@/components/charts/TargetZoomModal";
 import {
   DisplaySizeControls,
@@ -34,6 +41,7 @@ import {
   type ProbeSeries,
 } from "@/lib/api";
 import { formatDateTime24 } from "@/lib/date-format";
+import { saveEvidenceBrandName } from "@/lib/export-chart-png";
 import {
   parseWidthSpec,
   type FlowMode,
@@ -145,7 +153,7 @@ function FocalTargetCard({
   const focalProbeLabel =
     item.focalProbeName ??
     (focalCell ? probeMap.get(focalCell.probe_id) ?? "Probe" : "Probe");
-  const focalSeries = focalCell
+  const rawFocalSeries = focalCell
     ? mergeProbeSeriesWithCell(
         seriesMap.get(focalCell.probe_id),
         focalCell,
@@ -153,6 +161,18 @@ function FocalTargetCard({
         range
       )
     : null;
+  const focalSeries = rawFocalSeries
+    ? {
+        ...rawFocalSeries,
+        location_label:
+          rawFocalSeries.location_label || item.focalProbeLocation || "",
+      }
+    : null;
+
+  const chartRef = useRef<SmokeChartPanelHandle | null>(null);
+  const [isChartZoomed, setIsChartZoomed] = useState(false);
+  const [exportState, setExportState] = useState<ExportButtonState>("idle");
+  const hasChartData = Boolean(focalSeries && focalSeries.timestamps.length > 0);
 
   const cardBorderClass = isHighlight
     ? isImpaired
@@ -177,7 +197,7 @@ function FocalTargetCard({
       }
       className={`flex w-full shrink-0 flex-col justify-between gap-1 rounded-lg border p-2 overflow-hidden ${cardBorderClass}`}
     >
-      {/* Compact Header (2 tight rows: Target + Status, Host + Multi-Probe Switcher) */}
+      {/* Compact Header (2 tight rows: Target + Actions/Status on row 1, Host + optional Multi-Probe Switcher on row 2) */}
       <div className="flex shrink-0 flex-col gap-0.5">
         <div className="flex h-5 items-center justify-between gap-1.5 min-w-0">
           <div className="flex items-center gap-1.5 min-w-0">
@@ -207,30 +227,78 @@ function FocalTargetCard({
             )}
           </div>
 
-          <span
-            className={`inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0 text-[10px] font-mono font-semibold leading-tight ${vis.badgeClass}`}
-          >
-            <span className={`h-1.5 w-1.5 rounded-full ${vis.dotClass}`} />
-            {vis.label}
-          </span>
+          <div className="flex shrink-0 items-center gap-1">
+            {isChartZoomed && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  chartRef.current?.resetZoom();
+                }}
+                data-testid="reset-zoom-btn"
+                title="Reset time zoom to full window"
+                aria-label="Reset zoom"
+                className="inline-flex items-center gap-1 rounded border border-amber-500/50 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-mono font-semibold text-amber-300 transition-colors hover:bg-amber-500/25"
+              >
+                <RotateCcw className="h-3 w-3" aria-hidden="true" />
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onZoomTarget(target.id);
+              }}
+              data-testid="zoom-chart-btn"
+              title="Zoom & inspect target graph"
+              aria-label="Zoom graph"
+              className="inline-flex items-center gap-1 rounded border border-border bg-elevated/90 px-1.5 py-0.5 text-[10px] font-mono text-zinc-200 transition-colors hover:border-emerald-500/50 hover:text-emerald-300"
+            >
+              <Maximize2 className="h-3 w-3" aria-hidden="true" />
+            </button>
+
+            {hasChartData && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void chartRef.current?.exportPng();
+                }}
+                data-testid="copy-chart-png-btn"
+                title="Copy evidence graph as PNG to clipboard"
+                aria-label="Copy graph as PNG"
+                className="inline-flex items-center gap-1 rounded border border-border bg-elevated/90 px-1.5 py-0.5 text-[10px] font-mono text-zinc-200 transition-colors hover:border-cyan-500/50 hover:text-cyan-300"
+              >
+                {exportState === "copied" ? (
+                  <>
+                    <Check className="h-3 w-3 text-emerald-400" aria-hidden="true" />
+                    <span className="text-emerald-400">Copied</span>
+                  </>
+                ) : exportState === "downloaded" ? (
+                  <>
+                    <Download className="h-3 w-3 text-cyan-400" aria-hidden="true" />
+                    <span className="text-cyan-300">Saved</span>
+                  </>
+                ) : exportState === "error" ? (
+                  <span className="text-rose-400">Err</span>
+                ) : (
+                  <Camera className="h-3 w-3" aria-hidden="true" />
+                )}
+              </button>
+            )}
+
+            <span
+              data-testid="tv-card-status-badge"
+              className={`inline-flex shrink-0 items-center rounded border px-1.5 py-0 text-[10px] font-mono font-semibold leading-tight ${vis.badgeClass}`}
+            >
+              {vis.label}
+            </span>
+          </div>
         </div>
 
         <div className="flex h-4 items-center justify-between gap-2 min-w-0 text-[11px]">
           <div className="flex items-center gap-1.5 min-w-0">
-            {isPerProbeCard && (
-              <span
-                data-testid="tv-card-probe-badge"
-                title={
-                  item.focalProbeLocation
-                    ? `${focalProbeLabel} · ${item.focalProbeLocation}`
-                    : focalProbeLabel
-                }
-                className="inline-flex shrink-0 items-center gap-1 rounded border border-cyan-500/40 bg-cyan-500/15 px-1.5 py-0 text-[10px] font-mono font-semibold text-cyan-300"
-              >
-                <Radio className="h-2.5 w-2.5 shrink-0" aria-hidden="true" />
-                <span className="max-w-[115px] truncate">{focalProbeLabel}</span>
-              </span>
-            )}
             <p
               title={groupName ? `${target.host} · ${groupName}` : target.host}
               className="min-w-0 truncate font-mono text-zinc-400"
@@ -272,40 +340,62 @@ function FocalTargetCard({
         </div>
       </div>
 
-      {/* Focal 7:3 SmokePing Chart Panel */}
+      {/* Focal 7:3 SmokePing Chart Panel + Bottom Footer */}
       <div
         data-testid={isHighlight ? "tv-highlight-probe-row" : "tv-focal-probe-row"}
-        className="flex shrink-0 flex-col overflow-hidden"
+        className="flex flex-1 min-h-0 flex-col overflow-hidden"
       >
         {!focalCell || !focalSeries ? (
-          <button
-            type="button"
-            onClick={() => onZoomTarget(target.id)}
-            data-testid="zoom-chart-btn"
-            style={{ height: layout.panelHeight }}
-            className="flex w-full flex-col items-center justify-center gap-1 rounded-md border border-dashed border-border bg-canvas/50 px-2 text-center text-xs font-mono text-zinc-400 cursor-zoom-in transition-colors hover:border-emerald-500/40 hover:text-zinc-200"
-          >
-            <span>
-              {isPerProbeCard
-                ? `Waiting for ${focalProbeLabel} telemetry...`
-                : "Waiting for probe telemetry..."}
-            </span>
-            <span className="inline-flex items-center gap-1 text-[10px] text-emerald-400">
-              <Maximize2 className="h-3 w-3" aria-hidden="true" />
-              Click to zoom &amp; inspect MTR
-            </span>
-          </button>
+          <div className="flex flex-1 min-h-0 flex-col gap-1 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => onZoomTarget(target.id)}
+              style={{ height: layout.panelHeight }}
+              className="flex flex-1 min-h-[72px] w-full flex-col items-center justify-center gap-1 rounded-md border border-dashed border-border bg-canvas/50 px-2 text-center text-xs font-mono text-zinc-400 cursor-zoom-in transition-colors hover:border-emerald-500/40 hover:text-zinc-200"
+            >
+              <span>
+                {isPerProbeCard
+                  ? `Waiting for ${focalProbeLabel} telemetry...`
+                  : "Waiting for probe telemetry..."}
+              </span>
+              <span className="inline-flex items-center gap-1 text-[10px] text-emerald-400">
+                <Maximize2 className="h-3 w-3" aria-hidden="true" />
+                Click to zoom &amp; inspect MTR
+              </span>
+            </button>
+            <div className="flex h-[18px] shrink-0 items-center justify-between gap-2 border-t border-border/50 pt-0.5 text-[10px] font-mono tabular-nums text-zinc-400">
+              <div className="min-w-0 flex-1 truncate">
+                <span
+                  data-testid={isPerProbeCard ? "tv-card-probe-badge" : undefined}
+                  className="font-medium text-zinc-300"
+                >
+                  {focalProbeLabel}
+                </span>
+                {item.focalProbeLocation ? ` · ${item.focalProbeLocation}` : ""}
+                {` · Every ${target.interval_sec}s`}
+              </div>
+              <div className="flex shrink-0 items-center gap-2 whitespace-nowrap">
+                <span>NORMAL —</span>
+                <span>HIGH —</span>
+                <span>LOSS 0.0%</span>
+              </div>
+            </div>
+          </div>
         ) : (
           <SmokeChartPanel
+            ref={chartRef}
             compact
             fillHeight
-            fixedHeight={layout.panelHeight}
+            hideActions
+            fixedHeight={layout.panelHeight + 18}
             syncKey={`tv-${isHighlight ? "hi" : "grid"}-${target.id}`}
             series={focalSeries}
             targetName={target.name}
             targetHost={target.host}
             rangeLabel={range}
             windowSec={rangeKeyToSeconds(range)}
+            intervalSec={target.interval_sec}
+            probeBadgeTestId={isPerProbeCard ? "tv-card-probe-badge" : undefined}
             baselineMs={focalCell.baseline_ms ?? focalSeries.baseline_ms ?? null}
             warnMs={resolveEffectiveWarnMs({
               cellWarnMs: focalCell.warn_ms,
@@ -316,23 +406,10 @@ function FocalTargetCard({
             })}
             showThresholdMeta={Boolean(isHighlight)}
             onZoomClick={() => onZoomTarget(target.id)}
+            onZoomStateChange={setIsChartZoomed}
+            onExportStateChange={setExportState}
           />
         )}
-      </div>
-
-      {/* Compact Footer */}
-      <div className="flex h-[18px] shrink-0 items-center justify-between border-t border-border/50 pt-0.5 text-[10px] font-mono tabular-nums text-zinc-400">
-        <span className="truncate">
-          {isPerProbeCard
-            ? `${focalProbeLabel}${item.focalProbeLocation ? ` · ${item.focalProbeLocation}` : ""} · Every ${target.interval_sec}s`
-            : cells.length > 1
-            ? `${cells.length} probes · Every ${target.interval_sec}s`
-            : `Every ${target.interval_sec}s`}
-        </span>
-        <span className="shrink-0">
-          Peak {formatMs(item.maxP95Ms)}
-          {item.maxLossPct > 0 ? ` · Loss ${formatLoss(item.maxLossPct)}` : ""}
-        </span>
       </div>
     </article>
   );
@@ -462,6 +539,9 @@ export default function NocTvWallboardPage() {
     try {
       setError(null);
       const snap = await apiRequest<MatrixSnapshot>("/api/tv/matrix");
+      if (snap.brand_name !== undefined) {
+        saveEvidenceBrandName(snap.brand_name);
+      }
       setData(snap);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load NOC TV matrix");
@@ -927,12 +1007,13 @@ export default function NocTvWallboardPage() {
     return () => clearInterval(timer);
   }, [cfg.rotateSec, paused, zoomTargetId, totalSlides]);
 
-  // Keyboard shortcuts: "/" opens Search & Protocol Filter bar, "Escape" closes bar or drawer
+  // Keyboard shortcuts: Ctrl+F or "/" opens Search & Protocol Filter bar, "Escape" closes bar or drawer
   useEffect(() => {
     if (typeof window === "undefined") return;
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
       const inInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+      const isCtrlF = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f";
       if (e.key === "Escape") {
         if (zoomTargetId !== null) return;
         if (showSearch) {
@@ -946,10 +1027,13 @@ export default function NocTvWallboardPage() {
         if (showDrawer) {
           setShowDrawer(false);
         }
-      } else if (e.key === "/" && !inInput && !showDrawer && zoomTargetId === null) {
+      } else if ((isCtrlF || (e.key === "/" && !inInput)) && !showDrawer && zoomTargetId === null) {
         e.preventDefault();
         setShowSearch(true);
-        setTimeout(() => searchInputRef.current?.focus(), 30);
+        setTimeout(() => {
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select();
+        }, 30);
       }
     };
     window.addEventListener("keydown", onKeyDown);

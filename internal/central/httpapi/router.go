@@ -61,7 +61,7 @@ type Store interface {
 	CountOpenIncidents(ctx context.Context) (int, error)
 
 	GetSettings(ctx context.Context) (db.SystemSettings, error)
-	UpdateSettingsAndRetention(ctx context.Context, rawDays, aggDays, defaultQuorum int) (db.SystemSettings, error)
+	UpdateSettingsAndRetention(ctx context.Context, rawDays, aggDays, defaultQuorum int, brandName string) (db.SystemSettings, error)
 }
 
 type HubController interface {
@@ -134,6 +134,7 @@ func NewRouter(deps Dependencies) http.Handler {
 	r.Get("/api/tv/matrix", s.handleGetTVMatrix)
 	r.Get("/api/tv/series", s.handleGetTVSeries)
 	r.Get("/api/tv/targets/{id}/mtr", s.handleListTVTargetMTR)
+	r.Post("/api/tv/targets/{id}/mtr/run", s.handleTriggerTVTargetMTR)
 	r.Post("/api/targets/{id}/simulate", s.handleSimulateTarget)
 
 	// Protected API Routes

@@ -15,6 +15,8 @@ interface MtrSnapshotsPanelProps {
   probes?: ProbeOption[];
   running?: boolean;
   errorMessage?: string | null;
+  selectedProbeId?: string;
+  onChangeSelectedProbeId?: (probeId: string) => void;
   onRunNow?: (probeId?: string) => void;
 }
 
@@ -23,9 +25,16 @@ export function MtrSnapshotsPanel({
   probes = [],
   running = false,
   errorMessage = null,
+  selectedProbeId: controlledProbeId,
+  onChangeSelectedProbeId,
   onRunNow,
 }: MtrSnapshotsPanelProps) {
-  const [selectedProbeId, setSelectedProbeId] = useState<string>("");
+  const [internalProbeId, setInternalProbeId] = useState<string>("");
+  const selectedProbeId = controlledProbeId !== undefined ? controlledProbeId : internalProbeId;
+  const handleProbeChange = (val: string) => {
+    setInternalProbeId(val);
+    onChangeSelectedProbeId?.(val);
+  };
   const visibleSnapshots = selectedProbeId
     ? snapshots.filter((s) => s.probe_id === selectedProbeId)
     : snapshots;
@@ -33,6 +42,7 @@ export function MtrSnapshotsPanel({
   return (
     <section
       aria-label="MTR Path Snapshots"
+      data-testid="mtr-snapshots-panel"
       className="rounded-lg border border-border bg-surface p-4"
     >
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -48,7 +58,7 @@ export function MtrSnapshotsPanel({
             <select
               aria-label="Select probe for manual MTR"
               value={selectedProbeId}
-              onChange={(e) => setSelectedProbeId(e.target.value)}
+              onChange={(e) => handleProbeChange(e.target.value)}
               className="rounded-md border border-border bg-canvas px-2.5 py-1.5 text-xs font-mono text-zinc-200"
             >
               <option value="">All Online Probes</option>
@@ -63,6 +73,7 @@ export function MtrSnapshotsPanel({
           {onRunNow && (
             <button
               type="button"
+              data-testid="mtr-run-now-btn"
               onClick={() => onRunNow(selectedProbeId || undefined)}
               disabled={running}
               aria-busy={running}
@@ -87,7 +98,7 @@ export function MtrSnapshotsPanel({
 
       {visibleSnapshots.length === 0 ? (
         <div className="rounded border border-dashed border-border bg-canvas/50 p-6 text-center text-xs text-zinc-400">
-          No MTR snapshots recorded yet. Snapshots trigger automatically on consecutive or intermittent packet loss, or on demand.
+          No MTR snapshots recorded yet. Snapshots trigger automatically on sustained packet loss or high latency, or on demand via Run MTR Now.
         </div>
       ) : (
         <div className="space-y-4">
@@ -100,10 +111,16 @@ export function MtrSnapshotsPanel({
                     className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
                       snap.trigger_reason === "auto_loss"
                         ? "bg-rose-500/20 text-rose-300 border border-rose-500/30"
+                        : snap.trigger_reason === "auto_latency"
+                        ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
                         : "bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"
                     }`}
                   >
-                    {snap.trigger_reason === "auto_loss" ? "AUTO LOSS" : "MANUAL"}
+                    {snap.trigger_reason === "auto_loss"
+                      ? "AUTO LOSS"
+                      : snap.trigger_reason === "auto_latency"
+                      ? "AUTO HIGH RTT"
+                      : "MANUAL"}
                   </span>
                 </div>
                 <span className="text-zinc-400">

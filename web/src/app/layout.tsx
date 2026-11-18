@@ -6,6 +6,10 @@ export const metadata: Metadata = {
   title: "Smoker — Distributed Latency & NOC Observability",
   description:
     "Real-time distributed SmokePing, zero-gap Metro store-and-forward probing, and multi-probe quorum alerting.",
+  icons: {
+    icon: "/icon.svg",
+    shortcut: "/icon.svg",
+  },
 };
 
 export default function RootLayout({

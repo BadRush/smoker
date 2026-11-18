@@ -2,10 +2,25 @@ import { describe, expect, it } from "vitest";
 import {
   buildEvidenceFilename,
   computeSeriesSummary,
+  DEFAULT_EVIDENCE_BRAND_NAME,
   formatEvidenceSpan,
+  getEvidenceBrandName,
+  saveEvidenceBrandName,
 } from "./export-chart-png";
 
 describe("export-chart-png helpers", () => {
+  it("falls back to 'Smoker by anamBadrus' when brand name is empty and persists custom brand name", () => {
+    window.localStorage.clear();
+    expect(DEFAULT_EVIDENCE_BRAND_NAME).toBe("Smoker by anamBadrus");
+    expect(getEvidenceBrandName()).toBe("Smoker by anamBadrus");
+
+    saveEvidenceBrandName("  Varnion Technology Semesta  ");
+    expect(getEvidenceBrandName()).toBe("Varnion Technology Semesta");
+
+    saveEvidenceBrandName("   ");
+    expect(getEvidenceBrandName()).toBe("Smoker by anamBadrus");
+  });
+
   it("computes BEST, NORMAL, HIGH, JITTER, and AVG LOSS summary across buckets", () => {
     const summary = computeSeriesSummary({
       probe_id: "p1",

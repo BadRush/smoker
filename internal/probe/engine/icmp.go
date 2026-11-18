@@ -51,6 +51,7 @@ func openICMPSocket(isV6 bool, bindIP net.IP) (*icmpSocket, error) {
 		fallback = "udp6"
 		addr = "::"
 	}
+	defaultAddr := addr
 	if bindIP != nil {
 		if !isV6 && bindIP.To4() != nil {
 			addr = bindIP.To4().String()
@@ -64,6 +65,15 @@ func openICMPSocket(isV6 bool, bindIP net.IP) (*icmpSocket, error) {
 	if err != nil {
 		isRaw = false
 		conn, err = icmp.ListenPacket(fallback, addr)
+		if err != nil && addr != defaultAddr {
+			// If bound source IP is temporarily unavailable on host interface, fallback to wildcard address
+			isRaw = true
+			conn, err = icmp.ListenPacket(network, defaultAddr)
+			if err != nil {
+				isRaw = false
+				conn, err = icmp.ListenPacket(fallback, defaultAddr)
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("listen %s/%s on %s: %w", network, fallback, addr, err)
 		}
@@ -255,6 +265,18 @@ func (p *ICMPProber) PingIPv6(ctx context.Context, host string, timeout time.Dur
 	return v6.ping(ctx, ip6, timeout)
 }
 
+var fallbackPublicDNSResolver = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		d.Timeout = 2 * time.Second
+		if c, err := d.DialContext(ctx, "udp", "1.1.1.1:53"); err == nil {
+			return c, nil
+		}
+		return d.DialContext(ctx, "udp", "8.8.8.8:53")
+	},
+}
+
 func resolveHostIP(ctx context.Context, host string) (net.IP, error) {
 	return resolveHostIPWithFamily(ctx, host, "ip")
 }
@@ -275,7 +297,10 @@ func resolveHostIPWithFamily(ctx context.Context, rawHost string, family string)
 	}
 	ips, err := net.DefaultResolver.LookupIP(ctx, family, clean)
 	if err != nil || len(ips) == 0 {
-		return nil, fmt.Errorf("resolve %s (%s): %w", clean, family, err)
+		ips, err = fallbackPublicDNSResolver.LookupIP(ctx, family, clean)
+		if err != nil || len(ips) == 0 {
+			return nil, fmt.Errorf("resolve %s (%s): %w", clean, family, err)
+		}
 	}
 	if family == "ip6" {
 		for _, candidate := range ips {

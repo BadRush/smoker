@@ -18,6 +18,7 @@ vi.mock("@/lib/useLiveSocket", () => ({
 
 vi.mock("@/lib/export-chart-png", () => ({
   exportSmokeChartPng: vi.fn().mockResolvedValue("copied"),
+  saveEvidenceBrandName: vi.fn(),
 }));
 
 if (typeof globalThis.ResizeObserver === "undefined") {
@@ -180,6 +181,10 @@ describe("MatrixWallPage (Dashboard)", () => {
     // Separate protocol headers are displayed by default
     expect(screen.getByText("ICMP (Ping)")).toBeInTheDocument();
     expect(screen.getByText("DNS Query")).toBeInTheDocument();
+
+    // Ctrl+F focuses the search input on Dashboard
+    await user.keyboard("{Control>}f{/Control}");
+    expect(screen.getByLabelText("Search targets")).toHaveFocus();
 
     // Filter to DNS Query only
     await user.click(screen.getByTestId("dash-proto-dns"));

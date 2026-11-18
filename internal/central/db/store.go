@@ -101,9 +101,12 @@ func (s *Store) EnsureBootstrap(ctx context.Context, cfg config.CentralConfig) e
 	}
 
 	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO system_settings (id, raw_retention_days, agg_retention_days, default_quorum_min, updated_at)
-		VALUES (1, 14, 730, 2, NOW())
-		ON CONFLICT (id) DO NOTHING
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS brand_name TEXT NOT NULL DEFAULT '';
+		INSERT INTO system_settings (id, raw_retention_days, agg_retention_days, default_quorum_min, brand_name, updated_at)
+		VALUES (1, 14, 730, 2, '', NOW())
+		ON CONFLICT (id) DO NOTHING;
+		ALTER TABLE mtr_snapshots DROP CONSTRAINT IF EXISTS mtr_snapshots_trigger_reason_check;
+		ALTER TABLE mtr_snapshots ADD CONSTRAINT mtr_snapshots_trigger_reason_check CHECK (trigger_reason IN ('auto_loss', 'auto_latency', 'manual'));
 	`); err != nil {
 		return fmt.Errorf("seed system_settings: %w", err)
 	}
@@ -640,7 +643,8 @@ func (s *Store) DeleteTarget(ctx context.Context, id uuid.UUID) error {
 func (s *Store) TargetsForProbe(ctx context.Context, probeID uuid.UUID) ([]protocol.TargetConfig, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT t.id, t.name, t.host, t.probe_type, t.port_or_path,
-		       t.interval_sec, t.timeout_ms, t.auto_mtr_on_loss, t.mtr_loss_threshold
+		       t.interval_sec, t.timeout_ms, t.auto_mtr_on_loss, t.mtr_loss_threshold,
+		       t.latency_warn_ms, COALESCE(t.probe_latency_overrides, '{}'::jsonb)
 		FROM targets t
 		WHERE t.enabled = TRUE
 		  AND (
@@ -657,15 +661,26 @@ func (s *Store) TargetsForProbe(ctx context.Context, probeID uuid.UUID) ([]proto
 	}
 	defer rows.Close()
 
+	probeKey := probeID.String()
 	out := make([]protocol.TargetConfig, 0)
 	for rows.Next() {
 		var id uuid.UUID
 		var tc protocol.TargetConfig
+		var overridesRaw []byte
 		if err := rows.Scan(
 			&id, &tc.Name, &tc.Host, &tc.ProbeType, &tc.PortOrPath,
 			&tc.IntervalSec, &tc.TimeoutMs, &tc.AutoMTROnLoss, &tc.MTRLossThreshold,
+			&tc.LatencyWarnMs, &overridesRaw,
 		); err != nil {
 			return nil, err
+		}
+		if len(overridesRaw) > 0 {
+			var ov map[string]int
+			if json.Unmarshal(overridesRaw, &ov) == nil {
+				if customWarn, ok := ov[probeKey]; ok && customWarn > 0 {
+					tc.LatencyWarnMs = customWarn
+				}
+			}
 		}
 		tc.ID = id.String()
 		out = append(out, tc)
@@ -1107,20 +1122,20 @@ func (s *Store) MarkIncidentNotified(ctx context.Context, id uuid.UUID, now time
 func (s *Store) GetSettings(ctx context.Context) (SystemSettings, error) {
 	var st SystemSettings
 	err := s.pool.QueryRow(ctx, `
-		SELECT raw_retention_days, agg_retention_days, default_quorum_min, updated_at
+		SELECT raw_retention_days, agg_retention_days, default_quorum_min, COALESCE(brand_name, ''), updated_at
 		FROM system_settings WHERE id = 1
-	`).Scan(&st.RawRetentionDays, &st.AggRetentionDays, &st.DefaultQuorumMin, &st.UpdatedAt)
+	`).Scan(&st.RawRetentionDays, &st.AggRetentionDays, &st.DefaultQuorumMin, &st.BrandName, &st.UpdatedAt)
 	return st, mapPGError(err)
 }
 
-func (s *Store) UpdateSettingsAndRetention(ctx context.Context, rawDays, aggDays, defaultQuorum int) (SystemSettings, error) {
+func (s *Store) UpdateSettingsAndRetention(ctx context.Context, rawDays, aggDays, defaultQuorum int, brandName string) (SystemSettings, error) {
 	var st SystemSettings
 	err := s.pool.QueryRow(ctx, `
 		UPDATE system_settings
-		SET raw_retention_days = $1, agg_retention_days = $2, default_quorum_min = $3, updated_at = NOW()
+		SET raw_retention_days = $1, agg_retention_days = $2, default_quorum_min = $3, brand_name = $4, updated_at = NOW()
 		WHERE id = 1
-		RETURNING raw_retention_days, agg_retention_days, default_quorum_min, updated_at
-	`, rawDays, aggDays, defaultQuorum).Scan(&st.RawRetentionDays, &st.AggRetentionDays, &st.DefaultQuorumMin, &st.UpdatedAt)
+		RETURNING raw_retention_days, agg_retention_days, default_quorum_min, COALESCE(brand_name, ''), updated_at
+	`, rawDays, aggDays, defaultQuorum, brandName).Scan(&st.RawRetentionDays, &st.AggRetentionDays, &st.DefaultQuorumMin, &st.BrandName, &st.UpdatedAt)
 	if err != nil {
 		return st, mapPGError(err)
 	}

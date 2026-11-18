@@ -135,6 +135,7 @@ type SystemSettings struct {
 	RawRetentionDays int       `json:"raw_retention_days"`
 	AggRetentionDays int       `json:"agg_retention_days"`
 	DefaultQuorumMin int       `json:"default_quorum_min"`
+	BrandName        string    `json:"brand_name"`
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 

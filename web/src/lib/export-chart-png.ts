@@ -229,13 +229,42 @@ function drawVectorSmokePlot(
   });
 }
 
+export const DEFAULT_EVIDENCE_BRAND_NAME = "Smoker by anamBadrus";
+export const EVIDENCE_BRAND_STORAGE_KEY = "smoker.branding.name.v1";
+
+export function getEvidenceBrandName(): string {
+  if (typeof window === "undefined") return DEFAULT_EVIDENCE_BRAND_NAME;
+  try {
+    const raw = window.localStorage.getItem(EVIDENCE_BRAND_STORAGE_KEY);
+    const clean = raw?.trim() ?? "";
+    return clean || DEFAULT_EVIDENCE_BRAND_NAME;
+  } catch {
+    return DEFAULT_EVIDENCE_BRAND_NAME;
+  }
+}
+
+export function saveEvidenceBrandName(name: string | null | undefined): void {
+  if (typeof window === "undefined") return;
+  try {
+    const clean = (name ?? "").trim();
+    if (clean) {
+      window.localStorage.setItem(EVIDENCE_BRAND_STORAGE_KEY, clean);
+    } else {
+      window.localStorage.removeItem(EVIDENCE_BRAND_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
 export interface ExportChartOptions {
-  chartContainer: HTMLElement;
+  chartContainer?: HTMLElement | null;
   series: ProbeSeriesInput;
   targetName?: string;
   targetHost?: string;
   rangeLabel?: string;
   warnMs?: number | null;
+  brandName?: string | null;
 }
 
 export type ExportPngResult = "copied" | "downloaded";
@@ -247,8 +276,9 @@ export async function exportSmokeChartPng({
   targetHost,
   rangeLabel,
   warnMs,
+  brandName,
 }: ExportChartOptions): Promise<ExportPngResult> {
-  const srcCanvas = chartContainer.querySelector("canvas");
+  const srcCanvas = chartContainer?.querySelector("canvas") ?? null;
   if (series.timestamps.length === 0 && !srcCanvas) {
     throw new Error("Chart canvas is not ready yet");
   }
@@ -359,9 +389,11 @@ export async function exportSmokeChartPng({
 
   // Watermark Footer (24h + Date Detail)
   const footerY = totalH - 9;
+  const watermarkText =
+    (brandName ?? getEvidenceBrandName()).trim() || DEFAULT_EVIDENCE_BRAND_NAME;
   ctx.fillStyle = "#71717a";
   ctx.font = "10px 'JetBrains Mono', ui-monospace, monospace";
-  ctx.fillText("Smoker NOC Telemetry Evidence", padX, footerY);
+  ctx.fillText(watermarkText, padX, footerY);
   const capturedLabel = `Captured ${formatDateTime24(new Date())}`;
   const capW = ctx.measureText(capturedLabel).width;
   ctx.fillText(capturedLabel, contentW - padX - capW, footerY);

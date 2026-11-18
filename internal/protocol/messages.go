@@ -58,6 +58,7 @@ type TargetConfig struct {
 	TimeoutMs        int    `json:"timeout_ms"`
 	AutoMTROnLoss    bool   `json:"auto_mtr_on_loss"`
 	MTRLossThreshold int    `json:"mtr_loss_threshold"`
+	LatencyWarnMs    int    `json:"latency_warn_ms,omitempty"`
 }
 
 type ConfigSyncPayload struct {

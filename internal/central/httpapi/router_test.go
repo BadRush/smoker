@@ -39,6 +39,7 @@ type fakeStore struct {
 	probes        []db.Probe
 	alertRules    []db.AlertRule
 	alertChannels []db.AlertChannel
+	brandName     string
 }
 
 func (f *fakeStore) Ping(context.Context) error { return nil }
@@ -298,10 +299,11 @@ func (f *fakeStore) DeleteAlertChannel(context.Context, uuid.UUID) error      { 
 func (f *fakeStore) ListIncidents(context.Context, int) ([]db.Incident, error) { return []db.Incident{}, nil }
 func (f *fakeStore) CountOpenIncidents(context.Context) (int, error)           { return 0, nil }
 func (f *fakeStore) GetSettings(context.Context) (db.SystemSettings, error) {
-	return db.SystemSettings{RawRetentionDays: 14, AggRetentionDays: 730, DefaultQuorumMin: 2}, nil
+	return db.SystemSettings{RawRetentionDays: 14, AggRetentionDays: 730, DefaultQuorumMin: 2, BrandName: f.brandName}, nil
 }
-func (f *fakeStore) UpdateSettingsAndRetention(context.Context, int, int, int) (db.SystemSettings, error) {
-	return db.SystemSettings{}, nil
+func (f *fakeStore) UpdateSettingsAndRetention(_ context.Context, rawDays, aggDays, defaultQuorum int, brandName string) (db.SystemSettings, error) {
+	f.brandName = brandName
+	return db.SystemSettings{RawRetentionDays: rawDays, AggRetentionDays: aggDays, DefaultQuorumMin: defaultQuorum, BrandName: brandName}, nil
 }
 
 func TestRouterAuthAndTargetValidation(t *testing.T) {

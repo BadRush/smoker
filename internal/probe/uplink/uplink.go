@@ -68,23 +68,26 @@ func (c *Client) proberOptions() engine.ProberOptions {
 	}
 }
 
-func (c *Client) TriggerAutoMTR(targetID, host, probeType string) error {
+func (c *Client) TriggerAutoMTR(targetID, host, probeType, reason string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
 	hops, err := engine.RunMTRWithOptions(ctx, host, strings.HasSuffix(probeType, "6"), c.proberOptions())
 	if err != nil {
-		slog.Warn("auto mtr failed", "target_id", targetID, "host", host, "err", err)
+		slog.Warn("auto mtr failed", "target_id", targetID, "host", host, "reason", reason, "err", err)
 		return err
 	}
 	if hops == nil {
 		hops = []protocol.MTRHop{}
 	}
+	if reason != "auto_latency" {
+		reason = "auto_loss"
+	}
 	res := protocol.MTRResultPayload{
 		BatchID:       uuid.NewString(),
 		TargetID:      targetID,
 		CapturedAtNs:  c.clk.AdjustedNowUnixNs(),
-		TriggerReason: "auto_loss",
+		TriggerReason: reason,
 		Hops:          hops,
 	}
 	select {

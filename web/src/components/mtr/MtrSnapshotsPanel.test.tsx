@@ -41,6 +41,15 @@ describe("MtrSnapshotsPanel", () => {
               },
             ],
           },
+          {
+            id: "snap-2",
+            probe_id: "p2",
+            probe_name: "probe-jkt",
+            target_id: "t1",
+            captured_at: "2026-11-15T10:05:00Z",
+            trigger_reason: "auto_latency",
+            hops: [],
+          },
         ]}
       />
     );
@@ -50,6 +59,8 @@ describe("MtrSnapshotsPanel", () => {
     );
     expect(screen.getByText("1.1.1.1")).toBeInTheDocument();
     expect(screen.getByText("(one.one.one.one)")).toBeInTheDocument();
+    expect(screen.getByText("AUTO LOSS")).toBeInTheDocument();
+    expect(screen.getByText("AUTO HIGH RTT")).toBeInTheDocument();
 
     const select = screen.getByLabelText(/select probe for manual mtr/i);
     await user.selectOptions(select, "p2");

@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, X } from "lucide-react";
+import { ArrowUpRight, Play, Route, X } from "lucide-react";
 import { SmokeChartPanel } from "@/components/charts/SmokeChartPanel";
 import { MtrSnapshotsPanel } from "@/components/mtr/MtrSnapshotsPanel";
 import {
@@ -24,6 +24,7 @@ import {
   type ProbeSeriesInput,
 } from "@/lib/smoke-math";
 import { TV_RANGES, type TvRange } from "@/lib/tv-config";
+import { useLiveSocket, type LiveEventMessage } from "@/lib/useLiveSocket";
 
 interface TargetZoomModalProps {
   mode: "tv" | "dashboard";
@@ -171,24 +172,105 @@ export function TargetZoomModal({
     [mergedList, probeMap]
   );
 
-  async function handleRunMtr(probeId?: string) {
-    if (mode !== "dashboard") return;
+  const mtrTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const mtrSectionRef = useRef<HTMLDivElement | null>(null);
+
+  const clearMtrTimers = useCallback(() => {
+    for (const timer of mtrTimersRef.current) {
+      clearTimeout(timer);
+    }
+    mtrTimersRef.current = [];
+  }, []);
+
+  useEffect(() => {
+    return () => clearMtrTimers();
+  }, [clearMtrTimers]);
+
+  const handleLiveMtrEvent = useCallback(
+    (ev: LiveEventMessage) => {
+      if (ev.type !== "mtr_ready") return;
+      const raw = ev.data as
+        | (MTRSnapshot & { error?: string })
+        | { target_id?: string; probe_name?: string; error?: string };
+      if (!raw || raw.target_id !== target.id) return;
+      clearMtrTimers();
+      setRunningMtr(false);
+      if ("error" in raw && raw.error) {
+        const who = raw.probe_name ? `${raw.probe_name}: ` : "";
+        setMtrErr(`${who}${raw.error}`);
+        return;
+      }
+      if ("hops" in raw && Array.isArray(raw.hops)) {
+        setMtrErr(null);
+        setZoomMtrSnaps((prev) =>
+          [raw as MTRSnapshot, ...prev.filter((s) => s.id !== raw.id)].slice(0, 15)
+        );
+      }
+    },
+    [target.id, clearMtrTimers]
+  );
+
+  useLiveSocket(
+    [`target:${target.id}`],
+    handleLiveMtrEvent,
+    mode === "tv" ? { scope: "tv" } : undefined
+  );
+
+  async function handleRunMtr(probeId?: string, scrollToMtr = false) {
+    clearMtrTimers();
     setRunningMtr(true);
     setMtrErr(null);
+    if (scrollToMtr) {
+      setTimeout(() => {
+        mtrSectionRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+      }, 60);
+    }
+    const triggeredAtMs = Date.now();
+    const runUrl =
+      mode === "tv"
+        ? `/api/tv/targets/${encodeURIComponent(target.id)}/mtr/run`
+        : `/api/targets/${encodeURIComponent(target.id)}/mtr/run`;
+    const listUrl =
+      mode === "tv"
+        ? `/api/tv/targets/${encodeURIComponent(target.id)}/mtr?limit=10`
+        : `/api/targets/${encodeURIComponent(target.id)}/mtr?limit=10`;
+
     try {
-      await apiRequest(`/api/targets/${encodeURIComponent(target.id)}/mtr`, {
+      const resp = await apiRequest<{ request_ids?: string[] }>(runUrl, {
         method: "POST",
         body: JSON.stringify(probeId ? { probe_id: probeId } : {}),
       });
-      setTimeout(() => {
-        void apiRequest<MTRSnapshot[]>(
-          `/api/targets/${encodeURIComponent(target.id)}/mtr?limit=10`
-        )
-          .then((snaps) => {
-            setZoomMtrSnaps(Array.isArray(snaps) ? snaps : []);
-          })
-          .finally(() => setRunningMtr(false));
-      }, 2500);
+      if (resp && Array.isArray(resp.request_ids) && resp.request_ids.length === 0) {
+        setRunningMtr(false);
+        setMtrErr("No online probes available to execute MTR.");
+        return;
+      }
+
+      const delays = [2500, 5000, 8500, 12500];
+      delays.forEach((delay, idx) => {
+        const timer = setTimeout(async () => {
+          try {
+            const latest = await apiRequest<MTRSnapshot[]>(listUrl);
+            if (Array.isArray(latest)) {
+              setZoomMtrSnaps(latest);
+              const arrived = latest.some(
+                (s) => new Date(s.captured_at).getTime() >= triggeredAtMs - 2000
+              );
+              if (arrived) {
+                clearMtrTimers();
+                setRunningMtr(false);
+                return;
+              }
+            }
+          } catch {
+            // Keep polling until final fallback tick
+          }
+          if (idx === delays.length - 1) {
+            setRunningMtr(false);
+          }
+        }, delay);
+        mtrTimersRef.current.push(timer);
+      });
     } catch (err) {
       setMtrErr(err instanceof Error ? err.message : "Failed to trigger MTR");
       setRunningMtr(false);
@@ -255,6 +337,20 @@ export function TargetZoomModal({
                 </button>
               ))}
             </div>
+
+            <button
+              type="button"
+              data-testid="tv-zoom-run-mtr-btn"
+              disabled={runningMtr}
+              aria-busy={runningMtr}
+              onClick={() => void handleRunMtr(zoomProbeFilter || undefined, true)}
+              title="Run live hop-by-hop MTR diagnostic and scroll to MTR table"
+              className="inline-flex items-center gap-1.5 rounded-md border border-cyan-500/50 bg-cyan-500/15 px-2.5 py-1.5 text-xs font-mono font-semibold text-cyan-300 hover:bg-cyan-500/25 disabled:opacity-60 transition-colors"
+            >
+              <Route className="h-3.5 w-3.5" aria-hidden="true" />
+              <Play className="h-3 w-3" aria-hidden="true" />
+              <span>{runningMtr ? "Running MTR..." : "Run MTR"}</span>
+            </button>
 
             {mode === "dashboard" && (
               <Link
@@ -339,6 +435,7 @@ export function TargetZoomModal({
                 targetHost={target.host}
                 rangeLabel={zoomRange}
                 windowSec={rangeKeyToSeconds(zoomRange)}
+                intervalSec={target.interval_sec}
                 baselineMs={cell.baseline_ms ?? series.baseline_ms ?? null}
                 warnMs={resolveEffectiveWarnMs({
                   cellWarnMs: cell.warn_ms,
@@ -352,13 +449,17 @@ export function TargetZoomModal({
             ))
           )}
 
-          <MtrSnapshotsPanel
-            snapshots={zoomMtrSnaps}
-            probes={mtrProbes}
-            running={runningMtr}
-            errorMessage={mtrErr}
-            onRunNow={mode === "dashboard" ? (probeId) => void handleRunMtr(probeId) : undefined}
-          />
+          <div ref={mtrSectionRef}>
+            <MtrSnapshotsPanel
+              snapshots={zoomMtrSnaps}
+              probes={mtrProbes}
+              running={runningMtr}
+              errorMessage={mtrErr}
+              selectedProbeId={zoomProbeFilter}
+              onChangeSelectedProbeId={setZoomProbeFilter}
+              onRunNow={(probeId) => void handleRunMtr(probeId, false)}
+            />
+          </div>
         </div>
       </div>
     </div>

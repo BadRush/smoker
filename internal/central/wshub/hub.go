@@ -344,7 +344,7 @@ func (h *Hub) handleProbeMessage(ctx context.Context, pc *probeConn, env protoco
 			return
 		}
 		reason := mtr.TriggerReason
-		if reason != "manual" {
+		if reason != "manual" && reason != "auto_latency" {
 			reason = "auto_loss"
 		}
 		ch := "target:" + tid.String()
@@ -560,7 +560,7 @@ func (h *Hub) HandleLiveWS(w http.ResponseWriter, r *http.Request) {
 		}
 		var sub protocol.LiveSubscribe
 		if json.Unmarshal(data, &sub) == nil && sub.Channel != "" {
-			if !authenticated && sub.Channel != "matrix" {
+			if !authenticated && sub.Channel != "matrix" && !strings.HasPrefix(sub.Channel, "target:") {
 				continue
 			}
 			client.mu.Lock()

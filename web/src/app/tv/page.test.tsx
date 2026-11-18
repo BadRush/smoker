@@ -16,6 +16,7 @@ vi.mock("@/lib/useLiveSocket", () => ({
 
 vi.mock("@/lib/export-chart-png", () => ({
   exportSmokeChartPng: vi.fn().mockResolvedValue("copied"),
+  saveEvidenceBrandName: vi.fn(),
 }));
 
 if (typeof globalThis.ResizeObserver === "undefined") {
@@ -249,6 +250,41 @@ describe("NocTvWallboardPage layout controls", () => {
     });
     const badges = screen.getAllByTestId("tv-card-probe-badge");
     expect(badges.map((b) => b.textContent)).toEqual(["Local Central", "Remote-SGP"]);
+
+    // Probe name is not duplicated inside the card (appears once in bottom-left footer)
+    expect(screen.getAllByText("Local Central")).toHaveLength(1);
+    expect(screen.getAllByText("Remote-SGP")).toHaveLength(1);
+
+    // Peak is removed and NORMAL / HIGH / LOSS appear in the footer
+    expect(screen.queryByText(/Peak/i)).not.toBeInTheDocument();
+    expect(screen.getAllByText("NORMAL").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("HIGH").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("LOSS").length).toBeGreaterThanOrEqual(2);
+
+    // Status badge (OK) has no dot circle element inside it
+    const statusBadges = screen.getAllByTestId("tv-card-status-badge");
+    expect(statusBadges[0]).toHaveTextContent("OK");
+    expect(statusBadges[0].querySelector(".rounded-full")).toBeNull();
+
+    // Top-right Screenshot button copies PNG
+    const copyBtns = screen.getAllByTestId("copy-chart-png-btn");
+    await user.click(copyBtns[0]);
+    expect(await screen.findByText("Copied")).toBeInTheDocument();
+
+    // Ctrl+F opens the TV search filter bar
+    await user.keyboard("{Control>}f{/Control}");
+    expect(await screen.findByPlaceholderText(/search target name/i)).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+
+    // Clicking Zoom on TV card opens Zoom Modal with top Run MTR button and bottom Run MTR Now button
+    const zoomBtns = screen.getAllByTestId("zoom-chart-btn");
+    await user.click(zoomBtns[0]);
+    const zoomModal = await screen.findByTestId("tv-zoom-modal");
+    expect(zoomModal).toBeInTheDocument();
+    const runMtrBtn = screen.getByTestId("tv-zoom-run-mtr-btn");
+    expect(runMtrBtn).toBeInTheDocument();
+    await user.click(runMtrBtn);
+    await user.click(screen.getByTestId("tv-zoom-close-btn"));
 
     // Toggle to Per-Target compact mode -> collapses to 1 focal card with probe switcher chips
     await user.click(screen.getByTestId("tv-probe-mode-btn"));

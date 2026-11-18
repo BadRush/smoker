@@ -157,12 +157,15 @@ func (s *Server) handleGetMatrix(w http.ResponseWriter, r *http.Request) {
 		cells = []ingest.MatrixCell{}
 	}
 
+	st, _ := s.store.GetSettings(r.Context())
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"probes":           probes,
 		"groups":           groups,
 		"targets":          targets,
 		"cells":            cells,
 		"active_incidents": activeIncidents,
+		"brand_name":       st.BrandName,
 		"generated_at":     time.Now().UTC(),
 	})
 }
@@ -222,12 +225,15 @@ func (s *Server) handleGetTVMatrix(w http.ResponseWriter, r *http.Request) {
 		cells = []ingest.MatrixCell{}
 	}
 
+	st, _ := s.store.GetSettings(r.Context())
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"probes":           probes,
 		"groups":           groups,
 		"targets":          targets,
 		"cells":            cells,
 		"active_incidents": activeIncidents,
+		"brand_name":       st.BrandName,
 		"generated_at":     time.Now().UTC(),
 	})
 }
@@ -784,6 +790,13 @@ func (s *Server) handleListTVTargetMTR(w http.ResponseWriter, r *http.Request) {
 	s.handleListTargetMTR(w, r)
 }
 
+func (s *Server) handleTriggerTVTargetMTR(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeTVRequest(w, r) {
+		return
+	}
+	s.handleTriggerTargetMTR(w, r)
+}
+
 func (s *Server) handleTriggerTargetMTR(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseUUIDParam(w, r, "id")
 	if !ok {
@@ -1331,9 +1344,10 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		RawRetentionDays int `json:"raw_retention_days"`
-		AggRetentionDays int `json:"agg_retention_days"`
-		DefaultQuorumMin int `json:"default_quorum_min"`
+		RawRetentionDays int    `json:"raw_retention_days"`
+		AggRetentionDays int    `json:"agg_retention_days"`
+		DefaultQuorumMin int    `json:"default_quorum_min"`
+		BrandName        string `json:"brand_name"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeProblem(w, r, http.StatusBadRequest, "bad_json", "Invalid settings payload")
@@ -1351,8 +1365,13 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, r, http.StatusBadRequest, "validation_error", "default_quorum_min must be >= 1")
 		return
 	}
+	brandName := strings.TrimSpace(req.BrandName)
+	if len(brandName) > 80 {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", "brand_name must be at most 80 characters")
+		return
+	}
 
-	st, err := s.store.UpdateSettingsAndRetention(r.Context(), req.RawRetentionDays, req.AggRetentionDays, req.DefaultQuorumMin)
+	st, err := s.store.UpdateSettingsAndRetention(r.Context(), req.RawRetentionDays, req.AggRetentionDays, req.DefaultQuorumMin, brandName)
 	if err != nil {
 		handleStoreErr(w, r, err)
 		return

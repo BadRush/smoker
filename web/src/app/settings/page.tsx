@@ -5,12 +5,18 @@ import { useRouter } from "next/navigation";
 import { Save, Shield } from "lucide-react";
 import { NocShell } from "@/components/layout/NocShell";
 import { ApiError, apiRequest, type SystemSettings } from "@/lib/api";
+import {
+  DEFAULT_EVIDENCE_BRAND_NAME,
+  getEvidenceBrandName,
+  saveEvidenceBrandName,
+} from "@/lib/export-chart-png";
 
 export default function SettingsPage() {
   const router = useRouter();
   const [rawDays, setRawDays] = useState(14);
   const [aggDays, setAggDays] = useState(730);
   const [defaultQuorum, setDefaultQuorum] = useState(2);
+  const [brandName, setBrandName] = useState("");
 
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -23,6 +29,9 @@ export default function SettingsPage() {
       setRawDays(s.raw_retention_days);
       setAggDays(s.agg_retention_days);
       setDefaultQuorum(s.default_quorum_min);
+      const serverBrand = (s.brand_name ?? "").trim();
+      setBrandName(serverBrand);
+      saveEvidenceBrandName(serverBrand);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.replace("/login");
@@ -31,6 +40,10 @@ export default function SettingsPage() {
   }, [router]);
 
   useEffect(() => {
+    const cached = getEvidenceBrandName();
+    if (cached && cached !== DEFAULT_EVIDENCE_BRAND_NAME) {
+      setBrandName(cached);
+    }
     void loadSettings();
   }, [loadSettings]);
 
@@ -39,15 +52,19 @@ export default function SettingsPage() {
     setStatusMsg(null);
     setErrMsg(null);
     try {
+      const cleanBrand = brandName.trim();
       await apiRequest("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
           raw_retention_days: Number(rawDays),
           agg_retention_days: Number(aggDays),
           default_quorum_min: Number(defaultQuorum),
+          brand_name: cleanBrand,
         }),
       });
-      setStatusMsg("TimescaleDB retention policies updated.");
+      setBrandName(cleanBrand);
+      saveEvidenceBrandName(cleanBrand);
+      setStatusMsg("System settings & screenshot watermark saved.");
     } catch (err) {
       setErrMsg(err instanceof ApiError ? err.detail : "Failed to save settings");
     }
@@ -101,8 +118,26 @@ export default function SettingsPage() {
           className="rounded-lg border border-border bg-surface p-5 space-y-4"
         >
           <h2 className="text-sm font-semibold text-zinc-100">
-            TimescaleDB Retention Policy
+            TimescaleDB Retention &amp; Screenshot Branding
           </h2>
+          <div>
+            <label htmlFor="brand-name" className="mb-1 block text-xs text-zinc-300">
+              Screenshot Watermark / Organization Name (Bottom-Left PNG)
+            </label>
+            <input
+              id="brand-name"
+              type="text"
+              maxLength={80}
+              placeholder={`${DEFAULT_EVIDENCE_BRAND_NAME} (e.g. Varnion Technology Semesta)`}
+              value={brandName}
+              onChange={(e) => setBrandName(e.target.value)}
+              className="w-full rounded border border-border bg-canvas px-3 py-2 text-sm font-mono text-zinc-100 placeholder-zinc-500"
+            />
+            <p className="mt-1 text-[11px] text-zinc-400">
+              Leave blank to automatically fallback to{" "}
+              <span className="font-mono text-zinc-200">{DEFAULT_EVIDENCE_BRAND_NAME}</span>.
+            </p>
+          </div>
           <div className="grid gap-4 sm:grid-cols-3">
             <div>
               <label htmlFor="raw-days" className="mb-1 block text-xs text-zinc-300">
@@ -152,7 +187,7 @@ export default function SettingsPage() {
               className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 px-4 py-2 text-xs font-semibold text-zinc-950 hover:bg-emerald-400"
             >
               <Save className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Apply Retention Policy</span>
+              <span>Save Settings</span>
             </button>
           </div>
         </form>
