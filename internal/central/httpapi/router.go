@@ -39,6 +39,7 @@ type Store interface {
 	GetTarget(ctx context.Context, id uuid.UUID) (db.Target, error)
 	CreateTarget(ctx context.Context, in db.TargetInput) (db.Target, error)
 	UpdateTarget(ctx context.Context, id uuid.UUID, in db.TargetInput) (db.Target, error)
+	SetTargetMute(ctx context.Context, id uuid.UUID, mutedUntil *time.Time) (db.Target, error)
 	DeleteTarget(ctx context.Context, id uuid.UUID) error
 	SeedPublicMonitors(ctx context.Context, onlyIfEmpty bool) (db.SeedResult, error)
 
@@ -53,11 +54,12 @@ type Store interface {
 
 	ListAlertChannels(ctx context.Context) ([]db.AlertChannel, error)
 	GetAlertChannel(ctx context.Context, id uuid.UUID) (db.AlertChannel, error)
-	CreateAlertChannel(ctx context.Context, typ, name string, enc []byte, hint string, enabled bool) (db.AlertChannel, error)
-	UpdateAlertChannel(ctx context.Context, id uuid.UUID, name string, enc []byte, hint string, enabled bool) (db.AlertChannel, error)
+	CreateAlertChannel(ctx context.Context, typ, name string, enc []byte, hint, severityFilter string, enabled bool) (db.AlertChannel, error)
+	UpdateAlertChannel(ctx context.Context, id uuid.UUID, name string, enc []byte, hint, severityFilter string, enabled bool) (db.AlertChannel, error)
 	DeleteAlertChannel(ctx context.Context, id uuid.UUID) error
 
 	ListIncidents(ctx context.Context, limit int) ([]db.Incident, error)
+	AcknowledgeIncident(ctx context.Context, id uuid.UUID, ackBy string, now time.Time) (db.Incident, error)
 	CountOpenIncidents(ctx context.Context) (int, error)
 
 	GetSettings(ctx context.Context) (db.SystemSettings, error)
@@ -162,6 +164,7 @@ func NewRouter(deps Dependencies) http.Handler {
 		pr.Post("/api/targets/presets", s.handleSeedPresets)
 		pr.Get("/api/targets/{id}", s.handleGetTarget)
 		pr.Put("/api/targets/{id}", s.handleUpdateTarget)
+		pr.Post("/api/targets/{id}/mute", s.handleMuteTarget)
 		pr.Delete("/api/targets/{id}", s.handleDeleteTarget)
 		pr.Get("/api/targets/{id}/series", s.handleGetTargetSeries)
 		pr.Get("/api/targets/{id}/mtr", s.handleListTargetMTR)
@@ -179,6 +182,8 @@ func NewRouter(deps Dependencies) http.Handler {
 		pr.Post("/api/alerts/channels/{id}/test", s.handleTestAlertChannel)
 
 		pr.Get("/api/alerts/incidents", s.handleListIncidents)
+		pr.Post("/api/alerts/incidents/{id}/ack", s.handleAcknowledgeIncident)
+		pr.Post("/api/alerts/incidents/{id}/acknowledge", s.handleAcknowledgeIncident)
 
 		pr.Get("/api/settings", s.handleGetSettings)
 		pr.Put("/api/settings", s.handleUpdateSettings)

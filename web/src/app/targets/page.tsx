@@ -4,6 +4,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
+  Bell,
+  BellOff,
   ChevronLeft,
   ChevronRight,
   Copy,
@@ -25,11 +27,15 @@ import { ProtocolFilterChips } from "@/components/targets/ProtocolFilterChips";
 import {
   ApiError,
   apiRequest,
+  type AlertRule,
+  type MatrixCell,
+  type MatrixSnapshot,
   type Probe,
   type Target,
   type TargetGroup,
   type TargetInput,
 } from "@/lib/api";
+import { formatMs, resolveTargetBestPathSummary } from "@/lib/smoke-math";
 import {
   getProtocolFamily,
   getProtocolFamilyMeta,
@@ -62,6 +68,8 @@ export default function TargetsPage() {
   const [targets, setTargets] = useState<Target[]>([]);
   const [groups, setGroups] = useState<TargetGroup[]>([]);
   const [probes, setProbes] = useState<Probe[]>([]);
+  const [matrixCells, setMatrixCells] = useState<MatrixCell[]>([]);
+  const [alertRules, setAlertRules] = useState<AlertRule[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -73,7 +81,7 @@ export default function TargetsPage() {
   const [tType, setTType] = useState<TargetInput["probe_type"]>("icmp");
   const [tPortOrPath, setTPortOrPath] = useState("");
   const [tGroupId, setTGroupId] = useState<string>("");
-  const [tInterval, setTInterval] = useState(1);
+  const [tInterval, setTInterval] = useState(5);
   const [tTimeout, setTTimeout] = useState(1000);
   const [tEnabled, setTEnabled] = useState(true);
   const [tAutoMtr, setTAutoMtr] = useState(true);
@@ -83,6 +91,7 @@ export default function TargetsPage() {
   const [tProbeOverrides, setTProbeOverrides] = useState<Record<string, number>>({});
   const [tAssignAll, setTAssignAll] = useState(true);
   const [tProbeIds, setTProbeIds] = useState<string[]>([]);
+  const [tSyncRttAlert, setTSyncRttAlert] = useState(false);
   const [formErr, setFormErr] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [simNotice, setSimNotice] = useState<string | null>(null);
@@ -159,6 +168,43 @@ export default function TargetsPage() {
     return probes.filter((p) => selected.has(p.id));
   }, [probes, tAssignAll, tProbeIds]);
 
+  const modalBestPathSummary = useMemo(() => {
+    return resolveTargetBestPathSummary(
+      {
+        id: editingTarget?.id ?? "__new__",
+        assign_all_probes: tAssignAll,
+        probe_ids: tProbeIds,
+        latency_warn_ms: Number(tLatencyWarnMs) || 0,
+        probe_latency_overrides: tProbeOverrides,
+        timeout_ms: Number(tTimeout) || 1000,
+      },
+      matrixCells,
+      probes
+    );
+  }, [
+    editingTarget?.id,
+    tAssignAll,
+    tProbeIds,
+    tLatencyWarnMs,
+    tProbeOverrides,
+    tTimeout,
+    matrixCells,
+    probes,
+  ]);
+
+  const modalBestPathByProbe = useMemo(() => {
+    return new Map(modalBestPathSummary.probeEntries.map((e) => [e.probeId, e]));
+  }, [modalBestPathSummary]);
+
+  const existingTargetRttRule = useMemo(() => {
+    if (!editingTarget) return null;
+    return (
+      alertRules.find(
+        (r) => r.target_id === editingTarget.id && r.metric === "latency_p95"
+      ) ?? null
+    );
+  }, [editingTarget, alertRules]);
+
   const groupCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const t of targets) {
@@ -231,14 +277,18 @@ export default function TargetsPage() {
   const loadAll = useCallback(async () => {
     try {
       setError(null);
-      const [tRes, gRes, pRes] = await Promise.all([
+      const [tRes, gRes, pRes, mRes, rRes] = await Promise.all([
         apiRequest<Target[]>("/api/targets"),
         apiRequest<TargetGroup[]>("/api/groups"),
         apiRequest<Probe[]>("/api/probes"),
+        apiRequest<MatrixSnapshot>("/api/matrix").catch(() => null as MatrixSnapshot | null),
+        apiRequest<AlertRule[]>("/api/alerts/rules").catch(() => [] as AlertRule[]),
       ]);
       setTargets(tRes);
       setGroups(gRes);
       setProbes(pRes);
+      setMatrixCells(Array.isArray(mRes?.cells) ? mRes.cells : []);
+      setAlertRules(Array.isArray(rRes) ? rRes : []);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.replace("/login");
@@ -272,6 +322,7 @@ export default function TargetsPage() {
     setTProbeOverrides(t.probe_latency_overrides ?? {});
     setTAssignAll(t.assign_all_probes);
     setTProbeIds(t.probe_ids ?? []);
+    setTSyncRttAlert(false);
     setShowTargetModal(true);
   }, []);
 
@@ -295,7 +346,7 @@ export default function TargetsPage() {
     setTType("icmp");
     setTPortOrPath("");
     setTGroupId("");
-    setTInterval(1);
+    setTInterval(5);
     setTTimeout(1000);
     setTEnabled(true);
     setTAutoMtr(true);
@@ -305,6 +356,7 @@ export default function TargetsPage() {
     setTProbeOverrides({});
     setTAssignAll(true);
     setTProbeIds([]);
+    setTSyncRttAlert(false);
     setShowTargetModal(true);
   }
 
@@ -400,15 +452,63 @@ export default function TargetsPage() {
       probe_ids: tProbeIds,
     });
     try {
-      await apiRequest(
+      const savedTarget = await apiRequest<Target>(
         editingTarget ? `/api/targets/${editingTarget.id}` : "/api/targets",
         {
           method: editingTarget ? "PUT" : "POST",
           body: JSON.stringify(payload),
         }
       );
+      if (tSyncRttAlert && savedTarget?.id) {
+        const syncThreshold = Number(tLatencyWarnMs) || 0;
+        const ruleToUpdate = existingTargetRttRule;
+        if (ruleToUpdate) {
+          await apiRequest(`/api/alerts/rules/${ruleToUpdate.id}`, {
+            method: "PUT",
+            body: JSON.stringify({
+              name: ruleToUpdate.name,
+              target_id: savedTarget.id,
+              group_id: null,
+              metric: "latency_p95",
+              threshold_value: syncThreshold,
+              duration_sec: ruleToUpdate.duration_sec,
+              quorum_min_probes: ruleToUpdate.quorum_min_probes,
+              cooldown_sec: ruleToUpdate.cooldown_sec,
+              confirm_sec: ruleToUpdate.confirm_sec ?? 0,
+              recover_sec: ruleToUpdate.recover_sec ?? 45,
+              channel_ids: ruleToUpdate.channel_ids ?? [],
+              enabled: true,
+            }),
+          });
+        } else {
+          await apiRequest("/api/alerts/rules", {
+            method: "POST",
+            body: JSON.stringify({
+              name: `${savedTarget.name} High Latency`,
+              target_id: savedTarget.id,
+              group_id: null,
+              metric: "latency_p95",
+              threshold_value: syncThreshold,
+              duration_sec: 30,
+              quorum_min_probes: 1,
+              cooldown_sec: 0,
+              confirm_sec: 0,
+              recover_sec: 45,
+              channel_ids: [],
+              enabled: true,
+            }),
+          });
+        }
+        setSimNotice(
+          `Saved "${savedTarget.name}" and synced Telegram High-Latency (P95) rule (${
+            syncThreshold > 0 ? `>= ${syncThreshold} ms` : "Auto Best-Path"
+          }).`
+        );
+        setTimeout(() => setSimNotice(null), 6000);
+      }
       setShowTargetModal(false);
       setEditingTarget(null);
+      setTSyncRttAlert(false);
       setTName("");
       setTHost("");
       setTPortOrPath("");
@@ -451,6 +551,30 @@ export default function TargetsPage() {
       await loadAll();
     } catch (err) {
       setError(err instanceof ApiError ? err.detail : "Toggle TV pin failed");
+    }
+  }
+
+  function isTargetMuted(t: Target): boolean {
+    return Boolean(t.muted_until && new Date(t.muted_until).getTime() > Date.now());
+  }
+
+  async function handleToggleMute(t: Target) {
+    setError(null);
+    const muted = isTargetMuted(t);
+    try {
+      await apiRequest(`/api/targets/${t.id}/mute`, {
+        method: "POST",
+        body: JSON.stringify({ duration: muted ? "off" : "1h" }),
+      });
+      setSimNotice(
+        muted
+          ? `Maintenance mute cleared for "${t.name}".`
+          : `Alerts muted for 1 hour on "${t.name}".`
+      );
+      setTimeout(() => setSimNotice(null), 6000);
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.detail : "Toggle mute failed");
     }
   }
 
@@ -914,6 +1038,11 @@ export default function TargetsPage() {
                               Paused
                             </span>
                           )}
+                          {isTargetMuted(t) && (
+                            <span className="rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-mono uppercase text-amber-300">
+                              Muted
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td className="px-4 py-3 font-mono text-zinc-300">
@@ -985,6 +1114,23 @@ export default function TargetsPage() {
                         >
                           <Flame className="h-3 w-3" aria-hidden="true" />
                           <span>Test Spike</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleToggleMute(t)}
+                          aria-label={`${isTargetMuted(t) ? "Unmute" : "Mute"} target ${t.name}`}
+                          className={`inline-flex items-center gap-1 rounded border px-2 py-1 text-xs ${
+                            isTargetMuted(t)
+                              ? "border-amber-500/40 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25"
+                              : "border-border bg-elevated text-zinc-200 hover:border-amber-500/50 hover:text-amber-300"
+                          }`}
+                        >
+                          {isTargetMuted(t) ? (
+                            <Bell className="h-3 w-3" aria-hidden="true" />
+                          ) : (
+                            <BellOff className="h-3 w-3" aria-hidden="true" />
+                          )}
+                          <span>{isTargetMuted(t) ? "Unmute" : "Mute 1h"}</span>
                         </button>
                         <button
                           type="button"
@@ -1325,6 +1471,50 @@ export default function TargetsPage() {
                   </div>
                 </div>
 
+                {editingTarget && (
+                  <div
+                    data-testid="target-bestpath-callout"
+                    className="flex flex-wrap items-center justify-between gap-2 rounded border border-cyan-500/35 bg-cyan-500/10 px-3 py-2 text-xs"
+                  >
+                    <div className="space-y-0.5">
+                      <p className="font-mono text-cyan-200">
+                        {modalBestPathSummary.primaryBaselineMs !== null
+                          ? `Live Best-Path P25: ${formatMs(
+                              modalBestPathSummary.primaryBaselineMs
+                            )} → Auto Warn: ~${Math.round(
+                              modalBestPathSummary.primaryAutoWarnMs
+                            )} ms`
+                          : "Live Best-Path P25: collecting samples (0 = adaptive Auto Best-Path)"}
+                      </p>
+                      <p className="text-[11px] text-zinc-400">
+                        Sets card HIGH RTT badge, chart WARN line, &amp; Auto-MTR.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {modalBestPathSummary.primaryBaselineMs !== null && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setTLatencyWarnMs(
+                              Math.round(modalBestPathSummary.primaryAutoWarnMs)
+                            )
+                          }
+                          className="rounded border border-cyan-400/50 bg-canvas px-2 py-1 text-[11px] font-mono text-cyan-200 hover:bg-cyan-500/20"
+                        >
+                          Fill ~{Math.round(modalBestPathSummary.primaryAutoWarnMs)} ms
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setTLatencyWarnMs(0)}
+                        className="rounded border border-border bg-canvas px-2 py-1 text-[11px] font-mono text-zinc-300 hover:text-white"
+                      >
+                        Set 0 (Auto)
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="space-y-2 border-t border-border pt-3">
                   <label className="flex items-center gap-2 text-xs text-zinc-200">
                     <input
@@ -1403,17 +1593,30 @@ export default function TargetsPage() {
                       Per-Probe High-Latency Override (ms, 0 = Auto Best-Path Baseline):
                     </p>
                     <div className="grid gap-2 sm:grid-cols-2">
-                      {overrideProbes.map((p) => (
-                        <div key={p.id} className="flex items-center justify-between gap-2 text-xs">
-                          <label htmlFor={`probe-ov-${p.id}`} className="truncate text-zinc-300">
-                            {p.name}
-                          </label>
-                          <input
-                            id={`probe-ov-${p.id}`}
-                            type="number"
-                            min={0}
-                            max={10000}
-                            value={tProbeOverrides[p.id] ?? 0}
+                      {overrideProbes.map((p) => {
+                        const bp = modalBestPathByProbe.get(p.id);
+                        return (
+                          <div key={p.id} className="flex items-center justify-between gap-2 text-xs">
+                            <div className="min-w-0">
+                              <label htmlFor={`probe-ov-${p.id}`} className="block truncate text-zinc-300">
+                                {p.name}
+                              </label>
+                              {editingTarget && bp && (
+                                <span className="block font-mono text-[10px] text-zinc-400">
+                                  {bp.baselineMs !== null
+                                    ? `Base ${formatMs(bp.baselineMs)} · Auto ~${Math.round(
+                                        bp.autoWarnMs
+                                      )} ms`
+                                    : "Auto Best-Path"}
+                                </span>
+                              )}
+                            </div>
+                            <input
+                              id={`probe-ov-${p.id}`}
+                              type="number"
+                              min={0}
+                              max={10000}
+                              value={tProbeOverrides[p.id] ?? 0}
                             onChange={(e) => {
                               const val = Number(e.target.value);
                               setTProbeOverrides((prev) => {
@@ -1426,10 +1629,11 @@ export default function TargetsPage() {
                                 return next;
                               });
                             }}
-                            className="w-20 rounded border border-border bg-elevated px-2 py-1 font-mono text-zinc-100"
-                          />
-                        </div>
-                      ))}
+                              className="w-20 rounded border border-border bg-elevated px-2 py-1 font-mono text-zinc-100"
+                            />
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 )}
@@ -1480,6 +1684,58 @@ export default function TargetsPage() {
                       </div>
                     )}
                   </div>
+                </div>
+
+                <div className="rounded border border-emerald-500/30 bg-emerald-500/5 p-3 space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <span className="font-semibold text-zinc-100">
+                      Telegram High-Latency Alert (RTT)
+                    </span>
+                    <span className="rounded border border-border bg-canvas px-2 py-0.5 font-mono text-[10px] text-zinc-300">
+                      {existingTargetRttRule
+                        ? `Rule "${existingTargetRttRule.name}": ${
+                            existingTargetRttRule.threshold_value === 0
+                              ? "Auto Best-Path"
+                              : `>= ${existingTargetRttRule.threshold_value} ms`
+                          }`
+                        : "No Telegram RTT rule"}
+                    </span>
+                  </div>
+                  <label className="flex items-start gap-2 text-xs text-zinc-200 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      aria-label="Sync Telegram RTT alert rule"
+                      checked={tSyncRttAlert}
+                      onChange={(e) => setTSyncRttAlert(e.target.checked)}
+                      className="mt-0.5 rounded border-border bg-canvas"
+                    />
+                    <span>
+                      Also {existingTargetRttRule ? "update" : "create"} Telegram High Latency (P95) rule using this Warn RTT (
+                      <span className="font-mono text-cyan-300">
+                        {Number(tLatencyWarnMs) > 0
+                          ? `>= ${tLatencyWarnMs} ms`
+                          : "0 = Auto Best-Path"}
+                      </span>
+                      )
+                    </span>
+                  </label>
+                  {editingTarget && (
+                    <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-400">
+                      <span>Adjust Confirm/Recover/Channels in Alerts:</span>
+                      <Link
+                        href={`/alerts?target_id=${encodeURIComponent(
+                          editingTarget.id
+                        )}&metric=latency_p95${
+                          Number(tLatencyWarnMs) > 0
+                            ? `&threshold=${encodeURIComponent(String(Number(tLatencyWarnMs)))}`
+                            : ""
+                        }`}
+                        className="font-mono font-semibold text-emerald-400 hover:underline"
+                      >
+                        Customize in /alerts &rarr;
+                      </Link>
+                    </div>
+                  )}
                 </div>
 
                 {formErr && (

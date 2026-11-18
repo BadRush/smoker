@@ -107,6 +107,12 @@ func (s *Store) EnsureBootstrap(ctx context.Context, cfg config.CentralConfig) e
 		ON CONFLICT (id) DO NOTHING;
 		ALTER TABLE mtr_snapshots DROP CONSTRAINT IF EXISTS mtr_snapshots_trigger_reason_check;
 		ALTER TABLE mtr_snapshots ADD CONSTRAINT mtr_snapshots_trigger_reason_check CHECK (trigger_reason IN ('auto_loss', 'auto_latency', 'manual'));
+		ALTER TABLE alert_channels ADD COLUMN IF NOT EXISTS severity_filter TEXT NOT NULL DEFAULT 'all';
+		ALTER TABLE incidents ADD COLUMN IF NOT EXISTS notified_severity TEXT NOT NULL DEFAULT '';
+		ALTER TABLE incidents ADD COLUMN IF NOT EXISTS telegram_message_ids JSONB NOT NULL DEFAULT '{}'::jsonb;
+		ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ;
+		ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_by TEXT NOT NULL DEFAULT '';
+		ALTER TABLE targets ADD COLUMN IF NOT EXISTS muted_until TIMESTAMPTZ;
 	`); err != nil {
 		return fmt.Errorf("seed system_settings: %w", err)
 	}
@@ -436,7 +442,7 @@ func (s *Store) ListTargets(ctx context.Context) ([]Target, error) {
 		SELECT t.id, t.group_id, t.name, t.host, t.probe_type, t.port_or_path,
 		       t.interval_sec, t.timeout_ms, t.enabled, t.auto_mtr_on_loss,
 		       t.mtr_loss_threshold, t.assign_all_probes, t.pinned_on_tv,
-		       t.latency_warn_ms, t.probe_latency_overrides, t.created_at, t.updated_at,
+		       t.latency_warn_ms, t.probe_latency_overrides, t.muted_until, t.created_at, t.updated_at,
 		       COALESCE(ARRAY(SELECT pta.probe_id FROM probe_target_assignments pta WHERE pta.target_id = t.id), '{}')
 		FROM targets t
 		ORDER BY t.name ASC
@@ -454,7 +460,7 @@ func (s *Store) ListTargets(ctx context.Context) ([]Target, error) {
 			&t.ID, &t.GroupID, &t.Name, &t.Host, &t.ProbeType, &t.PortOrPath,
 			&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AutoMTROnLoss,
 			&t.MTRLossThreshold, &t.AssignAllProbes, &t.PinnedOnTV,
-			&t.LatencyWarnMs, &overridesRaw, &t.CreatedAt, &t.UpdatedAt, &t.ProbeIDs,
+			&t.LatencyWarnMs, &overridesRaw, &t.MutedUntil, &t.CreatedAt, &t.UpdatedAt, &t.ProbeIDs,
 		); err != nil {
 			return nil, err
 		}
@@ -477,7 +483,7 @@ func (s *Store) GetTarget(ctx context.Context, id uuid.UUID) (Target, error) {
 		SELECT t.id, t.group_id, t.name, t.host, t.probe_type, t.port_or_path,
 		       t.interval_sec, t.timeout_ms, t.enabled, t.auto_mtr_on_loss,
 		       t.mtr_loss_threshold, t.assign_all_probes, t.pinned_on_tv,
-		       t.latency_warn_ms, t.probe_latency_overrides, t.created_at, t.updated_at,
+		       t.latency_warn_ms, t.probe_latency_overrides, t.muted_until, t.created_at, t.updated_at,
 		       COALESCE(ARRAY(SELECT pta.probe_id FROM probe_target_assignments pta WHERE pta.target_id = t.id), '{}')
 		FROM targets t
 		WHERE t.id = $1
@@ -485,7 +491,7 @@ func (s *Store) GetTarget(ctx context.Context, id uuid.UUID) (Target, error) {
 		&t.ID, &t.GroupID, &t.Name, &t.Host, &t.ProbeType, &t.PortOrPath,
 		&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AutoMTROnLoss,
 		&t.MTRLossThreshold, &t.AssignAllProbes, &t.PinnedOnTV,
-		&t.LatencyWarnMs, &overridesRaw, &t.CreatedAt, &t.UpdatedAt, &t.ProbeIDs,
+		&t.LatencyWarnMs, &overridesRaw, &t.MutedUntil, &t.CreatedAt, &t.UpdatedAt, &t.ProbeIDs,
 	)
 	if err != nil {
 		return t, mapPGError(err)
@@ -528,7 +534,7 @@ func (s *Store) CreateTarget(ctx context.Context, in TargetInput) (Target, error
 		RETURNING id, group_id, name, host, probe_type, port_or_path,
 		          interval_sec, timeout_ms, enabled, auto_mtr_on_loss,
 		          mtr_loss_threshold, assign_all_probes, pinned_on_tv,
-		          latency_warn_ms, probe_latency_overrides, created_at, updated_at
+		          latency_warn_ms, probe_latency_overrides, muted_until, created_at, updated_at
 	`, id, in.GroupID, in.Name, in.Host, in.ProbeType, in.PortOrPath,
 		in.IntervalSec, in.TimeoutMs, in.Enabled, in.AutoMTROnLoss,
 		in.MTRLossThreshold, in.AssignAllProbes, in.PinnedOnTV,
@@ -536,7 +542,7 @@ func (s *Store) CreateTarget(ctx context.Context, in TargetInput) (Target, error
 		&t.ID, &t.GroupID, &t.Name, &t.Host, &t.ProbeType, &t.PortOrPath,
 		&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AutoMTROnLoss,
 		&t.MTRLossThreshold, &t.AssignAllProbes, &t.PinnedOnTV,
-		&t.LatencyWarnMs, &overridesRaw, &t.CreatedAt, &t.UpdatedAt,
+		&t.LatencyWarnMs, &overridesRaw, &t.MutedUntil, &t.CreatedAt, &t.UpdatedAt,
 	)
 	if err != nil {
 		return Target{}, mapPGError(err)
@@ -591,7 +597,7 @@ func (s *Store) UpdateTarget(ctx context.Context, id uuid.UUID, in TargetInput) 
 		RETURNING id, group_id, name, host, probe_type, port_or_path,
 		          interval_sec, timeout_ms, enabled, auto_mtr_on_loss,
 		          mtr_loss_threshold, assign_all_probes, pinned_on_tv,
-		          latency_warn_ms, probe_latency_overrides, created_at, updated_at
+		          latency_warn_ms, probe_latency_overrides, muted_until, created_at, updated_at
 	`, id, in.GroupID, in.Name, in.Host, in.ProbeType, in.PortOrPath,
 		in.IntervalSec, in.TimeoutMs, in.Enabled, in.AutoMTROnLoss,
 		in.MTRLossThreshold, in.AssignAllProbes, in.PinnedOnTV,
@@ -599,7 +605,7 @@ func (s *Store) UpdateTarget(ctx context.Context, id uuid.UUID, in TargetInput) 
 		&t.ID, &t.GroupID, &t.Name, &t.Host, &t.ProbeType, &t.PortOrPath,
 		&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AutoMTROnLoss,
 		&t.MTRLossThreshold, &t.AssignAllProbes, &t.PinnedOnTV,
-		&t.LatencyWarnMs, &overridesRaw, &t.CreatedAt, &t.UpdatedAt,
+		&t.LatencyWarnMs, &overridesRaw, &t.MutedUntil, &t.CreatedAt, &t.UpdatedAt,
 	)
 	if err != nil {
 		return Target{}, mapPGError(err)
@@ -627,6 +633,13 @@ func (s *Store) UpdateTarget(ctx context.Context, id uuid.UUID, in TargetInput) 
 		return Target{}, err
 	}
 	return t, nil
+}
+
+func (s *Store) SetTargetMute(ctx context.Context, id uuid.UUID, mutedUntil *time.Time) (Target, error) {
+	if _, err := s.pool.Exec(ctx, `UPDATE targets SET muted_until = $2, updated_at = NOW() WHERE id = $1`, id, mutedUntil); err != nil {
+		return Target{}, mapPGError(err)
+	}
+	return s.GetTarget(ctx, id)
 }
 
 func (s *Store) DeleteTarget(ctx context.Context, id uuid.UUID) error {
@@ -878,9 +891,25 @@ func (s *Store) DeleteAlertRule(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
+func normalizeSeverityFilter(f string) string {
+	if f == "critical" {
+		return "critical"
+	}
+	return "all"
+}
+
+func decodeTelegramMessageIDs(raw []byte) map[string]int64 {
+	out := make(map[string]int64)
+	if len(raw) == 0 {
+		return out
+	}
+	_ = json.Unmarshal(raw, &out)
+	return out
+}
+
 func (s *Store) ListAlertChannels(ctx context.Context) ([]AlertChannel, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, type, name, config_encrypted, config_hint, enabled, created_at
+		SELECT id, type, name, config_encrypted, config_hint, COALESCE(severity_filter, 'all'), enabled, created_at
 		FROM alert_channels
 		ORDER BY created_at DESC
 	`)
@@ -891,9 +920,10 @@ func (s *Store) ListAlertChannels(ctx context.Context) ([]AlertChannel, error) {
 	out := make([]AlertChannel, 0)
 	for rows.Next() {
 		var c AlertChannel
-		if err := rows.Scan(&c.ID, &c.Type, &c.Name, &c.ConfigEncrypted, &c.ConfigHint, &c.Enabled, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Type, &c.Name, &c.ConfigEncrypted, &c.ConfigHint, &c.SeverityFilter, &c.Enabled, &c.CreatedAt); err != nil {
 			return nil, err
 		}
+		c.SeverityFilter = normalizeSeverityFilter(c.SeverityFilter)
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -902,31 +932,36 @@ func (s *Store) ListAlertChannels(ctx context.Context) ([]AlertChannel, error) {
 func (s *Store) GetAlertChannel(ctx context.Context, id uuid.UUID) (AlertChannel, error) {
 	var c AlertChannel
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, type, name, config_encrypted, config_hint, enabled, created_at
+		SELECT id, type, name, config_encrypted, config_hint, COALESCE(severity_filter, 'all'), enabled, created_at
 		FROM alert_channels WHERE id = $1
-	`, id).Scan(&c.ID, &c.Type, &c.Name, &c.ConfigEncrypted, &c.ConfigHint, &c.Enabled, &c.CreatedAt)
+	`, id).Scan(&c.ID, &c.Type, &c.Name, &c.ConfigEncrypted, &c.ConfigHint, &c.SeverityFilter, &c.Enabled, &c.CreatedAt)
+	c.SeverityFilter = normalizeSeverityFilter(c.SeverityFilter)
 	return c, mapPGError(err)
 }
 
-func (s *Store) CreateAlertChannel(ctx context.Context, typ, name string, enc []byte, hint string, enabled bool) (AlertChannel, error) {
+func (s *Store) CreateAlertChannel(ctx context.Context, typ, name string, enc []byte, hint, severityFilter string, enabled bool) (AlertChannel, error) {
 	id := newUUIDv7()
+	sf := normalizeSeverityFilter(severityFilter)
 	var c AlertChannel
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO alert_channels (id, type, name, config_encrypted, config_hint, enabled)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, type, name, config_hint, enabled, created_at
-	`, id, typ, name, enc, hint, enabled).Scan(&c.ID, &c.Type, &c.Name, &c.ConfigHint, &c.Enabled, &c.CreatedAt)
+		INSERT INTO alert_channels (id, type, name, config_encrypted, config_hint, severity_filter, enabled)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, type, name, config_hint, COALESCE(severity_filter, 'all'), enabled, created_at
+	`, id, typ, name, enc, hint, sf, enabled).Scan(&c.ID, &c.Type, &c.Name, &c.ConfigHint, &c.SeverityFilter, &c.Enabled, &c.CreatedAt)
+	c.SeverityFilter = normalizeSeverityFilter(c.SeverityFilter)
 	return c, mapPGError(err)
 }
 
-func (s *Store) UpdateAlertChannel(ctx context.Context, id uuid.UUID, name string, enc []byte, hint string, enabled bool) (AlertChannel, error) {
+func (s *Store) UpdateAlertChannel(ctx context.Context, id uuid.UUID, name string, enc []byte, hint, severityFilter string, enabled bool) (AlertChannel, error) {
+	sf := normalizeSeverityFilter(severityFilter)
 	var c AlertChannel
 	err := s.pool.QueryRow(ctx, `
 		UPDATE alert_channels
-		SET name = $2, config_encrypted = $3, config_hint = $4, enabled = $5
+		SET name = $2, config_encrypted = $3, config_hint = $4, severity_filter = $5, enabled = $6
 		WHERE id = $1
-		RETURNING id, type, name, config_hint, enabled, created_at
-	`, id, name, enc, hint, enabled).Scan(&c.ID, &c.Type, &c.Name, &c.ConfigHint, &c.Enabled, &c.CreatedAt)
+		RETURNING id, type, name, config_hint, COALESCE(severity_filter, 'all'), enabled, created_at
+	`, id, name, enc, hint, sf, enabled).Scan(&c.ID, &c.Type, &c.Name, &c.ConfigHint, &c.SeverityFilter, &c.Enabled, &c.CreatedAt)
+	c.SeverityFilter = normalizeSeverityFilter(c.SeverityFilter)
 	return c, mapPGError(err)
 }
 
@@ -949,17 +984,19 @@ func scanIncidentRows(rows interface {
 	out := make([]Incident, 0)
 	for rows.Next() {
 		var inc Incident
-		var rawProbes []byte
+		var rawProbes, rawMsgIDs []byte
 		if err := rows.Scan(
 			&inc.ID, &inc.RuleID, &inc.RuleName, &inc.TargetID, &inc.TargetName,
 			&inc.Status, &inc.Severity, &rawProbes, &inc.PeakValue, &inc.StartedAt, &inc.ResolvedAt,
-			&inc.LastNotifiedAt, &inc.Summary,
+			&inc.LastNotifiedAt, &inc.NotifiedSeverity, &rawMsgIDs,
+			&inc.AcknowledgedAt, &inc.AcknowledgedBy, &inc.Summary,
 		); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(rawProbes, &inc.AffectedProbes); err != nil {
 			inc.AffectedProbes = []string{}
 		}
+		inc.TelegramMessageIDs = decodeTelegramMessageIDs(rawMsgIDs)
 		out = append(out, inc)
 	}
 	return out, rows.Err()
@@ -972,7 +1009,9 @@ func (s *Store) ListIncidents(ctx context.Context, limit int) ([]Incident, error
 	rows, err := s.pool.Query(ctx, `
 		SELECT i.id, i.rule_id, COALESCE(r.name, 'Deleted Rule'), i.target_id,
 		       COALESCE(t.name, 'Fleet / System'), i.status, i.severity, i.affected_probes,
-		       i.peak_value, i.started_at, i.resolved_at, i.last_notified_at, i.summary
+		       i.peak_value, i.started_at, i.resolved_at, i.last_notified_at,
+		       COALESCE(i.notified_severity, ''), COALESCE(i.telegram_message_ids, '{}'::jsonb),
+		       i.acknowledged_at, COALESCE(i.acknowledged_by, ''), i.summary
 		FROM incidents i
 		LEFT JOIN alert_rules r ON r.id = i.rule_id
 		LEFT JOIN targets t ON t.id = i.target_id
@@ -990,7 +1029,9 @@ func (s *Store) ListOpenIncidents(ctx context.Context) ([]Incident, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT i.id, i.rule_id, COALESCE(r.name, 'Deleted Rule'), i.target_id,
 		       COALESCE(t.name, 'Fleet / System'), i.status, i.severity, i.affected_probes,
-		       i.peak_value, i.started_at, i.resolved_at, i.last_notified_at, i.summary
+		       i.peak_value, i.started_at, i.resolved_at, i.last_notified_at,
+		       COALESCE(i.notified_severity, ''), COALESCE(i.telegram_message_ids, '{}'::jsonb),
+		       i.acknowledged_at, COALESCE(i.acknowledged_by, ''), i.summary
 		FROM incidents i
 		LEFT JOIN alert_rules r ON r.id = i.rule_id
 		LEFT JOIN targets t ON t.id = i.target_id
@@ -1016,23 +1057,29 @@ func (s *Store) UpsertOpenIncident(ctx context.Context, ruleID uuid.UUID, target
 	probesJSON, _ := json.Marshal(affectedProbes)
 
 	var existing Incident
-	var rawProbes []byte
+	var rawProbes, rawMsgIDs []byte
 	var err error
 	if targetID != nil {
 		err = s.pool.QueryRow(ctx, `
-			SELECT id, rule_id, target_id, status, severity, affected_probes, peak_value, started_at, resolved_at, last_notified_at, summary
+			SELECT id, rule_id, target_id, status, severity, affected_probes, peak_value, started_at, resolved_at,
+			       last_notified_at, COALESCE(notified_severity, ''), COALESCE(telegram_message_ids, '{}'::jsonb),
+			       acknowledged_at, COALESCE(acknowledged_by, ''), summary
 			FROM incidents WHERE rule_id = $1 AND target_id = $2 AND status = 'open'
 		`, ruleID, *targetID).Scan(
 			&existing.ID, &existing.RuleID, &existing.TargetID, &existing.Status, &existing.Severity, &rawProbes,
-			&existing.PeakValue, &existing.StartedAt, &existing.ResolvedAt, &existing.LastNotifiedAt, &existing.Summary,
+			&existing.PeakValue, &existing.StartedAt, &existing.ResolvedAt, &existing.LastNotifiedAt,
+			&existing.NotifiedSeverity, &rawMsgIDs, &existing.AcknowledgedAt, &existing.AcknowledgedBy, &existing.Summary,
 		)
 	} else {
 		err = s.pool.QueryRow(ctx, `
-			SELECT id, rule_id, target_id, status, severity, affected_probes, peak_value, started_at, resolved_at, last_notified_at, summary
+			SELECT id, rule_id, target_id, status, severity, affected_probes, peak_value, started_at, resolved_at,
+			       last_notified_at, COALESCE(notified_severity, ''), COALESCE(telegram_message_ids, '{}'::jsonb),
+			       acknowledged_at, COALESCE(acknowledged_by, ''), summary
 			FROM incidents WHERE rule_id = $1 AND target_id IS NULL AND status = 'open'
 		`, ruleID).Scan(
 			&existing.ID, &existing.RuleID, &existing.TargetID, &existing.Status, &existing.Severity, &rawProbes,
-			&existing.PeakValue, &existing.StartedAt, &existing.ResolvedAt, &existing.LastNotifiedAt, &existing.Summary,
+			&existing.PeakValue, &existing.StartedAt, &existing.ResolvedAt, &existing.LastNotifiedAt,
+			&existing.NotifiedSeverity, &rawMsgIDs, &existing.AcknowledgedAt, &existing.AcknowledgedBy, &existing.Summary,
 		)
 	}
 
@@ -1055,6 +1102,7 @@ func (s *Store) UpsertOpenIncident(ctx context.Context, ruleID uuid.UUID, target
 		existing.PeakValue = peak
 		existing.Summary = summary
 		existing.Severity = nextSeverity
+		existing.TelegramMessageIDs = decodeTelegramMessageIDs(rawMsgIDs)
 		return existing, false, escalated, updErr
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -1065,41 +1113,51 @@ func (s *Store) UpsertOpenIncident(ctx context.Context, ruleID uuid.UUID, target
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO incidents (id, rule_id, target_id, status, severity, affected_probes, peak_value, started_at, summary)
 		VALUES ($1, $2, $3, 'open', $4, $5, $6, $7, $8)
-		RETURNING id, rule_id, target_id, status, severity, peak_value, started_at, resolved_at, last_notified_at, summary
+		RETURNING id, rule_id, target_id, status, severity, peak_value, started_at, resolved_at, last_notified_at,
+		          COALESCE(notified_severity, ''), COALESCE(telegram_message_ids, '{}'::jsonb),
+		          acknowledged_at, COALESCE(acknowledged_by, ''), summary
 	`, id, ruleID, targetID, severity, probesJSON, peak, now, summary).Scan(
 		&existing.ID, &existing.RuleID, &existing.TargetID, &existing.Status, &existing.Severity,
-		&existing.PeakValue, &existing.StartedAt, &existing.ResolvedAt, &existing.LastNotifiedAt, &existing.Summary,
+		&existing.PeakValue, &existing.StartedAt, &existing.ResolvedAt, &existing.LastNotifiedAt,
+		&existing.NotifiedSeverity, &rawMsgIDs, &existing.AcknowledgedAt, &existing.AcknowledgedBy, &existing.Summary,
 	)
 	if err != nil {
 		return Incident{}, false, false, mapPGError(err)
 	}
 	existing.AffectedProbes = affectedProbes
+	existing.TelegramMessageIDs = decodeTelegramMessageIDs(rawMsgIDs)
 	return existing, true, false, nil
 }
 
 func (s *Store) ResolveOpenIncident(ctx context.Context, ruleID uuid.UUID, targetID *uuid.UUID, now time.Time) (*Incident, error) {
 	var inc Incident
-	var rawProbes []byte
+	var rawProbes, rawMsgIDs []byte
 	var err error
 	if targetID != nil {
 		err = s.pool.QueryRow(ctx, `
 			UPDATE incidents
 			SET status = 'resolved', resolved_at = $3
 			WHERE rule_id = $1 AND target_id = $2 AND status = 'open'
-			RETURNING id, rule_id, target_id, status, severity, affected_probes, peak_value, started_at, resolved_at, last_notified_at, summary
+			RETURNING id, rule_id, target_id, status, severity, affected_probes, peak_value, started_at, resolved_at,
+			          last_notified_at, COALESCE(notified_severity, ''), COALESCE(telegram_message_ids, '{}'::jsonb),
+			          acknowledged_at, COALESCE(acknowledged_by, ''), summary
 		`, ruleID, *targetID, now).Scan(
 			&inc.ID, &inc.RuleID, &inc.TargetID, &inc.Status, &inc.Severity, &rawProbes,
-			&inc.PeakValue, &inc.StartedAt, &inc.ResolvedAt, &inc.LastNotifiedAt, &inc.Summary,
+			&inc.PeakValue, &inc.StartedAt, &inc.ResolvedAt, &inc.LastNotifiedAt,
+			&inc.NotifiedSeverity, &rawMsgIDs, &inc.AcknowledgedAt, &inc.AcknowledgedBy, &inc.Summary,
 		)
 	} else {
 		err = s.pool.QueryRow(ctx, `
 			UPDATE incidents
 			SET status = 'resolved', resolved_at = $2
 			WHERE rule_id = $1 AND target_id IS NULL AND status = 'open'
-			RETURNING id, rule_id, target_id, status, severity, affected_probes, peak_value, started_at, resolved_at, last_notified_at, summary
+			RETURNING id, rule_id, target_id, status, severity, affected_probes, peak_value, started_at, resolved_at,
+			          last_notified_at, COALESCE(notified_severity, ''), COALESCE(telegram_message_ids, '{}'::jsonb),
+			          acknowledged_at, COALESCE(acknowledged_by, ''), summary
 		`, ruleID, now).Scan(
 			&inc.ID, &inc.RuleID, &inc.TargetID, &inc.Status, &inc.Severity, &rawProbes,
-			&inc.PeakValue, &inc.StartedAt, &inc.ResolvedAt, &inc.LastNotifiedAt, &inc.Summary,
+			&inc.PeakValue, &inc.StartedAt, &inc.ResolvedAt, &inc.LastNotifiedAt,
+			&inc.NotifiedSeverity, &rawMsgIDs, &inc.AcknowledgedAt, &inc.AcknowledgedBy, &inc.Summary,
 		)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1109,12 +1167,69 @@ func (s *Store) ResolveOpenIncident(ctx context.Context, ruleID uuid.UUID, targe
 		return nil, err
 	}
 	_ = json.Unmarshal(rawProbes, &inc.AffectedProbes)
+	inc.TelegramMessageIDs = decodeTelegramMessageIDs(rawMsgIDs)
 	return &inc, nil
 }
 
-func (s *Store) MarkIncidentNotified(ctx context.Context, id uuid.UUID, now time.Time) error {
-	_, err := s.pool.Exec(ctx, `UPDATE incidents SET last_notified_at = $2 WHERE id = $1`, id, now)
+func (s *Store) MarkIncidentNotified(ctx context.Context, id uuid.UUID, notifiedSeverity string, now time.Time, telegramMsgIDs map[string]int64) error {
+	if telegramMsgIDs == nil {
+		telegramMsgIDs = map[string]int64{}
+	}
+	msgIDsJSON, _ := json.Marshal(telegramMsgIDs)
+	if now.IsZero() {
+		_, err := s.pool.Exec(ctx, `
+			UPDATE incidents
+			SET telegram_message_ids = COALESCE(telegram_message_ids, '{}'::jsonb) || $2::jsonb
+			WHERE id = $1
+		`, id, msgIDsJSON)
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE incidents
+		SET last_notified_at = $2,
+		    notified_severity = CASE
+		        WHEN notified_severity = 'critical' OR $3 = 'critical' THEN 'critical'
+		        WHEN $3 <> '' THEN $3
+		        ELSE notified_severity
+		    END,
+		    telegram_message_ids = COALESCE(telegram_message_ids, '{}'::jsonb) || $4::jsonb
+		WHERE id = $1
+	`, id, now, notifiedSeverity, msgIDsJSON)
 	return err
+}
+
+func (s *Store) AcknowledgeIncident(ctx context.Context, id uuid.UUID, ackBy string, now time.Time) (Incident, error) {
+	if ackBy == "" {
+		ackBy = "admin"
+	}
+	var inc Incident
+	var rawProbes, rawMsgIDs []byte
+	err := s.pool.QueryRow(ctx, `
+		UPDATE incidents i
+		SET acknowledged_at = COALESCE(i.acknowledged_at, $2),
+		    acknowledged_by = CASE WHEN i.acknowledged_by = '' THEN $3 ELSE i.acknowledged_by END
+		WHERE i.id = $1 AND i.status = 'open'
+		RETURNING i.id, i.rule_id,
+		          COALESCE((SELECT r.name FROM alert_rules r WHERE r.id = i.rule_id), 'Deleted Rule'),
+		          i.target_id,
+		          COALESCE((SELECT t.name FROM targets t WHERE t.id = i.target_id), 'Fleet / System'),
+		          i.status, i.severity, i.affected_probes, i.peak_value, i.started_at, i.resolved_at,
+		          i.last_notified_at, COALESCE(i.notified_severity, ''), COALESCE(i.telegram_message_ids, '{}'::jsonb),
+		          i.acknowledged_at, COALESCE(i.acknowledged_by, ''), i.summary
+	`, id, now, ackBy).Scan(
+		&inc.ID, &inc.RuleID, &inc.RuleName, &inc.TargetID, &inc.TargetName,
+		&inc.Status, &inc.Severity, &rawProbes, &inc.PeakValue, &inc.StartedAt, &inc.ResolvedAt,
+		&inc.LastNotifiedAt, &inc.NotifiedSeverity, &rawMsgIDs,
+		&inc.AcknowledgedAt, &inc.AcknowledgedBy, &inc.Summary,
+	)
+	if err != nil {
+		return Incident{}, mapPGError(err)
+	}
+	if err := json.Unmarshal(rawProbes, &inc.AffectedProbes); err != nil {
+		inc.AffectedProbes = []string{}
+	}
+	inc.TelegramMessageIDs = decodeTelegramMessageIDs(rawMsgIDs)
+	return inc, nil
 }
 
 // --- Settings & Retention ---

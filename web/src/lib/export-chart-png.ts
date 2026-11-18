@@ -8,6 +8,7 @@ import {
   computeChartYUpper,
   formatLoss,
   formatMs,
+  getLossAxisSplits,
   type ProbeSeriesInput,
 } from "./smoke-math";
 
@@ -136,7 +137,16 @@ function computeNiceXTicks(startTs: number, endTs: number): number[] {
   return ticks;
 }
 
-function drawVectorSmokePlot(
+export interface SmokePlotBoxGeometry {
+  gLeft: number;
+  gTop: number;
+  gW: number;
+  gH: number;
+  gRight: number;
+  gBottom: number;
+}
+
+export function drawVectorSmokePlot(
   ctx: CanvasRenderingContext2D,
   series: ProbeSeriesInput,
   boxX: number,
@@ -144,9 +154,9 @@ function drawVectorSmokePlot(
   boxW: number,
   boxH: number,
   warnMs?: number | null
-) {
+): SmokePlotBoxGeometry {
   const mLeft = 62;
-  const mRight = 18;
+  const mRight = 48;
   const mTop = 14;
   const mBottom = 38;
   const gLeft = boxX + mLeft;
@@ -173,7 +183,7 @@ function drawVectorSmokePlot(
   const toY = (v: number) =>
     gBottom - (Math.max(0, Math.min(yMax, v)) / yMax) * gH;
 
-  // Horizontal Y grid & right-aligned axis labels (never clipped on the left)
+  // Horizontal Y grid & right-aligned latency axis labels (left side, ms)
   ctx.font = "11px 'JetBrains Mono', ui-monospace, monospace";
   ctx.textBaseline = "middle";
   for (const val of yTicks) {
@@ -189,6 +199,22 @@ function drawVectorSmokePlot(
     ctx.textAlign = "right";
     const lbl = `${val.toFixed(val > 0 && val < 10 ? 1 : 0)}ms`;
     ctx.fillText(lbl, gLeft - 8, y);
+  }
+
+  // Right-hand packet loss Y-axis ticks & labels (0%..100%)
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  for (const pct of getLossAxisSplits(false)) {
+    const y = Math.round(gBottom - (pct / 100) * gH) + 0.5;
+    ctx.strokeStyle = "#27272a";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(gRight, y);
+    ctx.lineTo(gRight + 4, y);
+    ctx.stroke();
+
+    ctx.fillStyle = "#a1a1aa";
+    ctx.fillText(`${pct}%`, gRight + 8, y);
   }
 
   // Vertical X grid & strict 24h + date ticks (never clipped at the bottom)
@@ -227,6 +253,8 @@ function drawVectorSmokePlot(
     yMax,
     warnMs: effectiveWarn,
   });
+
+  return { gLeft, gTop, gW, gH, gRight, gBottom };
 }
 
 export const DEFAULT_EVIDENCE_BRAND_NAME = "Smoker by anamBadrus";

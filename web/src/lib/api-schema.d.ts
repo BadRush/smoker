@@ -246,6 +246,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/targets/{id}/mute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["muteTarget"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/targets/{id}/series": {
         parameters: {
             query?: never;
@@ -406,6 +422,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/alerts/incidents/{id}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["acknowledgeIncident"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/settings": {
         parameters: {
             query?: never;
@@ -506,6 +538,8 @@ export interface components {
             probe_latency_overrides: {
                 [key: string]: number;
             };
+            /** Format: date-time */
+            muted_until?: string | null;
             assign_all_probes: boolean;
             probe_ids: string[];
             /** Format: date-time */
@@ -670,6 +704,8 @@ export interface components {
             type: "telegram" | "webhook";
             name: string;
             config_hint: string;
+            /** @enum {string} */
+            severity_filter?: "all" | "critical";
             enabled: boolean;
             /** Format: date-time */
             created_at: string;
@@ -683,6 +719,8 @@ export interface components {
             /** Format: int64 */
             thread_id?: number | null;
             webhook_url?: string;
+            /** @enum {string} */
+            severity_filter?: "all" | "critical";
             enabled?: boolean;
         };
         AlertChannelUpdateInput: {
@@ -692,6 +730,8 @@ export interface components {
             /** Format: int64 */
             thread_id?: number | null;
             webhook_url?: string;
+            /** @enum {string} */
+            severity_filter?: "all" | "critical";
             enabled?: boolean;
         };
         Incident: {
@@ -713,6 +753,9 @@ export interface components {
             started_at: string;
             /** Format: date-time */
             resolved_at?: string | null;
+            /** Format: date-time */
+            acknowledged_at?: string | null;
+            acknowledged_by?: string;
             summary: string;
         };
         SystemSettings: {
@@ -1224,6 +1267,37 @@ export interface operations {
             };
         };
     };
+    muteTarget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    duration_sec?: number;
+                    duration?: string;
+                    /** Format: date-time */
+                    muted_until?: string | null;
+                };
+            };
+        };
+        responses: {
+            /** @description Updated target mute window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Target"];
+                };
+            };
+        };
+    };
     getTargetSeries: {
         parameters: {
             query?: {
@@ -1561,6 +1635,28 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Incident"][];
+                };
+            };
+        };
+    };
+    acknowledgeIncident: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Incident acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Incident"];
                 };
             };
         };

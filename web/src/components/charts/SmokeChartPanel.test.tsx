@@ -18,10 +18,32 @@ if (typeof globalThis.ResizeObserver === "undefined") {
 
 const setScaleSpy = vi.fn();
 const setDataSpy = vi.fn();
+const capturedOpts: Array<{
+  scales?: Record<string, { auto?: boolean; range?: (...args: unknown[]) => [number, number] }>;
+  axes?: Array<{
+    side?: number;
+    scale?: string;
+    splits?: () => number[];
+    values?: (u: unknown, vals: number[]) => string[];
+  }>;
+  hooks?: {
+    setScale?: Array<(u: unknown, key: string) => void>;
+  };
+}> = [];
+const mockPlotInstances: Array<{
+  scales: { x: { min: number; max: number }; y: { min: number; max: number } };
+  opts: (typeof capturedOpts)[number];
+}> = [];
 
 vi.mock("uplot", () => {
   class FakeUPlot {
     scales = { x: { min: 0, max: 0 }, y: { min: 0, max: 100 } };
+    opts: (typeof capturedOpts)[number];
+    constructor(opts: (typeof capturedOpts)[number]) {
+      this.opts = opts;
+      capturedOpts.push(opts);
+      mockPlotInstances.push(this);
+    }
     destroy() {}
     setData(...args: unknown[]) {
       setDataSpy(...args);
@@ -239,5 +261,88 @@ describe("SmokeChartPanel", () => {
     });
     const last15m = setScaleSpy.mock.calls.at(-1)?.[1] as { min: number; max: number };
     expect(last15m.max - last15m.min).toBe(900);
+  });
+
+  it("configures a right-hand 0%..100% loss Y-axis in both zoomed and compact modes and shows zoom window loss", async () => {
+    const user = userEvent.setup();
+    capturedOpts.length = 0;
+    mockPlotInstances.length = 0;
+
+    const baseSeries = {
+      probe_id: "p1",
+      probe_name: "probe-local",
+      location_label: "Jakarta",
+      timestamps: [1700000000, 1700000060, 1700000120, 1700000180],
+      min_ms: [4, 5, null, 5],
+      p25_ms: [5, 6, null, 6],
+      p50_ms: [6, 8, null, 7],
+      p75_ms: [7, 10, null, 8],
+      p95_ms: [9, 12, null, 9],
+      max_ms: [10, 14, null, 10],
+      jitter_ms: [0.5, 1.0, null, 0.5],
+      loss_pct: [0, 20, 100, 0],
+    };
+
+    const { rerender } = render(
+      <SmokeChartPanel
+        syncKey="loss-axis-full"
+        targetName="Cloudflare DNS"
+        targetHost="1.1.1.1"
+        series={baseSeries}
+      />
+    );
+
+    await vi.waitFor(() => {
+      expect(capturedOpts.length).toBeGreaterThanOrEqual(1);
+    });
+
+    const fullOpts = capturedOpts.at(-1)!;
+    expect(fullOpts.scales?.loss?.auto).toBe(false);
+    expect(fullOpts.scales?.loss?.range?.()).toEqual([0, 100]);
+    const fullLossAxis = fullOpts.axes?.[2];
+    expect(fullLossAxis?.side).toBe(1);
+    expect(fullLossAxis?.scale).toBe("loss");
+    const fullSplits = fullLossAxis?.splits?.() ?? [];
+    expect(fullSplits).toEqual([0, 25, 50, 75, 100]);
+    expect(fullLossAxis?.values?.(null, fullSplits)).toEqual([
+      "0%",
+      "25%",
+      "50%",
+      "75%",
+      "100%",
+    ]);
+
+    // Simulate horizontal drag-zoom across [1700000060, 1700000120] -> avg 60.0%, peak 100.0%
+    const inst = mockPlotInstances.at(-1)!;
+    inst.scales.x = { min: 1700000060, max: 1700000120 };
+    inst.opts.hooks?.setScale?.[0]?.(inst, "x");
+
+    const zoomLossBadge = await screen.findByTestId("zoom-window-loss");
+    expect(zoomLossBadge).toHaveTextContent("Zoom Loss:");
+    expect(zoomLossBadge).toHaveTextContent("avg 60.0%");
+    expect(zoomLossBadge).toHaveTextContent("peak 100.0%");
+
+    await user.click(screen.getByTestId("reset-zoom-btn"));
+    expect(screen.queryByTestId("zoom-window-loss")).not.toBeInTheDocument();
+
+    // Compact mode uses concise [0, 50, 100] splits on right axis
+    capturedOpts.length = 0;
+    rerender(
+      <SmokeChartPanel
+        compact
+        syncKey="loss-axis-compact"
+        targetName="Cloudflare DNS"
+        targetHost="1.1.1.1"
+        series={baseSeries}
+      />
+    );
+
+    await vi.waitFor(() => {
+      expect(capturedOpts.length).toBeGreaterThanOrEqual(1);
+    });
+    const compactLossAxis = capturedOpts.at(-1)!.axes?.[2];
+    expect(compactLossAxis?.side).toBe(1);
+    expect(compactLossAxis?.scale).toBe("loss");
+    expect(compactLossAxis?.splits?.()).toEqual([0, 50, 100]);
   });
 });

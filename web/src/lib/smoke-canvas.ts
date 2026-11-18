@@ -172,21 +172,24 @@ export function drawSmokeScene({
     "innerCloud"
   );
 
-  // 2. Vertical packet loss indicators
+  // 2. Vertical packet loss indicators (linearly calibrated 0%..100% to right Y-axis)
   const barW = Math.max(2, Math.min(6, width / Math.max(ts.length, 30)));
   for (let i = 0; i < ts.length; i++) {
-    const loss = series.loss_pct[i] ?? 0;
-    if (loss <= 0) continue;
+    const rawLoss = series.loss_pct[i] ?? 0;
+    if (!Number.isFinite(rawLoss) || rawLoss <= 0) continue;
+    const clampedLoss = Math.min(100, Math.max(0, rawLoss));
     const x = toX(ts[i]);
     if (x < left - barW || x > right + barW) continue;
 
-    if (loss >= 100) {
+    if (clampedLoss >= 100) {
       ctx.fillStyle = "rgba(244, 63, 94, 0.45)";
       ctx.fillRect(x - barW / 2, top, barW, height);
     } else {
-      const tickH = Math.max(6, (loss / 100) * height * 0.65);
+      const tickH = Math.max(3, (clampedLoss / 100) * height);
       ctx.fillStyle =
-        loss >= 25 ? "rgba(244, 63, 94, 0.85)" : "rgba(245, 158, 11, 0.85)";
+        clampedLoss >= 25
+          ? "rgba(244, 63, 94, 0.85)"
+          : "rgba(245, 158, 11, 0.85)";
       ctx.fillRect(x - barW / 2, bottom - tickH, barW, tickH);
     }
   }

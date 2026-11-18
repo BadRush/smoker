@@ -74,6 +74,7 @@ type Target struct {
 	PinnedOnTV            bool           `json:"pinned_on_tv"`
 	LatencyWarnMs         int            `json:"latency_warn_ms"`
 	ProbeLatencyOverrides map[string]int `json:"probe_latency_overrides"`
+	MutedUntil            *time.Time     `json:"muted_until"`
 	CreatedAt             time.Time      `json:"created_at"`
 	UpdatedAt             time.Time      `json:"updated_at"`
 }
@@ -101,24 +102,29 @@ type AlertChannel struct {
 	Name            string    `json:"name"`
 	ConfigEncrypted []byte    `json:"-"`
 	ConfigHint      string    `json:"config_hint"`
+	SeverityFilter  string    `json:"severity_filter"`
 	Enabled         bool      `json:"enabled"`
 	CreatedAt       time.Time `json:"created_at"`
 }
 
 type Incident struct {
-	ID             uuid.UUID  `json:"id"`
-	RuleID         uuid.UUID  `json:"rule_id"`
-	RuleName       string     `json:"rule_name"`
-	TargetID       *uuid.UUID `json:"target_id"`
-	TargetName     string     `json:"target_name"`
-	Status         string     `json:"status"`
-	Severity       string     `json:"severity"`
-	AffectedProbes []string   `json:"affected_probes"`
-	PeakValue      float64    `json:"peak_value"`
-	StartedAt      time.Time  `json:"started_at"`
-	ResolvedAt     *time.Time `json:"resolved_at"`
-	LastNotifiedAt *time.Time `json:"-"`
-	Summary        string     `json:"summary"`
+	ID                 uuid.UUID        `json:"id"`
+	RuleID             uuid.UUID        `json:"rule_id"`
+	RuleName           string           `json:"rule_name"`
+	TargetID           *uuid.UUID       `json:"target_id"`
+	TargetName         string           `json:"target_name"`
+	Status             string           `json:"status"`
+	Severity           string           `json:"severity"`
+	AffectedProbes     []string         `json:"affected_probes"`
+	PeakValue          float64          `json:"peak_value"`
+	StartedAt          time.Time        `json:"started_at"`
+	ResolvedAt         *time.Time       `json:"resolved_at"`
+	LastNotifiedAt     *time.Time       `json:"-"`
+	NotifiedSeverity   string           `json:"-"`
+	TelegramMessageIDs map[string]int64 `json:"-"`
+	AcknowledgedAt     *time.Time       `json:"acknowledged_at"`
+	AcknowledgedBy     string           `json:"acknowledged_by"`
+	Summary            string           `json:"summary"`
 }
 
 type MTRSnapshot struct {

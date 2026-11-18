@@ -538,7 +538,7 @@ func validateTargetInput(req targetRequest) (db.TargetInput, string) {
 		}
 	}
 
-	interval := 1
+	interval := 5
 	if req.IntervalSec != nil {
 		interval = *req.IntervalSec
 	}
@@ -692,6 +692,64 @@ func (s *Server) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	s.syncProbesAsync()
 	writeJSON(w, http.StatusOK, t)
+}
+
+func (s *Server) handleMuteTarget(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseUUIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	var req struct {
+		DurationSec *int       `json:"duration_sec"`
+		Duration    string     `json:"duration"`
+		MutedUntil  *time.Time `json:"muted_until"`
+	}
+	if r.ContentLength > 0 {
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeProblem(w, r, http.StatusBadRequest, "bad_json", "Invalid mute payload")
+			return
+		}
+	}
+	now := time.Now().UTC()
+	var mutedUntil *time.Time
+	if req.MutedUntil != nil {
+		if req.MutedUntil.After(now) {
+			t := req.MutedUntil.UTC()
+			mutedUntil = &t
+		}
+	} else if strings.TrimSpace(req.Duration) != "" {
+		dStr := strings.ToLower(strings.TrimSpace(req.Duration))
+		switch dStr {
+		case "0", "off", "unmute", "clear", "none":
+			mutedUntil = nil
+		default:
+			d, err := time.ParseDuration(dStr)
+			if err != nil || d < 0 || d > 30*24*time.Hour {
+				writeProblem(w, r, http.StatusBadRequest, "validation_error", "duration must be a valid positive duration up to 720h or 'off'")
+				return
+			}
+			if d > 0 {
+				t := now.Add(d)
+				mutedUntil = &t
+			}
+		}
+	} else if req.DurationSec != nil {
+		if *req.DurationSec < 0 || *req.DurationSec > 30*86400 {
+			writeProblem(w, r, http.StatusBadRequest, "validation_error", "duration_sec must be between 0 and 2592000")
+			return
+		}
+		if *req.DurationSec > 0 {
+			t := now.Add(time.Duration(*req.DurationSec) * time.Second)
+			mutedUntil = &t
+		}
+	}
+
+	target, err := s.store.SetTargetMute(r.Context(), id, mutedUntil)
+	if err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, target)
 }
 
 func (s *Server) handleDeleteTarget(w http.ResponseWriter, r *http.Request) {
@@ -1094,13 +1152,34 @@ func parseOptionalThreadID(raw json.RawMessage) (int64, error) {
 }
 
 type alertChannelReq struct {
-	Type       string          `json:"type"`
-	Name       string          `json:"name"`
-	BotToken   string          `json:"bot_token"`
-	ChatID     string          `json:"chat_id"`
-	ThreadID   json.RawMessage `json:"thread_id"`
-	WebhookURL string          `json:"webhook_url"`
-	Enabled    *bool           `json:"enabled"`
+	Type           string          `json:"type"`
+	Name           string          `json:"name"`
+	BotToken       string          `json:"bot_token"`
+	ChatID         string          `json:"chat_id"`
+	ThreadID       json.RawMessage `json:"thread_id"`
+	WebhookURL     string          `json:"webhook_url"`
+	SeverityFilter *string         `json:"severity_filter"`
+	EventsFilter   *string         `json:"events_filter"`
+	Enabled        *bool           `json:"enabled"`
+}
+
+func parseSeverityFilter(req alertChannelReq, defaultVal string) (string, string) {
+	if defaultVal == "" {
+		defaultVal = "all"
+	}
+	raw := defaultVal
+	if req.SeverityFilter != nil {
+		raw = strings.ToLower(strings.TrimSpace(*req.SeverityFilter))
+	} else if req.EventsFilter != nil {
+		raw = strings.ToLower(strings.TrimSpace(*req.EventsFilter))
+	}
+	if raw == "" {
+		raw = "all"
+	}
+	if raw != "all" && raw != "critical" {
+		return "", "severity_filter must be 'all' or 'critical'"
+	}
+	return raw, ""
 }
 
 func buildAlertChannelSecret(chType string, req alertChannelReq, existing *alerts.ChannelSecret) (alerts.ChannelSecret, string, string) {
@@ -1164,6 +1243,11 @@ func (s *Server) handleCreateAlertChannel(w http.ResponseWriter, r *http.Request
 		writeProblem(w, r, http.StatusBadRequest, "validation_error", "Channel name must be 1..80 characters")
 		return
 	}
+	severityFilter, sfErr := parseSeverityFilter(req, "all")
+	if sfErr != "" {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", sfErr)
+		return
+	}
 
 	sec, hint, errMsg := buildAlertChannelSecret(req.Type, req, nil)
 	if errMsg != "" {
@@ -1186,7 +1270,7 @@ func (s *Server) handleCreateAlertChannel(w http.ResponseWriter, r *http.Request
 		enabled = *req.Enabled
 	}
 
-	ch, err := s.store.CreateAlertChannel(r.Context(), req.Type, req.Name, enc, hint, enabled)
+	ch, err := s.store.CreateAlertChannel(r.Context(), req.Type, req.Name, enc, hint, severityFilter, enabled)
 	if err != nil {
 		handleStoreErr(w, r, err)
 		return
@@ -1228,6 +1312,11 @@ func (s *Server) handleUpdateAlertChannel(w http.ResponseWriter, r *http.Request
 		writeProblem(w, r, http.StatusBadRequest, "validation_error", "Channel name must be 1..80 characters")
 		return
 	}
+	severityFilter, sfErr := parseSeverityFilter(req, existingCh.SeverityFilter)
+	if sfErr != "" {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", sfErr)
+		return
+	}
 	sec, hint, errMsg := buildAlertChannelSecret(existingCh.Type, req, &oldSec)
 	if errMsg != "" {
 		writeProblem(w, r, http.StatusBadRequest, "validation_error", errMsg)
@@ -1248,7 +1337,7 @@ func (s *Server) handleUpdateAlertChannel(w http.ResponseWriter, r *http.Request
 		enabled = *req.Enabled
 	}
 
-	updated, err := s.store.UpdateAlertChannel(r.Context(), id, name, encNew, hint, enabled)
+	updated, err := s.store.UpdateAlertChannel(r.Context(), id, name, encNew, hint, severityFilter, enabled)
 	if err != nil {
 		handleStoreErr(w, r, err)
 		return
@@ -1329,6 +1418,30 @@ func (s *Server) handleListIncidents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleAcknowledgeIncident(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseUUIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	ackBy := strings.TrimSpace(auth.UsernameFromCtx(r.Context()))
+	if ackBy == "" {
+		ackBy = "admin"
+	}
+	inc, err := s.store.AcknowledgeIncident(r.Context(), id, ackBy, time.Now().UTC())
+	if err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	if s.hub != nil {
+		s.hub.BroadcastUI("matrix", protocol.LiveEvent{
+			Type:    "incident_update",
+			Channel: "matrix",
+			Data:    inc,
+		})
+	}
+	writeJSON(w, http.StatusOK, inc)
 }
 
 // --- Settings ---

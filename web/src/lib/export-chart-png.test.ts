@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildEvidenceFilename,
   computeSeriesSummary,
   DEFAULT_EVIDENCE_BRAND_NAME,
+  drawVectorSmokePlot,
   formatEvidenceSpan,
   getEvidenceBrandName,
   saveEvidenceBrandName,
@@ -59,5 +60,63 @@ describe("export-chart-png helpers", () => {
     const span = formatEvidenceSpan(t1, t2);
     expect(span).toBe("15 Nov 2026 · 16:47:30 – 19:23:44");
     expect(span).not.toMatch(/am|pm/i);
+  });
+
+  it("renders both left latency (ms) and right packet loss (0%..100%) axes on exported PNG plots", () => {
+    const texts: Array<{ text: string; x: number; y: number }> = [];
+    const ctx = {
+      strokeStyle: "#000",
+      fillStyle: "#000",
+      lineWidth: 1,
+      lineCap: "butt",
+      lineJoin: "miter",
+      font: "",
+      textAlign: "left",
+      textBaseline: "alphabetic",
+      save: vi.fn(),
+      restore: vi.fn(),
+      beginPath: vi.fn(),
+      closePath: vi.fn(),
+      rect: vi.fn(),
+      clip: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      arc: vi.fn(),
+      fillRect: vi.fn(),
+      fill: vi.fn(),
+      stroke: vi.fn(),
+      setLineDash: vi.fn(),
+      fillText: vi.fn((text: string, x: number, y: number) => {
+        texts.push({ text, x, y });
+      }),
+    } as unknown as CanvasRenderingContext2D;
+
+    const geom = drawVectorSmokePlot(
+      ctx,
+      {
+        probe_id: "p1",
+        probe_name: "Local",
+        location_label: "DC1",
+        timestamps: [1700000000, 1700000060],
+        min_ms: [4, 5],
+        p25_ms: [5, 6],
+        p50_ms: [6, 7],
+        p75_ms: [7, 8],
+        p95_ms: [8, 9],
+        max_ms: [9, 10],
+        jitter_ms: [0.5, 0.5],
+        loss_pct: [0, 50],
+      },
+      20,
+      66,
+      800,
+      264,
+      20
+    );
+
+    const rightLabels = texts.filter((t) => t.x > geom.gRight);
+    expect(rightLabels.map((t) => t.text)).toEqual(["0%", "25%", "50%", "75%", "100%"]);
+    const leftLabels = texts.filter((t) => t.x < geom.gLeft);
+    expect(leftLabels.some((t) => t.text.endsWith("ms"))).toBe(true);
   });
 });

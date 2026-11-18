@@ -1,4 +1,4 @@
-import type { MatrixCell, ProbeSeries, SparkPoint } from "./api";
+import type { MatrixCell, Probe, ProbeSeries, SparkPoint, Target } from "./api";
 
 export type CellStatus = "healthy" | "degraded" | "loss" | "down" | "unknown";
 
@@ -464,5 +464,166 @@ export function mergeProbeSeriesWithCell(
     max_ms: [...dbSeries.max_ms, ...extra.max_ms],
     jitter_ms: [...dbSeries.jitter_ms, ...extra.jitter_ms],
     loss_pct: [...dbSeries.loss_pct, ...extra.loss_pct],
+  };
+}
+
+export const FULL_LOSS_AXIS_SPLITS = [0, 25, 50, 75, 100] as const;
+export const COMPACT_LOSS_AXIS_SPLITS = [0, 50, 100] as const;
+
+/** Returns canonical right-hand Y-axis percentage ticks for compact or full graphs. */
+export function getLossAxisSplits(compact = false): number[] {
+  return compact ? [...COMPACT_LOSS_AXIS_SPLITS] : [...FULL_LOSS_AXIS_SPLITS];
+}
+
+export interface WindowLossSummary {
+  sampleCount: number;
+  avgLossPct: number;
+  peakLossPct: number;
+}
+
+/**
+ * Computes average and peak packet loss (%) across samples within [minTs, maxTs].
+ * When minTs/maxTs are omitted, evaluates the entire series.
+ */
+export function computeWindowLossSummary(
+  timestamps: readonly number[],
+  lossPct: readonly number[],
+  minTs?: number | null,
+  maxTs?: number | null
+): WindowLossSummary {
+  let count = 0;
+  let sum = 0;
+  let peak = 0;
+  const len = Math.min(timestamps.length, lossPct.length);
+
+  for (let i = 0; i < len; i++) {
+    const ts = timestamps[i];
+    if (minTs !== null && minTs !== undefined && ts < minTs) continue;
+    if (maxTs !== null && maxTs !== undefined && ts > maxTs) continue;
+    const raw = lossPct[i];
+    if (typeof raw !== "number" || !Number.isFinite(raw)) continue;
+    const clamped = Math.min(100, Math.max(0, raw));
+    count++;
+    sum += clamped;
+    if (clamped > peak) {
+      peak = clamped;
+    }
+  }
+
+  return {
+    sampleCount: count,
+    avgLossPct: count > 0 ? sum / count : 0,
+    peakLossPct: peak,
+  };
+}
+
+export interface TargetProbeBestPath {
+  probeId: string;
+  probeName: string;
+  baselineMs: number | null;
+  autoWarnMs: number;
+  effectiveWarnMs: number;
+  overrideMs: number | null;
+}
+
+export interface TargetBestPathSummary {
+  probeEntries: TargetProbeBestPath[];
+  primaryBaselineMs: number | null;
+  primaryAutoWarnMs: number;
+  concreteFillMs: number | null;
+  recommendedRuleThresholdMs: number;
+}
+
+/**
+ * Resolves live Best-Path telemetry (P25 baseline & effective Warn RTT) for each probe assigned to a target,
+ * and computes recommended High Latency (P95) alert rule threshold:
+ * - If target already sets explicit latency_warn_ms > 0 -> uses target.latency_warn_ms
+ * - If 1 assigned probe -> auto-fills rounded effective Warn RTT (ms) from Best-Path
+ * - If multi-probe with 0=Auto -> returns 0 (dynamic per-path Auto Best-Path)
+ */
+export function resolveTargetBestPathSummary(
+  target: Pick<
+    Target,
+    | "id"
+    | "assign_all_probes"
+    | "probe_ids"
+    | "latency_warn_ms"
+    | "probe_latency_overrides"
+    | "timeout_ms"
+  >,
+  cells: readonly MatrixCell[],
+  probes: readonly Pick<Probe, "id" | "name">[]
+): TargetBestPathSummary {
+  const assignedProbes = target.assign_all_probes
+    ? probes
+    : probes.filter((p) => (target.probe_ids ?? []).includes(p.id));
+  const targetCells = cells.filter((c) => c.target_id === target.id);
+  const cellByProbe = new Map(targetCells.map((c) => [c.probe_id, c]));
+
+  const fallbackTimeoutWarn =
+    Math.round(
+      (target.timeout_ms && target.timeout_ms > 0 ? target.timeout_ms : 1000) *
+        0.5 *
+        100
+    ) / 100;
+
+  const probeEntries: TargetProbeBestPath[] = assignedProbes.map((p) => {
+    const cell = cellByProbe.get(p.id);
+    const baselineMs =
+      cell?.baseline_ms !== null &&
+      cell?.baseline_ms !== undefined &&
+      cell.baseline_ms > 0
+        ? cell.baseline_ms
+        : null;
+    const autoWarnMs =
+      baselineMs !== null
+        ? Math.round(Math.max(baselineMs * 2, baselineMs + 15) * 100) / 100
+        : fallbackTimeoutWarn;
+    const rawOv = target.probe_latency_overrides?.[p.id];
+    const overrideMs = typeof rawOv === "number" && rawOv > 0 ? rawOv : null;
+    const effectiveWarnMs =
+      overrideMs ??
+      (target.latency_warn_ms > 0
+        ? target.latency_warn_ms
+        : cell?.warn_ms && cell.warn_ms > 0
+        ? cell.warn_ms
+        : autoWarnMs);
+
+    return {
+      probeId: p.id,
+      probeName: p.name,
+      baselineMs,
+      autoWarnMs,
+      effectiveWarnMs,
+      overrideMs,
+    };
+  });
+
+  const firstWithBase = probeEntries.find((e) => e.baselineMs !== null) ?? probeEntries[0];
+  const primaryBaselineMs = firstWithBase?.baselineMs ?? null;
+  const primaryAutoWarnMs = firstWithBase?.autoWarnMs ?? fallbackTimeoutWarn;
+
+  const concreteFillMs =
+    target.latency_warn_ms > 0
+      ? target.latency_warn_ms
+      : probeEntries.length === 1
+      ? Math.round(probeEntries[0].effectiveWarnMs)
+      : probeEntries.length > 1
+      ? Math.round(Math.max(...probeEntries.map((e) => e.effectiveWarnMs)))
+      : Math.round(fallbackTimeoutWarn);
+
+  const recommendedRuleThresholdMs =
+    target.latency_warn_ms > 0
+      ? target.latency_warn_ms
+      : probeEntries.length === 1
+      ? Math.round(probeEntries[0].effectiveWarnMs)
+      : 0;
+
+  return {
+    probeEntries,
+    primaryBaselineMs,
+    primaryAutoWarnMs,
+    concreteFillMs,
+    recommendedRuleThresholdMs,
   };
 }

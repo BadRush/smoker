@@ -5,10 +5,13 @@ import {
   classifySampleSeverity,
   computeChartXBounds,
   computeChartYUpper,
+  computeWindowLossSummary,
   formatLoss,
   formatMs,
+  getLossAxisSplits,
   rangeKeyToSeconds,
   resolveEffectiveWarnMs,
+  resolveTargetBestPathSummary,
   sparklineToProbeSeries,
   statusVisuals,
   worseSeverity,
@@ -135,5 +138,110 @@ describe("smoke-math helpers", () => {
       now - 900,
       now,
     ]);
+  });
+
+  it("provides right-axis loss splits and computes zoomed window avg/peak loss", () => {
+    expect(getLossAxisSplits(false)).toEqual([0, 25, 50, 75, 100]);
+    expect(getLossAxisSplits(true)).toEqual([0, 50, 100]);
+
+    const summary = computeWindowLossSummary(
+      [100, 110, 120, 130, 140],
+      [0, 20, 60, 0, 100],
+      110,
+      130
+    );
+    expect(summary).toEqual({
+      sampleCount: 3,
+      avgLossPct: (20 + 60 + 0) / 3,
+      peakLossPct: 60,
+    });
+
+    const empty = computeWindowLossSummary([100, 110], [0, 10], 200, 300);
+    expect(empty).toEqual({ sampleCount: 0, avgLossPct: 0, peakLossPct: 0 });
+  });
+
+  it("resolves target Best-Path summary for single-probe concrete fill and multi-probe Auto Best-Path", () => {
+    const probes = [
+      { id: "p-jkt", name: "Localhost", status: "online" as const },
+      { id: "p-sgp", name: "Remote-SGP", status: "online" as const },
+    ];
+    const cells = [
+      {
+        target_id: "t1",
+        probe_id: "p-jkt",
+        p50_ms: 7.0,
+        p95_ms: 14.0,
+        baseline_ms: 6.5,
+        warn_ms: 21.5,
+        jitter_ms: 1.0,
+        loss_pct: 0,
+        sample_count: 30,
+        status: "healthy" as const,
+        sparkline: [],
+      },
+      {
+        target_id: "t1",
+        probe_id: "p-sgp",
+        p50_ms: 29.0,
+        p95_ms: 35.0,
+        baseline_ms: 28.0,
+        warn_ms: 56.0,
+        jitter_ms: 2.0,
+        loss_pct: 0,
+        sample_count: 30,
+        status: "healthy" as const,
+        sparkline: [],
+      },
+    ];
+
+    // Single probe -> concrete Best-Path ms auto-fill (~22 ms)
+    const singleSummary = resolveTargetBestPathSummary(
+      {
+        id: "t1",
+        assign_all_probes: false,
+        probe_ids: ["p-jkt"],
+        latency_warn_ms: 0,
+        probe_latency_overrides: {},
+        timeout_ms: 1000,
+      },
+      cells,
+      probes
+    );
+    expect(singleSummary.primaryBaselineMs).toBe(6.5);
+    expect(singleSummary.primaryAutoWarnMs).toBe(21.5);
+    expect(singleSummary.concreteFillMs).toBe(22);
+    expect(singleSummary.recommendedRuleThresholdMs).toBe(22);
+
+    // Multi-probe with 0=Auto -> recommends 0 (Auto per path), while concreteFillMs gives max 56
+    const multiSummary = resolveTargetBestPathSummary(
+      {
+        id: "t1",
+        assign_all_probes: true,
+        probe_ids: [],
+        latency_warn_ms: 0,
+        probe_latency_overrides: {},
+        timeout_ms: 1000,
+      },
+      cells,
+      probes
+    );
+    expect(multiSummary.recommendedRuleThresholdMs).toBe(0);
+    expect(multiSummary.concreteFillMs).toBe(56);
+
+    // Explicit manual Warn RTT overrides auto calculation
+    const explicitSummary = resolveTargetBestPathSummary(
+      {
+        id: "t1",
+        assign_all_probes: true,
+        probe_ids: [],
+        latency_warn_ms: 12,
+        probe_latency_overrides: {},
+        timeout_ms: 1000,
+      },
+      cells,
+      probes
+    );
+    expect(explicitSummary.recommendedRuleThresholdMs).toBe(12);
+    expect(explicitSummary.concreteFillMs).toBe(12);
   });
 });

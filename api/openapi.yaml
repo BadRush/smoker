@@ -322,6 +322,37 @@ paths:
       responses:
         '204':
           description: Deleted
+  /api/targets/{id}/mute:
+    post:
+      operationId: muteTarget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                duration_sec:
+                  type: integer
+                duration:
+                  type: string
+                muted_until:
+                  type: string
+                  format: date-time
+                  nullable: true
+      responses:
+        '200':
+          description: Updated target mute window
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Target'
   /api/targets/{id}/series:
     get:
       operationId: getTargetSeries
@@ -597,6 +628,23 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Incident'
+  /api/alerts/incidents/{id}/ack:
+    post:
+      operationId: acknowledgeIncident
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Incident acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
   /api/settings:
     get:
       operationId: getSettings
@@ -716,6 +764,7 @@ components:
         probe_latency_overrides:
           type: object
           additionalProperties: { type: integer }
+        muted_until: { type: string, format: date-time, nullable: true }
         assign_all_probes: { type: boolean }
         probe_ids:
           type: array
@@ -789,6 +838,7 @@ components:
           type: array
           items: { $ref: '#/components/schemas/MatrixCell' }
         active_incidents: { type: integer }
+        brand_name: { type: string }
         generated_at: { type: string, format: date-time }
     ProbeSeries:
       type: object
@@ -870,7 +920,7 @@ components:
         probe_name: { type: string }
         target_id: { type: string, format: uuid }
         captured_at: { type: string, format: date-time }
-        trigger_reason: { type: string, enum: [auto_loss, manual] }
+        trigger_reason: { type: string, enum: [auto_loss, auto_latency, manual] }
         hops:
           type: array
           items: { $ref: '#/components/schemas/MTRHop' }
@@ -920,6 +970,7 @@ components:
         type: { type: string, enum: [telegram, webhook] }
         name: { type: string }
         config_hint: { type: string }
+        severity_filter: { type: string, enum: [all, critical] }
         enabled: { type: boolean }
         created_at: { type: string, format: date-time }
     AlertChannelInput:
@@ -932,6 +983,7 @@ components:
         chat_id: { type: string }
         thread_id: { type: integer, format: int64, nullable: true }
         webhook_url: { type: string }
+        severity_filter: { type: string, enum: [all, critical] }
         enabled: { type: boolean }
     AlertChannelUpdateInput:
       type: object
@@ -941,6 +993,7 @@ components:
         chat_id: { type: string }
         thread_id: { type: integer, format: int64, nullable: true }
         webhook_url: { type: string }
+        severity_filter: { type: string, enum: [all, critical] }
         enabled: { type: boolean }
     Incident:
       type: object
@@ -959,6 +1012,8 @@ components:
         peak_value: { type: number }
         started_at: { type: string, format: date-time }
         resolved_at: { type: string, format: date-time, nullable: true }
+        acknowledged_at: { type: string, format: date-time, nullable: true }
+        acknowledged_by: { type: string }
         summary: { type: string }
     SystemSettings:
       type: object
@@ -967,6 +1022,7 @@ components:
         raw_retention_days: { type: integer }
         agg_retention_days: { type: integer }
         default_quorum_min: { type: integer }
+        brand_name: { type: string }
         updated_at: { type: string, format: date-time }
     SystemSettingsInput:
       type: object
@@ -975,6 +1031,7 @@ components:
         raw_retention_days: { type: integer }
         agg_retention_days: { type: integer }
         default_quorum_min: { type: integer }
+        brand_name: { type: string }
     SeedResult:
       type: object
       required: [groups_created, targets_created]

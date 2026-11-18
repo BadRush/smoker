@@ -197,4 +197,178 @@ describe("TargetsPage search, filters, and pagination", () => {
     expect(screen.queryByRole("spinbutton", { name: "Local Central" })).not.toBeInTheDocument();
     expect(screen.getByRole("spinbutton", { name: "Remote-SGP" })).toBeInTheDocument();
   });
+
+  it("supports quick 1h maintenance mute and unmute actions on target rows", async () => {
+    const requests: Array<{ method: string; url: string; body: unknown }> = [];
+    const mockTargets = makeTargets();
+    mockTargets[0].muted_until = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (method === "POST") {
+          const body = init?.body ? JSON.parse(String(init.body)) : null;
+          requests.push({ method, url, body });
+          if (url === "/api/targets/t-01/mute") {
+            mockTargets[0] = {
+              ...mockTargets[0],
+              muted_until:
+                body?.duration === "off" ? null : "2099-01-01T00:00:00Z",
+            };
+            return new Response(JSON.stringify(mockTargets[0]), { status: 200 });
+          }
+        }
+        if (url === "/api/targets") {
+          return new Response(JSON.stringify(mockTargets), { status: 200 });
+        }
+        if (url === "/api/groups") {
+          return new Response(JSON.stringify(GROUPS), { status: 200 });
+        }
+        if (url === "/api/probes") {
+          return new Response(JSON.stringify(PROBES), { status: 200 });
+        }
+        return new Response(JSON.stringify({ username: "admin" }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<TargetsPage />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Mute target Monitor Node 01" })).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Mute target Monitor Node 01" }));
+    await waitFor(() => {
+      expect(requests).toHaveLength(1);
+    });
+    expect(requests[0]).toEqual({
+      method: "POST",
+      url: "/api/targets/t-01/mute",
+      body: { duration: "1h" },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Unmute target Monitor Node 01" })).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Unmute target Monitor Node 01" }));
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    expect(requests[1]).toEqual({
+      method: "POST",
+      url: "/api/targets/t-01/mute",
+      body: { duration: "off" },
+    });
+  });
+
+  it("defaults new target interval to 5s, displays Best-Path telemetry, and syncs Telegram RTT rule on save", async () => {
+    const requests: Array<{ method: string; url: string; body: unknown }> = [];
+    const mockTargets = makeTargets().slice(0, 2);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (method === "POST" || method === "PUT") {
+          const body = init?.body ? JSON.parse(String(init.body)) : null;
+          requests.push({ method, url, body });
+          if (url === "/api/targets/t-01") {
+            return new Response(JSON.stringify({ ...mockTargets[0], ...body }), {
+              status: 200,
+            });
+          }
+          if (url === "/api/alerts/rules") {
+            return new Response(JSON.stringify({ id: "r-new", ...body }), {
+              status: 201,
+            });
+          }
+        }
+        if (url === "/api/targets") {
+          return new Response(JSON.stringify(mockTargets), { status: 200 });
+        }
+        if (url === "/api/groups") {
+          return new Response(JSON.stringify(GROUPS), { status: 200 });
+        }
+        if (url === "/api/probes") {
+          return new Response(JSON.stringify([PROBES[0]]), { status: 200 });
+        }
+        if (url === "/api/alerts/rules") {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        if (url === "/api/matrix") {
+          return new Response(
+            JSON.stringify({
+              generated_at: "",
+              active_incidents: 0,
+              probes: [PROBES[0]],
+              groups: GROUPS,
+              targets: mockTargets,
+              cells: [
+                {
+                  target_id: "t-01",
+                  probe_id: "p-local",
+                  p50_ms: 7.0,
+                  p95_ms: 14.0,
+                  baseline_ms: 6.5,
+                  warn_ms: 21.5,
+                  jitter_ms: 0.5,
+                  loss_pct: 0,
+                  sample_count: 30,
+                  status: "healthy",
+                  sparkline: [],
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ username: "admin" }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<TargetsPage />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("target-row")).toHaveLength(2);
+    });
+
+    // 1. Add Target defaults Interval (seconds) to 5
+    await user.click(screen.getByRole("button", { name: "Add Target" }));
+    const intervalInput = screen.getByLabelText("Interval (seconds)") as HTMLInputElement;
+    expect(intervalInput.value).toBe("5");
+    await user.click(screen.getByRole("button", { name: "Close modal" }));
+
+    // 2. Edit Target shows live Best-Path & Fill button, and syncs Telegram High-Latency rule on Save
+    await user.click(screen.getByRole("button", { name: "Edit target Monitor Node 01" }));
+    expect(screen.getByTestId("target-bestpath-callout")).toHaveTextContent(
+      /Live Best-Path P25: 6\.5 ms → Auto Warn: ~22 ms/
+    );
+
+    await user.click(screen.getByRole("button", { name: "Fill ~22 ms" }));
+    expect((screen.getByLabelText("Warn RTT (0 = Auto)") as HTMLInputElement).value).toBe(
+      "22"
+    );
+
+    await user.click(screen.getByLabelText("Sync Telegram RTT alert rule"));
+    await user.click(screen.getByRole("button", { name: "Update & Sync to Probes" }));
+
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    expect(requests[0].method).toBe("PUT");
+    expect(requests[0].url).toBe("/api/targets/t-01");
+    expect(requests[1]).toEqual({
+      method: "POST",
+      url: "/api/alerts/rules",
+      body: expect.objectContaining({
+        target_id: "t-01",
+        metric: "latency_p95",
+        threshold_value: 22,
+      }),
+    });
+  });
 });

@@ -16,8 +16,10 @@ import {
   classifySampleSeverity,
   computeChartXBounds,
   computeChartYUpper,
+  computeWindowLossSummary,
   formatLoss,
   formatMs,
+  getLossAxisSplits,
   rangeKeyToSeconds,
   type ProbeSeriesInput,
 } from "@/lib/smoke-math";
@@ -137,6 +139,7 @@ export const SmokeChartPanel = forwardRef<
   onExportStateChangeRef.current = onExportStateChange;
 
   const [isZoomed, setIsZoomed] = useState(false);
+  const [zoomedXRange, setZoomedXRange] = useState<[number, number] | null>(null);
   const isZoomedRef = useRef(false);
   const programmaticScaleRef = useRef(false);
   const prevWindowKeyRef = useRef<string | number | null>(
@@ -155,9 +158,10 @@ export const SmokeChartPanel = forwardRef<
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [exportState, setExportState] = useState<ExportButtonState>("idle");
 
-  const updateZoomState = (zoomed: boolean) => {
+  const updateZoomState = (zoomed: boolean, bounds?: [number, number] | null) => {
     isZoomedRef.current = zoomed;
     setIsZoomed(zoomed);
+    setZoomedXRange(zoomed && bounds ? bounds : null);
     onZoomStateChangeRef.current?.(zoomed);
   };
 
@@ -256,7 +260,7 @@ export const SmokeChartPanel = forwardRef<
       const opts: uPlot.Options = {
         width: initW,
         height: initH,
-        padding: [10, 12, 0, 6],
+        padding: [10, compact ? 4 : 6, 0, 6],
         legend: { show: false },
         cursor: {
           sync: {
@@ -290,6 +294,10 @@ export const SmokeChartPanel = forwardRef<
               return [0, Math.max(5, upper * 1.15)];
             },
           },
+          loss: {
+            auto: false,
+            range: () => [0, 100],
+          },
         },
         axes: [
           {
@@ -314,6 +322,22 @@ export const SmokeChartPanel = forwardRef<
               ? "10px JetBrains Mono, monospace"
               : "11px JetBrains Mono, monospace",
             values: (_u, vals) => vals.map((v) => `${v.toFixed(v < 10 ? 1 : 0)}ms`),
+          },
+          {
+            scale: "loss",
+            side: 1,
+            stroke: compact ? "#71717a" : "#a1a1aa",
+            size: compact ? 36 : 44,
+            gap: 4,
+            space: compact ? 16 : 24,
+            incrs: compact ? [50, 100] : [25, 50, 100],
+            grid: { show: false },
+            ticks: { stroke: "#27272a", width: 1, size: 4 },
+            font: compact
+              ? "10px JetBrains Mono, monospace"
+              : "11px JetBrains Mono, monospace",
+            splits: () => getLossAxisSplits(compact),
+            values: (_u, vals) => vals.map((v) => `${v}%`),
           },
         ],
         series: [
@@ -347,7 +371,7 @@ export const SmokeChartPanel = forwardRef<
               const max = u.scales.x?.max;
               if (min === undefined || max === undefined) return;
               const zoomed = min > bounds[0] + 2 || max < bounds[1] - 2;
-              updateZoomState(zoomed);
+              updateZoomState(zoomed, zoomed ? [min, max] : null);
             },
           ],
         },
@@ -401,6 +425,7 @@ export const SmokeChartPanel = forwardRef<
       plotRef.current = null;
       isZoomedRef.current = false;
       setIsZoomed(false);
+      setZoomedXRange(null);
     };
   }, [hasData, syncKey, defaultHeight, compact, effectiveFillHeight]);
 
@@ -456,6 +481,17 @@ export const SmokeChartPanel = forwardRef<
     }
   }, [series, effectiveWarnMs, effectiveWindowSec, rangeLabel]);
 
+  const zoomWindowLoss = useMemo(() => {
+    if (compact || !zoomedXRange) return null;
+    const stats = computeWindowLossSummary(
+      series.timestamps,
+      series.loss_pct,
+      zoomedXRange[0],
+      zoomedXRange[1]
+    );
+    return stats.sampleCount > 0 ? stats : null;
+  }, [compact, zoomedXRange, series.timestamps, series.loss_pct]);
+
   const readoutSeverity = classifySampleSeverity({
     p50: displayReadout.p50,
     p95: displayReadout.p95,
@@ -484,8 +520,25 @@ export const SmokeChartPanel = forwardRef<
     >
       {showTopActionBar && (
         <div className="flex shrink-0 items-center justify-between gap-2 min-w-0">
-          <div className="min-w-0 flex-1 font-mono text-xs text-zinc-400 truncate">
-            {!compact && displayReadout.ts ? formatDateTime24(displayReadout.ts) : null}
+          <div className="flex min-w-0 flex-1 items-center gap-2.5 font-mono text-xs text-zinc-400">
+            <span className="truncate">
+              {!compact && displayReadout.ts ? formatDateTime24(displayReadout.ts) : null}
+            </span>
+            {zoomWindowLoss && (
+              <span
+                data-testid="zoom-window-loss"
+                className={`inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-mono tabular-nums ${
+                  zoomWindowLoss.peakLossPct > 0
+                    ? "border-rose-500/40 bg-rose-500/10 text-rose-300"
+                    : "border-border bg-elevated/80 text-zinc-300"
+                }`}
+              >
+                <span>Zoom Loss:</span>
+                <span>avg {formatLoss(zoomWindowLoss.avgLossPct)}</span>
+                <span>·</span>
+                <span>peak {formatLoss(zoomWindowLoss.peakLossPct)}</span>
+              </span>
+            )}
           </div>
 
           <div className="flex shrink-0 items-center gap-1">

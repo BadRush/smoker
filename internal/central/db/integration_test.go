@@ -115,4 +115,63 @@ func TestTimescaleMigrationsAndIdempotentIngest(t *testing.T) {
 	if res2.GroupsCreated != 0 || res2.TargetsCreated != 0 {
 		t.Fatalf("expected idempotent 0/0 on repeat seed, got %+v", res2)
 	}
+
+	// Verify migration 007 columns & alert persistence (severity_filter, telegram_message_ids, ack, target mute)
+	muteAt := time.Now().UTC().Add(30 * time.Minute).Truncate(time.Microsecond)
+	mutedTarget, err := store.SetTargetMute(ctx, target.ID, &muteAt)
+	if err != nil || mutedTarget.MutedUntil == nil {
+		t.Fatalf("SetTargetMute failed: target=%+v err=%v", mutedTarget, err)
+	}
+	unmutedTarget, err := store.SetTargetMute(ctx, target.ID, nil)
+	if err != nil || unmutedTarget.MutedUntil != nil {
+		t.Fatalf("SetTargetMute clear failed: target=%+v err=%v", unmutedTarget, err)
+	}
+
+	ch, err := store.CreateAlertChannel(ctx, "telegram", "Int Test TG", []byte("enc"), "chat:-1001", "critical", true)
+	if err != nil || ch.SeverityFilter != "critical" {
+		t.Fatalf("CreateAlertChannel failed: ch=%+v err=%v", ch, err)
+	}
+	defer func() { _ = store.DeleteAlertChannel(context.Background(), ch.ID) }()
+
+	chUpd, err := store.UpdateAlertChannel(ctx, ch.ID, "Int Test TG 2", []byte("enc2"), "chat:-1002", "all", true)
+	if err != nil || chUpd.SeverityFilter != "all" {
+		t.Fatalf("UpdateAlertChannel failed: ch=%+v err=%v", chUpd, err)
+	}
+
+	rule, err := store.CreateAlertRule(ctx, db.AlertRuleInput{
+		Name:            "Int Test Rule",
+		TargetID:        &target.ID,
+		Metric:          "loss_pct",
+		ThresholdValue:  20,
+		DurationSec:     30,
+		QuorumMinProbes: 1,
+		CooldownSec:     0,
+		ConfirmSec:      0,
+		RecoverSec:      45,
+		Enabled:         true,
+	})
+	if err != nil {
+		t.Fatalf("CreateAlertRule failed: %v", err)
+	}
+	defer func() { _ = store.DeleteAlertRule(context.Background(), rule.ID) }()
+
+	tNow := time.Now().UTC().Truncate(time.Microsecond)
+	inc, isNew, _, err := store.UpsertOpenIncident(ctx, rule.ID, &target.ID, []string{"Integration Probe"}, 30, "warn", tNow, "Unstable")
+	if err != nil || !isNew {
+		t.Fatalf("UpsertOpenIncident failed: inc=%+v isNew=%v err=%v", inc, isNew, err)
+	}
+	if err := store.MarkIncidentNotified(ctx, inc.ID, "", time.Time{}, map[string]int64{ch.ID.String(): 555}); err != nil {
+		t.Fatalf("MarkIncidentNotified partial failed: %v", err)
+	}
+	if err := store.MarkIncidentNotified(ctx, inc.ID, "warn", tNow, map[string]int64{"fired:" + ch.ID.String(): 1}); err != nil {
+		t.Fatalf("MarkIncidentNotified final failed: %v", err)
+	}
+	acked, err := store.AcknowledgeIncident(ctx, inc.ID, "admin", tNow.Add(5*time.Second))
+	if err != nil || acked.AcknowledgedAt == nil || acked.AcknowledgedBy != "admin" {
+		t.Fatalf("AcknowledgeIncident failed: acked=%+v err=%v", acked, err)
+	}
+	resolved, err := store.ResolveOpenIncident(ctx, rule.ID, &target.ID, tNow.Add(time.Minute))
+	if err != nil || resolved == nil || resolved.TelegramMessageIDs[ch.ID.String()] != 555 || resolved.TelegramMessageIDs["fired:"+ch.ID.String()] != 1 || resolved.NotifiedSeverity != "warn" {
+		t.Fatalf("ResolveOpenIncident failed: resolved=%+v err=%v", resolved, err)
+	}
 }

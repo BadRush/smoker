@@ -39,6 +39,7 @@ type fakeStore struct {
 	probes        []db.Probe
 	alertRules    []db.AlertRule
 	alertChannels []db.AlertChannel
+	incidents     []db.Incident
 	brandName     string
 }
 
@@ -149,6 +150,16 @@ func (f *fakeStore) UpdateTarget(_ context.Context, id uuid.UUID, in db.TargetIn
 			existing.AssignAllProbes = in.AssignAllProbes
 			existing.ProbeIDs = probeIDs
 			existing.ProbeLatencyOverrides = in.ProbeLatencyOverrides
+			f.targets[i] = existing
+			return existing, nil
+		}
+	}
+	return db.Target{}, db.ErrNotFound
+}
+func (f *fakeStore) SetTargetMute(_ context.Context, id uuid.UUID, mutedUntil *time.Time) (db.Target, error) {
+	for i, existing := range f.targets {
+		if existing.ID == id {
+			existing.MutedUntil = mutedUntil
 			f.targets[i] = existing
 			return existing, nil
 		}
@@ -269,25 +280,32 @@ func (f *fakeStore) GetAlertChannel(_ context.Context, id uuid.UUID) (db.AlertCh
 	}
 	return db.AlertChannel{}, db.ErrNotFound
 }
-func (f *fakeStore) CreateAlertChannel(_ context.Context, chType, name string, enc []byte, hint string, enabled bool) (db.AlertChannel, error) {
+func (f *fakeStore) CreateAlertChannel(_ context.Context, chType, name string, enc []byte, hint, severityFilter string, enabled bool) (db.AlertChannel, error) {
+	if severityFilter == "" {
+		severityFilter = "all"
+	}
 	ch := db.AlertChannel{
 		ID:              uuid.New(),
 		Type:            chType,
 		Name:            name,
 		ConfigEncrypted: enc,
 		ConfigHint:      hint,
+		SeverityFilter:  severityFilter,
 		Enabled:         enabled,
 		CreatedAt:       time.Now().UTC(),
 	}
 	f.alertChannels = append(f.alertChannels, ch)
 	return ch, nil
 }
-func (f *fakeStore) UpdateAlertChannel(_ context.Context, id uuid.UUID, name string, enc []byte, hint string, enabled bool) (db.AlertChannel, error) {
+func (f *fakeStore) UpdateAlertChannel(_ context.Context, id uuid.UUID, name string, enc []byte, hint, severityFilter string, enabled bool) (db.AlertChannel, error) {
 	for i, ch := range f.alertChannels {
 		if ch.ID == id {
 			ch.Name = name
 			ch.ConfigEncrypted = enc
 			ch.ConfigHint = hint
+			if severityFilter != "" {
+				ch.SeverityFilter = severityFilter
+			}
 			ch.Enabled = enabled
 			f.alertChannels[i] = ch
 			return ch, nil
@@ -295,9 +313,23 @@ func (f *fakeStore) UpdateAlertChannel(_ context.Context, id uuid.UUID, name str
 	}
 	return db.AlertChannel{}, db.ErrNotFound
 }
-func (f *fakeStore) DeleteAlertChannel(context.Context, uuid.UUID) error      { return nil }
-func (f *fakeStore) ListIncidents(context.Context, int) ([]db.Incident, error) { return []db.Incident{}, nil }
-func (f *fakeStore) CountOpenIncidents(context.Context) (int, error)           { return 0, nil }
+func (f *fakeStore) DeleteAlertChannel(context.Context, uuid.UUID) error { return nil }
+func (f *fakeStore) ListIncidents(context.Context, int) ([]db.Incident, error) {
+	return f.incidents, nil
+}
+func (f *fakeStore) AcknowledgeIncident(_ context.Context, id uuid.UUID, ackBy string, now time.Time) (db.Incident, error) {
+	for i, inc := range f.incidents {
+		if inc.ID == id && inc.Status == "open" {
+			t := now
+			inc.AcknowledgedAt = &t
+			inc.AcknowledgedBy = ackBy
+			f.incidents[i] = inc
+			return inc, nil
+		}
+	}
+	return db.Incident{}, db.ErrNotFound
+}
+func (f *fakeStore) CountOpenIncidents(context.Context) (int, error) { return 0, nil }
 func (f *fakeStore) GetSettings(context.Context) (db.SystemSettings, error) {
 	return db.SystemSettings{RawRetentionDays: 14, AggRetentionDays: 730, DefaultQuorumMin: 2, BrandName: f.brandName}, nil
 }
@@ -860,5 +892,99 @@ func TestTelegramAlertChannelWithThreadID(t *testing.T) {
 	}
 	if updatedRule.ConfirmSec != 90 || updatedRule.RecoverSec != 0 {
 		t.Fatalf("expected confirm_sec=90 recover_sec=0, got %+v", updatedRule)
+	}
+
+	// Channel severity_filter: invalid value -> 400, valid 'critical' -> 200
+	badFilterReq := httptest.NewRequest(http.MethodPut, "/api/alerts/channels/"+ch.ID.String(), bytes.NewBufferString(`{"severity_filter":"invalid_level"}`))
+	badFilterReq.AddCookie(sessionCookie)
+	badFilterRec := httptest.NewRecorder()
+	router.ServeHTTP(badFilterRec, badFilterReq)
+	if badFilterRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid severity_filter, got %d", badFilterRec.Code)
+	}
+
+	critFilterReq := httptest.NewRequest(http.MethodPut, "/api/alerts/channels/"+ch.ID.String(), bytes.NewBufferString(`{"severity_filter":"critical"}`))
+	critFilterReq.AddCookie(sessionCookie)
+	critFilterRec := httptest.NewRecorder()
+	router.ServeHTTP(critFilterRec, critFilterReq)
+	if critFilterRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 updating severity_filter=critical, got %d (%s)", critFilterRec.Code, critFilterRec.Body.String())
+	}
+	var critCh db.AlertChannel
+	if err := json.Unmarshal(critFilterRec.Body.Bytes(), &critCh); err != nil || critCh.SeverityFilter != "critical" {
+		t.Fatalf("expected severity_filter=critical, got %+v (err=%v)", critCh, err)
+	}
+
+	// Incident Acknowledge & Target Maintenance Mute endpoints
+	targetID := uuid.New()
+	store.targets = append(store.targets, db.Target{ID: targetID, Name: "Core-Link", Host: "10.0.0.1", ProbeType: "icmp", Enabled: true})
+	incID := uuid.New()
+	store.incidents = append(store.incidents, db.Incident{
+		ID:        incID,
+		RuleID:    createdRule.ID,
+		TargetID:  &targetID,
+		Status:    "open",
+		Severity:  "critical",
+		StartedAt: time.Now().UTC(),
+	})
+
+	ackReq := httptest.NewRequest(http.MethodPost, "/api/alerts/incidents/"+incID.String()+"/ack", nil)
+	ackReq.AddCookie(sessionCookie)
+	ackRec := httptest.NewRecorder()
+	router.ServeHTTP(ackRec, ackReq)
+	if ackRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 acknowledging open incident, got %d (%s)", ackRec.Code, ackRec.Body.String())
+	}
+	var ackedInc db.Incident
+	if err := json.Unmarshal(ackRec.Body.Bytes(), &ackedInc); err != nil || ackedInc.AcknowledgedAt == nil || ackedInc.AcknowledgedBy != "admin" {
+		t.Fatalf("expected acknowledged_at and acknowledged_by=admin, got %+v", ackedInc)
+	}
+
+	muteReq := httptest.NewRequest(http.MethodPost, "/api/targets/"+targetID.String()+"/mute", bytes.NewBufferString(`{"duration":"1h"}`))
+	muteReq.AddCookie(sessionCookie)
+	muteRec := httptest.NewRecorder()
+	router.ServeHTTP(muteRec, muteReq)
+	if muteRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 muting target, got %d (%s)", muteRec.Code, muteRec.Body.String())
+	}
+	var mutedTarget db.Target
+	if err := json.Unmarshal(muteRec.Body.Bytes(), &mutedTarget); err != nil || mutedTarget.MutedUntil == nil {
+		t.Fatalf("expected muted_until set on target, got %+v", mutedTarget)
+	}
+
+	unmuteReq := httptest.NewRequest(http.MethodPost, "/api/targets/"+targetID.String()+"/mute", bytes.NewBufferString(`{"duration":"off"}`))
+	unmuteReq.AddCookie(sessionCookie)
+	unmuteRec := httptest.NewRecorder()
+	router.ServeHTTP(unmuteRec, unmuteReq)
+	if unmuteRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 unmuting target, got %d (%s)", unmuteRec.Code, unmuteRec.Body.String())
+	}
+	var unmutedTarget db.Target
+	if err := json.Unmarshal(unmuteRec.Body.Bytes(), &unmutedTarget); err != nil || unmutedTarget.MutedUntil != nil {
+		t.Fatalf("expected muted_until cleared on target, got %+v", unmutedTarget)
+	}
+
+	// Default target interval_sec when omitted should be 5s, and latency_p95 threshold_value=0 (Auto Best-Path) must be accepted
+	tDefReq := httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{"name":"Default Interval Node","host":"1.0.0.1","probe_type":"icmp","assign_all_probes":true}`))
+	tDefReq.AddCookie(sessionCookie)
+	tDefRec := httptest.NewRecorder()
+	router.ServeHTTP(tDefRec, tDefReq)
+	if tDefRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating target with omitted interval_sec, got %d (%s)", tDefRec.Code, tDefRec.Body.String())
+	}
+	var defTarget db.Target
+	if err := json.Unmarshal(tDefRec.Body.Bytes(), &defTarget); err != nil {
+		t.Fatalf("decode default interval target: %v", err)
+	}
+	if defTarget.IntervalSec != 5 {
+		t.Fatalf("expected omitted interval_sec default to 5, got %d", defTarget.IntervalSec)
+	}
+
+	autoRttReq := httptest.NewRequest(http.MethodPost, "/api/alerts/rules", bytes.NewBufferString(`{"name":"Auto BestPath RTT","target_id":"`+defTarget.ID.String()+`","metric":"latency_p95","threshold_value":0,"duration_sec":30,"quorum_min_probes":1,"cooldown_sec":0}`))
+	autoRttReq.AddCookie(sessionCookie)
+	autoRttRec := httptest.NewRecorder()
+	router.ServeHTTP(autoRttRec, autoRttReq)
+	if autoRttRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating latency_p95 threshold_value=0 rule, got %d (%s)", autoRttRec.Code, autoRttRec.Body.String())
 	}
 }

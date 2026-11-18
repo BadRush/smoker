@@ -305,4 +305,269 @@ describe("AlertsPage quorum, routing, and Telegram channel controls", () => {
       },
     });
   });
+
+  it("defaults quorum to 1 when fleet has 1 active probe, and supports channel severity_filter, incident ack, and target mute", async () => {
+    const openIncidents: Incident[] = [
+      {
+        id: "inc-1",
+        rule_id: "r-1",
+        rule_name: "Core Loss Check",
+        target_id: "t-single",
+        target_name: "Single-Probe Target",
+        status: "open",
+        severity: "critical",
+        affected_probes: ["Local Central"],
+        peak_value: 100,
+        started_at: "2026-11-16T10:00:00Z",
+        resolved_at: null,
+        summary: "Connection Down (100% failed) · Local Central",
+      },
+    ];
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (method === "POST" || method === "PUT") {
+          requests.push({
+            method,
+            url,
+            body: init?.body ? JSON.parse(String(init.body)) : null,
+          });
+          if (url === "/api/alerts/incidents/inc-1/ack") {
+            return new Response(
+              JSON.stringify({
+                ...openIncidents[0],
+                acknowledged_at: "2026-11-16T10:05:00Z",
+                acknowledged_by: "admin",
+              }),
+              { status: 200 }
+            );
+          }
+          if (url === "/api/targets/t-single/mute") {
+            return new Response(
+              JSON.stringify({
+                ...TARGETS[0],
+                muted_until: "2099-01-01T00:00:00Z",
+              }),
+              { status: 200 }
+            );
+          }
+          if (url === "/api/alerts/channels") {
+            return new Response(
+              JSON.stringify({ ...CHANNELS[0], severity_filter: "critical" }),
+              { status: 201 }
+            );
+          }
+        }
+        if (url === "/api/alerts/incidents") {
+          return new Response(JSON.stringify(openIncidents), { status: 200 });
+        }
+        if (url === "/api/alerts/rules") {
+          return new Response(JSON.stringify(RULES), { status: 200 });
+        }
+        if (url === "/api/alerts/channels") {
+          return new Response(JSON.stringify(CHANNELS), { status: 200 });
+        }
+        if (url === "/api/targets") {
+          return new Response(JSON.stringify(TARGETS), { status: 200 });
+        }
+        if (url === "/api/groups") {
+          return new Response(JSON.stringify(GROUPS), { status: 200 });
+        }
+        if (url === "/api/probes") {
+          return new Response(JSON.stringify([PROBES[0]]), { status: 200 });
+        }
+        return new Response(JSON.stringify({ username: "admin" }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<AlertsPage />);
+
+    await waitFor(() => {
+      const quorumInput = screen.getByLabelText("Quorum min probes") as HTMLInputElement;
+      expect(quorumInput.value).toBe("1");
+    });
+
+    // Acknowledge open incident
+    await user.click(screen.getByRole("button", { name: "Acknowledge incident inc-1" }));
+    await waitFor(() => {
+      expect(requests).toHaveLength(1);
+    });
+    expect(requests[0]).toEqual({
+      method: "POST",
+      url: "/api/alerts/incidents/inc-1/ack",
+      body: null,
+    });
+
+    // Mute target for 4h
+    await user.selectOptions(screen.getByLabelText("Mute target"), "t-single");
+    await user.selectOptions(screen.getByLabelText("Mute duration"), "4h");
+    await user.click(screen.getByRole("button", { name: "Apply Mute" }));
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    expect(requests[1]).toEqual({
+      method: "POST",
+      url: "/api/targets/t-single/mute",
+      body: { duration: "4h" },
+    });
+
+    // Create channel with critical severity_filter
+    await user.type(screen.getByLabelText("Channel name"), "Pager Channel");
+    await user.selectOptions(screen.getByLabelText("Channel severity filter"), "critical");
+    await user.type(screen.getByLabelText("Telegram bot token"), "999:XYZ");
+    await user.type(screen.getByLabelText("Telegram chat ID"), "-100777");
+    await user.click(screen.getByRole("button", { name: "Save Channel" }));
+    await waitFor(() => {
+      expect(requests).toHaveLength(3);
+    });
+    expect(requests[2]).toEqual({
+      method: "POST",
+      url: "/api/alerts/channels",
+      body: {
+        type: "telegram",
+        name: "Pager Channel",
+        bot_token: "999:XYZ",
+        chat_id: "-100777",
+        webhook_url: "",
+        severity_filter: "critical",
+        enabled: true,
+      },
+    });
+  });
+
+  it("auto-fills Best-Path threshold for High Latency (P95), warns on Critical Only channels, and disables threshold for Probe Offline", async () => {
+    const multiTarget: Target = {
+      ...TARGETS[0],
+      id: "t-multi",
+      name: "Multi-Probe Target",
+      host: "8.8.8.8",
+      assign_all_probes: true,
+      probe_ids: [],
+    };
+    const critChannel: AlertChannel = {
+      ...CHANNELS[0],
+      id: "ch-crit",
+      name: "Pager Crit",
+      severity_filter: "critical",
+    };
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === "/api/alerts/incidents") {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        if (url === "/api/alerts/rules") {
+          return new Response(JSON.stringify(RULES), { status: 200 });
+        }
+        if (url === "/api/alerts/channels") {
+          return new Response(JSON.stringify([CHANNELS[0], critChannel]), { status: 200 });
+        }
+        if (url === "/api/targets") {
+          return new Response(JSON.stringify([TARGETS[0], multiTarget]), { status: 200 });
+        }
+        if (url === "/api/groups") {
+          return new Response(JSON.stringify(GROUPS), { status: 200 });
+        }
+        if (url === "/api/probes") {
+          return new Response(JSON.stringify(PROBES), { status: 200 });
+        }
+        if (url === "/api/matrix") {
+          return new Response(
+            JSON.stringify({
+              generated_at: "",
+              active_incidents: 0,
+              probes: PROBES,
+              groups: GROUPS,
+              targets: [TARGETS[0], multiTarget],
+              cells: [
+                {
+                  target_id: "t-single",
+                  probe_id: "p-sgp",
+                  p50_ms: 7.2,
+                  p95_ms: 14.0,
+                  baseline_ms: 6.5,
+                  warn_ms: 21.5,
+                  jitter_ms: 1.0,
+                  loss_pct: 0,
+                  sample_count: 30,
+                  status: "healthy",
+                  sparkline: [],
+                },
+                {
+                  target_id: "t-multi",
+                  probe_id: "p-local",
+                  p50_ms: 8.0,
+                  p95_ms: 12.0,
+                  baseline_ms: 8.0,
+                  warn_ms: 23.0,
+                  jitter_ms: 0.5,
+                  loss_pct: 0,
+                  sample_count: 30,
+                  status: "healthy",
+                  sparkline: [],
+                },
+                {
+                  target_id: "t-multi",
+                  probe_id: "p-sgp",
+                  p50_ms: 30.0,
+                  p95_ms: 40.0,
+                  baseline_ms: 28.0,
+                  warn_ms: 56.0,
+                  jitter_ms: 2.0,
+                  loss_pct: 0,
+                  sample_count: 30,
+                  status: "healthy",
+                  sparkline: [],
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ username: "admin" }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<AlertsPage />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Alert metric")).toBeInTheDocument();
+    });
+
+    await user.selectOptions(screen.getByLabelText("Alert metric"), "latency_p95");
+    await user.selectOptions(screen.getByLabelText("Target"), "t-single");
+
+    const threshInput = screen.getByLabelText("Threshold") as HTMLInputElement;
+    // Single-probe target auto-fills concrete Best-Path ms (~22 ms)
+    expect(threshInput.value).toBe("22");
+    expect(screen.getByTestId("alert-bestpath-helper")).toHaveTextContent("P25 6.5 ms");
+    expect(screen.getByTestId("alert-rule-preview")).toHaveTextContent(
+      "Latency (P95) >= 22 ms"
+    );
+
+    // Multi-probe target auto-fills 0 (Auto Best-Path per probe/path)
+    await user.selectOptions(screen.getByLabelText("Target"), "t-multi");
+    expect(threshInput.value).toBe("0");
+    expect(screen.getByTestId("alert-auto-bestpath-badge")).toBeInTheDocument();
+    expect(screen.getByTestId("alert-rule-preview")).toHaveTextContent(
+      "Latency (P95) >= Auto Best-Path"
+    );
+
+    // Checking a Critical Only channel for latency_p95 shows warning banner
+    await user.click(screen.getByLabelText("Route to channel Pager Crit"));
+    expect(screen.getByTestId("alert-critical-only-warning")).toHaveTextContent(
+      "Pager Crit"
+    );
+
+    // Switching to probe_offline disables Threshold input ("Uses Window")
+    await user.selectOptions(screen.getByLabelText("Alert metric"), "probe_offline");
+    expect(threshInput.disabled).toBe(true);
+  });
 });
