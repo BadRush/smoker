@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
+ORIG_ARGS=("$@")
+
 ROLE="auto"
 BRANCH=""
 SKIP_PULL="false"
@@ -73,6 +75,11 @@ if ! [[ "$BACKUP_KEEP" =~ ^[0-9]+$ ]] || [[ "$BACKUP_KEEP" -lt 1 ]]; then
   log_err "--backup-keep must be a positive integer (got: '$BACKUP_KEEP')"
   exit 1
 fi
+
+case "$ROLE" in
+  auto|central|probe|all) ;;
+  *) log_err "Invalid --role '$ROLE' (expected auto|central|probe|all)"; exit 1 ;;
+esac
 
 check_docker() {
   if ! command -v docker >/dev/null 2>&1; then
@@ -161,8 +168,12 @@ detect_roles() {
   if [[ -f "${ROOT_DIR}/.env" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | awk '/^smoker-(central|db|web|gateway)$/ { found=1 } END { exit !found }'; then
     has_central="true"
   fi
-  # Exclude built-in 'smoker-probe-local' (managed by Central compose) when detecting standalone Remote Probe containers
-  if [[ -n "$(list_probe_env_files)" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | awk '/^smoker-probe($|-)/ && $0 != "smoker-probe-local" { found=1 } END { exit !found }'; then
+  # Standalone remote probes require .probe.env / .probe.<instance>.env.
+  # Only fall back to container-name detection (excluding built-in smoker-probe-local) when this host is not a Central server,
+  # so leftover/unrelated smoker-probe* containers on a Master server never cause auto-detect to fail in update_probe.
+  if [[ -n "$(list_probe_env_files)" ]]; then
+    has_probe="true"
+  elif [[ "$has_central" != "true" ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | awk '/^smoker-probe($|-)/ && $0 != "smoker-probe-local" { found=1 } END { exit !found }'; then
     has_probe="true"
   fi
 
@@ -244,6 +255,13 @@ pull_updates() {
       chmod +x "$sh_file" 2>/dev/null || true
     fi
   done
+
+  if [[ "$old_sha" != "$new_sha" && "${SMOKER_UPDATE_REEXECED:-0}" != "1" ]]; then
+    if [[ -n "$(git diff --name-only "$old_sha" "$new_sha" -- "scripts/update.sh" 2>/dev/null || true)" ]]; then
+      log_info "scripts/update.sh was updated (${old_sha} -> ${new_sha}); re-executing with the new version..."
+      exec env SMOKER_UPDATE_REEXECED=1 "${ROOT_DIR}/scripts/update.sh" --skip-pull ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+    fi
+  fi
 }
 
 backup_central_db() {
@@ -528,11 +546,14 @@ main() {
   ts="$(date -u +"%Y%m%d-%H%M%S")"
 
   check_docker
+
+  if [[ "${SMOKER_UPDATE_REEXECED:-0}" != "1" ]]; then
+    backup_env_files "$ts"
+  fi
+  pull_updates "$ts"
+
   detected_role="$(detect_roles)"
   log_info "Detected deployment role: ${detected_role}"
-
-  backup_env_files "$ts"
-  pull_updates "$ts"
 
   case "$detected_role" in
     central)
