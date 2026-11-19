@@ -221,8 +221,8 @@ setup_central() {
     fi
   fi
 
-  # Preserve existing secrets if .env already exists, otherwise generate fresh secure secrets
-  local pg_db pg_user pg_pass admin_user admin_pass jwt_sec enc_key local_tok cookie_mode
+  # Preserve existing secrets & optional settings if .env already exists, otherwise generate fresh secure secrets
+  local pg_db pg_user pg_pass admin_user admin_pass jwt_sec enc_key local_tok cookie_mode tv_kiosk_token public_base_url
   pg_db="$(read_env_var "${ROOT_DIR}/.env" "POSTGRES_DB")"; pg_db="${pg_db:-smoker}"
   pg_user="$(read_env_var "${ROOT_DIR}/.env" "POSTGRES_USER")"; pg_user="${pg_user:-smoker}"
   pg_pass="$(read_env_var "${ROOT_DIR}/.env" "POSTGRES_PASSWORD")"
@@ -231,6 +231,9 @@ setup_central() {
   jwt_sec="$(read_env_var "${ROOT_DIR}/.env" "JWT_SECRET")"
   enc_key="$(read_env_var "${ROOT_DIR}/.env" "APP_ENCRYPTION_KEY")"
   local_tok="$(read_env_var "${ROOT_DIR}/.env" "LOCAL_PROBE_TOKEN")"
+  cookie_mode="$(read_env_var "${ROOT_DIR}/.env" "COOKIE_SECURE")"; cookie_mode="${cookie_mode:-auto}"
+  tv_kiosk_token="$(read_env_var "${ROOT_DIR}/.env" "NOC_TV_KIOSK_TOKEN")"
+  public_base_url="$(read_env_var "${ROOT_DIR}/.env" "PUBLIC_BASE_URL")"
 
   local generated_creds="false"
   if [[ -z "$pg_pass" ]]; then pg_pass="smk_pg_$(gen_secret 16)"; fi
@@ -238,10 +241,10 @@ setup_central() {
   if [[ -z "$jwt_sec" ]]; then jwt_sec="$(gen_secret 32)"; fi
   if [[ -z "$enc_key" ]]; then enc_key="$(gen_secret 32)"; fi
   if [[ -z "$local_tok" ]]; then local_tok="smk_local_$(gen_secret 24)"; fi
-  cookie_mode="auto"
 
   if [[ -f "${ROOT_DIR}/.env" ]]; then
     cp "${ROOT_DIR}/.env" "${ROOT_DIR}/.env.bak"
+    chmod 600 "${ROOT_DIR}/.env.bak"
     log_info "Backed up existing .env -> .env.bak"
   fi
 
@@ -271,7 +274,9 @@ LOCAL_PROBE_TOKEN=${local_tok}
 
 SEED_PUBLIC_MONITORS=true
 NOC_TV_ALLOW_UNAUTH=${TV_ALLOW_UNAUTH}
+NOC_TV_KIOSK_TOKEN=${tv_kiosk_token}
 COOKIE_SECURE=${cookie_mode}
+PUBLIC_BASE_URL=${public_base_url}
 EOF
   chmod 600 "${ROOT_DIR}/.env"
   log_info "Wrote ${ROOT_DIR}/.env (mode=${ACCESS_MODE}, bind=${BIND_ADDR}:${APP_PORT})"

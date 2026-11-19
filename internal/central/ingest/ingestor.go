@@ -42,7 +42,9 @@ type WindowStats struct {
 	SampleCount      int
 	LossCount        int
 	LossPct          float64
+	P50Ms            float64
 	P95Ms            float64
+	LastRTTMs        float64
 	BaselineMs       float64
 	BaselineSpikePct float64
 	AvgJitterMs      float64
@@ -151,6 +153,8 @@ func (c *RollingCache) WindowStats(targetID, probeID uuid.UUID, window time.Dura
 	}
 	cutoff := now.Add(-window)
 	var rtts, allHealthy []int32
+	var lastHealthyRTTUs int32
+	var lastHealthyTS time.Time
 	var totalJitter int64
 	var okCount, lossCount, totalCount int
 	for _, s := range buf {
@@ -167,6 +171,10 @@ func (c *RollingCache) WindowStats(targetID, probeID uuid.UUID, window time.Dura
 			okCount++
 			rtts = append(rtts, s.rttUs)
 			totalJitter += int64(s.jitterUs)
+			if s.rttUs > 0 && (lastHealthyTS.IsZero() || !s.ts.Before(lastHealthyTS)) {
+				lastHealthyRTTUs = s.rttUs
+				lastHealthyTS = s.ts
+			}
 		}
 	}
 	c.mu.RUnlock()
@@ -191,23 +199,29 @@ func (c *RollingCache) WindowStats(targetID, probeID uuid.UUID, window time.Dura
 				BaselineMs:  baselineMs,
 			}
 		case "intermittent_loss":
+			p50 := round2(base*1.4 + 6.0)
 			p95 := round2(base*1.8 + 12.0)
 			return WindowStats{
 				SampleCount:      15,
 				LossCount:        5,
 				LossPct:          33.33,
+				P50Ms:            p50,
 				P95Ms:            p95,
+				LastRTTMs:        p50,
 				BaselineMs:       base,
 				BaselineSpikePct: round2(((p95 - base) / base) * 100.0),
 				AvgJitterMs:      18.5,
 			}
 		case "high_latency":
+			p50 := round2(math.Max(base*2.6, base+48.0))
 			p95 := round2(math.Max(base*3.2, base+65.0))
 			return WindowStats{
 				SampleCount:      15,
 				LossCount:        0,
 				LossPct:          0,
+				P50Ms:            p50,
 				P95Ms:            p95,
+				LastRTTMs:        p50,
 				BaselineMs:       base,
 				BaselineSpikePct: round2(((p95 - base) / base) * 100.0),
 				AvgJitterMs:      14.0,
@@ -226,7 +240,13 @@ func (c *RollingCache) WindowStats(targetID, probeID uuid.UUID, window time.Dura
 	}
 	if okCount > 0 {
 		sort.Slice(rtts, func(i, j int) bool { return rtts[i] < rtts[j] })
+		stats.P50Ms = round2(float64(percentileSorted(rtts, 0.50)) / 1000.0)
 		stats.P95Ms = float64(percentileSorted(rtts, 0.95)) / 1000.0
+		if lastHealthyRTTUs > 0 {
+			stats.LastRTTMs = round2(float64(lastHealthyRTTUs) / 1000.0)
+		} else {
+			stats.LastRTTMs = stats.P50Ms
+		}
 		stats.AvgJitterMs = (float64(totalJitter) / float64(okCount)) / 1000.0
 		if baselineMs > 0 && (stats.P95Ms-baselineMs) >= 15.0 {
 			stats.BaselineSpikePct = round2(((stats.P95Ms - baselineMs) / baselineMs) * 100.0)

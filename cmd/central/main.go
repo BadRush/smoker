@@ -59,9 +59,11 @@ func main() {
 
 	hub := wshub.NewHub(store, ingestor, cfg.JWTSecret)
 	hub.SetNocTVAllowUnauth(cfg.NocTVAllowUnauth)
+	hub.SetNocTVKioskToken(cfg.NocTVKioskToken)
 	notifier := alerts.NewNotifier()
 	aesKey := auth.DeriveAESKey(cfg.AppEncryptionKey)
 	evaluator := alerts.NewEvaluator(store, cache, hub, notifier, aesKey, nil)
+	evaluator.SetPublicBaseURL(cfg.PublicBaseURL)
 
 	go hub.RunStalenessMonitor(ctx)
 	go evaluator.Run(ctx)

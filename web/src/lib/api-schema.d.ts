@@ -118,6 +118,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tv/presets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listTVPresets"];
+        put?: never;
+        post: operations["createTVPreset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tv/presets/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["updateTVPreset"];
+        post?: never;
+        delete: operations["deleteTVPreset"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/probes": {
         parameters: {
             query?: never;
@@ -406,6 +438,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/alerts/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["setAlertingStatus"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/alerts/incidents": {
         parameters: {
             query?: never;
@@ -416,7 +464,7 @@ export interface paths {
         get: operations["listIncidents"];
         put?: never;
         post?: never;
-        delete?: never;
+        delete: operations["clearIncidents"];
         options?: never;
         head?: never;
         patch?: never;
@@ -432,6 +480,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["acknowledgeIncident"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/alerts/incidents/{id}/close": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["closeIncident"];
         delete?: never;
         options?: never;
         head?: never;
@@ -531,6 +595,7 @@ export interface components {
             interval_sec: number;
             timeout_ms: number;
             enabled: boolean;
+            alerts_enabled?: boolean;
             auto_mtr_on_loss: boolean;
             mtr_loss_threshold: number;
             pinned_on_tv: boolean;
@@ -558,6 +623,7 @@ export interface components {
             interval_sec?: number;
             timeout_ms?: number;
             enabled?: boolean;
+            alerts_enabled?: boolean;
             auto_mtr_on_loss?: boolean;
             mtr_loss_threshold?: number;
             pinned_on_tv?: boolean;
@@ -600,8 +666,31 @@ export interface components {
             cells: components["schemas"]["MatrixCell"][];
             active_incidents: number;
             brand_name?: string;
+            is_admin?: boolean;
             /** Format: date-time */
             generated_at: string;
+        };
+        TVPreset: {
+            /** Format: uuid */
+            id: string;
+            slug: string;
+            name: string;
+            config: {
+                [key: string]: unknown;
+            };
+            is_default: boolean;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        TVPresetInput: {
+            slug?: string;
+            name: string;
+            config: {
+                [key: string]: unknown;
+            };
+            is_default?: boolean;
         };
         ProbeSeries: {
             /** Format: uuid */
@@ -763,6 +852,7 @@ export interface components {
             agg_retention_days: number;
             default_quorum_min: number;
             brand_name?: string;
+            alerting_enabled?: boolean;
             /** Format: date-time */
             updated_at: string;
         };
@@ -771,6 +861,7 @@ export interface components {
             agg_retention_days: number;
             default_quorum_min: number;
             brand_name?: string;
+            alerting_enabled?: boolean;
         };
         SeedResult: {
             groups_created: number;
@@ -930,6 +1021,96 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["BatchSeriesResponse"];
                 };
+            };
+        };
+    };
+    listTVPresets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Saved TV display presets */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TVPreset"][];
+                };
+            };
+        };
+    };
+    createTVPreset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TVPresetInput"];
+            };
+        };
+        responses: {
+            /** @description Created TV preset */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TVPreset"];
+                };
+            };
+        };
+    };
+    updateTVPreset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TVPresetInput"];
+            };
+        };
+        responses: {
+            /** @description Updated TV preset */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TVPreset"];
+                };
+            };
+        };
+    };
+    deleteTVPreset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -1619,6 +1800,32 @@ export interface operations {
             };
         };
     };
+    setAlertingStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    alerting_enabled: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Updated alerting status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SystemSettings"];
+                };
+            };
+        };
+    };
     listIncidents: {
         parameters: {
             query?: never;
@@ -1639,6 +1846,32 @@ export interface operations {
             };
         };
     };
+    clearIncidents: {
+        parameters: {
+            query?: {
+                scope?: "resolved" | "all";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cleared incidents count */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        deleted: number;
+                        /** @enum {string} */
+                        scope: "resolved" | "all";
+                    };
+                };
+            };
+        };
+    };
     acknowledgeIncident: {
         parameters: {
             query?: never;
@@ -1651,6 +1884,28 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Incident acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Incident"];
+                };
+            };
+        };
+    };
+    closeIncident: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Incident manually closed */
             200: {
                 headers: {
                     [name: string]: unknown;

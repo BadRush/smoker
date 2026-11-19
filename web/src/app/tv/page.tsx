@@ -5,6 +5,7 @@ import Link from "next/link";
 import {
   Activity,
   AlertTriangle,
+  Bookmark,
   Camera,
   Check,
   Copy,
@@ -17,8 +18,11 @@ import {
   Play,
   Radio,
   RotateCcw,
+  Save,
   Search,
   Settings2,
+  Star,
+  Trash2,
   Volume2,
   VolumeX,
   X,
@@ -35,10 +39,12 @@ import {
 } from "@/components/layout/DisplaySizeControls";
 import { ProtocolFilterChips } from "@/components/targets/ProtocolFilterChips";
 import {
+  ApiError,
   apiRequest,
   type BatchSeriesResponse,
   type MatrixSnapshot,
   type ProbeSeries,
+  type TVPreset,
 } from "@/lib/api";
 import { formatDateTime24 } from "@/lib/date-format";
 import { saveEvidenceBrandName } from "@/lib/export-chart-png";
@@ -74,6 +80,7 @@ import {
   parseTvConfig,
   partitionTargetsForTv,
   resolveTvFlowMode,
+  sanitizeTvConfig,
   saveTvConfigToStorage,
   selectFocalProbeCell,
   serializeTvConfig,
@@ -441,6 +448,13 @@ export default function NocTvWallboardPage() {
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [impairedOnly, setImpairedOnly] = useState<boolean>(false);
   const [zoomTargetId, setZoomTargetId] = useState<string | null>(null);
+  const [presets, setPresets] = useState<TVPreset[]>([]);
+  const [activePresetSlug, setActivePresetSlug] = useState<string | null>(null);
+  const [newPresetName, setNewPresetName] = useState<string>("");
+  const [newPresetDefault, setNewPresetDefault] = useState<boolean>(true);
+  const [presetBusy, setPresetBusy] = useState<boolean>(false);
+  const [presetNotice, setPresetNotice] = useState<string | null>(null);
+  const [kioskKey, setKioskKey] = useState<string>("");
   const [stageBox, setStageBox] = useState<{ width: number; height: number }>({
     width: 1900,
     height: 988,
@@ -451,9 +465,30 @@ export default function NocTvWallboardPage() {
   const prevImpairedIdsRef = useRef<Set<string>>(new Set());
   const prevCriticalIdsRef = useRef<Set<string>>(new Set());
   const hasSeededImpairedRef = useRef<boolean>(false);
+  const handledZoomQueryRef = useRef<boolean>(false);
+  const initialConfigSourceRef = useRef<"preset-query" | "url-query" | "storage" | "default">("default");
+  const requestedPresetSlugRef = useRef<string | null>(null);
+  const appliedServerPresetRef = useRef<boolean>(false);
+  const kioskKeyRef = useRef<string>("");
 
   const handleOpenZoomTarget = useCallback((targetId: string) => {
     setZoomTargetId(targetId);
+  }, []);
+
+  const handleCloseZoomTarget = useCallback(() => {
+    setZoomTargetId(null);
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      if (params.has("zoom")) {
+        params.delete("zoom");
+        const qs = params.toString();
+        window.history.replaceState(
+          null,
+          "",
+          qs ? `${window.location.pathname}?${qs}` : window.location.pathname
+        );
+      }
+    }
   }, []);
 
   const handleSelectProbe = useCallback((targetId: string, probeId: string) => {
@@ -506,18 +541,52 @@ export default function NocTvWallboardPage() {
   // Hydrate initial config from window.location.search or localStorage fallback on mount
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const hasSearch = window.location.search.length > 1;
-    const initial = hasSearch
+    const params = new URLSearchParams(window.location.search);
+    const keyParam = (params.get("key") ?? "").trim();
+    if (keyParam) {
+      kioskKeyRef.current = keyParam;
+      setKioskKey(keyParam);
+    }
+    const presetParam = (params.get("preset") ?? "").trim().toLowerCase();
+    if (presetParam) {
+      requestedPresetSlugRef.current = presetParam;
+      initialConfigSourceRef.current = "preset-query";
+    }
+    params.delete("zoom");
+    params.delete("preset");
+    params.delete("key");
+    const hasConfigSearch = params.toString().length > 0;
+    const stored = loadTvConfigFromStorage();
+    if (!presetParam) {
+      if (hasConfigSearch) {
+        initialConfigSourceRef.current = "url-query";
+      } else if (stored) {
+        initialConfigSourceRef.current = "storage";
+      } else {
+        initialConfigSourceRef.current = "default";
+      }
+    }
+    const initial = hasConfigSearch
       ? parseTvConfig(window.location.search)
-      : loadTvConfigFromStorage() ?? DEFAULT_TV_CONFIG;
+      : stored ?? DEFAULT_TV_CONFIG;
     setCfg(initial);
     setCountdown(initial.rotateSec);
     setUrlHydrated(true);
   }, []);
 
+  useEffect(() => {
+    if (handledZoomQueryRef.current || !data || typeof window === "undefined") return;
+    const zId = new URLSearchParams(window.location.search).get("zoom");
+    handledZoomQueryRef.current = true;
+    if (zId && data.targets.some((t) => t.id === zId)) {
+      setZoomTargetId(zId);
+    }
+  }, [data]);
+
   // Sync config updates to URL query parameters and localStorage without triggering router navigation
   const updateConfig = useCallback(
     (updater: (prev: TvWallConfig) => TvWallConfig, resetPage = true) => {
+      setActivePresetSlug(null);
       setCfg((prev) => {
         const next = updater(prev);
         if (typeof window !== "undefined") {
@@ -535,10 +604,76 @@ export default function NocTvWallboardPage() {
     []
   );
 
+  const applyTvPreset = useCallback((preset: TVPreset, syncUrl = true) => {
+    const nextCfg = sanitizeTvConfig(preset.config);
+    setCfg(nextCfg);
+    setCountdown(nextCfg.rotateSec);
+    setPageIdx(0);
+    setActivePresetSlug(preset.slug);
+    if (typeof window !== "undefined") {
+      saveTvConfigToStorage(nextCfg);
+      if (syncUrl) {
+        const params = new URLSearchParams();
+        params.set("preset", preset.slug);
+        window.history.replaceState(null, "", `${window.location.pathname}?${params.toString()}`);
+      }
+    }
+  }, []);
+
+  const loadTvPresets = useCallback(async () => {
+    try {
+      const keySuffix = kioskKeyRef.current
+        ? `?key=${encodeURIComponent(kioskKeyRef.current)}`
+        : "";
+      const list = await apiRequest<TVPreset[]>(`/api/tv/presets${keySuffix}`);
+      if (!Array.isArray(list)) return;
+      setPresets(list);
+
+      if (!appliedServerPresetRef.current) {
+        appliedServerPresetRef.current = true;
+        if (
+          initialConfigSourceRef.current === "preset-query" &&
+          requestedPresetSlugRef.current
+        ) {
+          const matched = list.find(
+            (p) => p.slug.toLowerCase() === requestedPresetSlugRef.current
+          );
+          if (matched) {
+            applyTvPreset(matched, false);
+          }
+        } else if (initialConfigSourceRef.current === "default") {
+          const defPreset = list.find((p) => p.is_default);
+          if (defPreset) {
+            applyTvPreset(defPreset, false);
+          }
+        }
+      }
+    } catch {
+      // ignore if presets endpoint unavailable in minimal test mocks
+    }
+  }, [applyTvPreset]);
+
   const loadTvMatrix = useCallback(async () => {
     try {
       setError(null);
-      const snap = await apiRequest<MatrixSnapshot>("/api/tv/matrix");
+      const keySuffix = kioskKeyRef.current
+        ? `?key=${encodeURIComponent(kioskKeyRef.current)}`
+        : "";
+      const snap = await apiRequest<MatrixSnapshot>(`/api/tv/matrix${keySuffix}`);
+      if (kioskKeyRef.current && typeof window !== "undefined") {
+        // Server has now issued HttpOnly smoker_tv_kiosk cookie; remove secret key from address bar
+        const params = new URLSearchParams(window.location.search);
+        if (params.has("key")) {
+          params.delete("key");
+          const qs = params.toString();
+          window.history.replaceState(
+            null,
+            "",
+            qs ? `${window.location.pathname}?${qs}` : window.location.pathname
+          );
+        }
+        kioskKeyRef.current = "";
+      }
       if (snap.brand_name !== undefined) {
         saveEvidenceBrandName(snap.brand_name);
       }
@@ -549,12 +684,14 @@ export default function NocTvWallboardPage() {
   }, []);
 
   useEffect(() => {
+    if (!urlHydrated) return;
     void loadTvMatrix();
+    void loadTvPresets();
     const poll = setInterval(() => {
       void loadTvMatrix();
     }, 5000);
     return () => clearInterval(poll);
-  }, [loadTvMatrix]);
+  }, [urlHydrated, loadTvMatrix, loadTvPresets]);
 
   // Live 24h + date clock ticker
   useEffect(() => {
@@ -633,7 +770,10 @@ export default function NocTvWallboardPage() {
     [loadTvMatrix]
   );
 
-  const wsState = useLiveSocket(["matrix"], handleLiveEvent, { scope: "tv" });
+  const wsState = useLiveSocket(["matrix"], handleLiveEvent, {
+    scope: "tv",
+    kioskKey: kioskKey || undefined,
+  });
 
   const groupMap = useMemo(() => {
     const map = new Map<string, string>();
@@ -1054,13 +1194,96 @@ export default function NocTvWallboardPage() {
     };
   }, [data, partitioned]);
 
-  const kioskUrl = useMemo(() => {
-    const qs = serializeTvConfig(cfg);
-    if (typeof window === "undefined" || !urlHydrated) {
-      return `/tv?${qs}`;
+  const isAdmin = Boolean(data?.is_admin);
+
+  async function handleSaveNewPreset(e: React.FormEvent) {
+    e.preventDefault();
+    const cleanName = newPresetName.trim();
+    if (!cleanName) return;
+    setPresetBusy(true);
+    setPresetNotice(null);
+    try {
+      const created = await apiRequest<TVPreset>("/api/tv/presets", {
+        method: "POST",
+        body: JSON.stringify({
+          name: cleanName,
+          config: cfg,
+          is_default: newPresetDefault,
+        }),
+      });
+      setNewPresetName("");
+      setActivePresetSlug(created.slug);
+      setPresetNotice(
+        created.is_default
+          ? `Saved "${created.name}" as Default TV layout (auto-loads on reboot).`
+          : `Saved preset "${created.name}".`
+      );
+      await loadTvPresets();
+    } catch (err) {
+      setPresetNotice(
+        err instanceof ApiError ? err.detail : "Failed to save TV preset"
+      );
+    } finally {
+      setPresetBusy(false);
     }
-    return `${window.location.origin}/tv?${qs}`;
-  }, [cfg, urlHydrated]);
+  }
+
+  async function handleUpdatePreset(preset: TVPreset, opts: { setDefault?: boolean; overwriteConfig?: boolean }) {
+    setPresetBusy(true);
+    setPresetNotice(null);
+    try {
+      await apiRequest<TVPreset>(`/api/tv/presets/${preset.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          slug: preset.slug,
+          name: preset.name,
+          config: opts.overwriteConfig ? cfg : preset.config,
+          is_default: opts.setDefault ? true : preset.is_default,
+        }),
+      });
+      setPresetNotice(
+        opts.setDefault
+          ? `"${preset.name}" is now the Default TV preset on reboot.`
+          : `Updated preset "${preset.name}" with current layout.`
+      );
+      await loadTvPresets();
+    } catch (err) {
+      setPresetNotice(
+        err instanceof ApiError ? err.detail : "Failed to update TV preset"
+      );
+    } finally {
+      setPresetBusy(false);
+    }
+  }
+
+  async function handleDeletePreset(preset: TVPreset) {
+    setPresetBusy(true);
+    setPresetNotice(null);
+    try {
+      await apiRequest(`/api/tv/presets/${preset.id}`, { method: "DELETE" });
+      if (activePresetSlug === preset.slug) {
+        setActivePresetSlug(null);
+      }
+      setPresetNotice(`Deleted preset "${preset.name}".`);
+      await loadTvPresets();
+    } catch (err) {
+      setPresetNotice(
+        err instanceof ApiError ? err.detail : "Failed to delete TV preset"
+      );
+    } finally {
+      setPresetBusy(false);
+    }
+  }
+
+  const kioskUrl = useMemo(() => {
+    const origin =
+      typeof window === "undefined" || !urlHydrated ? "" : window.location.origin;
+    if (activePresetSlug) {
+      return `${origin}/tv?preset=${encodeURIComponent(activePresetSlug)}`;
+    }
+    const qs = serializeTvConfig(cfg);
+    return `${origin}/tv?${qs}`;
+  }, [cfg, urlHydrated, activePresetSlug]);
 
   async function handleCopyKioskUrl() {
     try {
@@ -1229,6 +1452,31 @@ export default function NocTvWallboardPage() {
               </button>
             ))}
           </div>
+
+          {presets.length > 0 && (
+            <div className="hidden md:flex items-center gap-1">
+              <Bookmark className="h-3.5 w-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
+              <select
+                aria-label="Switch TV preset"
+                data-testid="tv-header-preset-select"
+                value={activePresetSlug ?? ""}
+                onChange={(e) => {
+                  const chosen = presets.find((p) => p.slug === e.target.value);
+                  if (chosen) applyTvPreset(chosen);
+                }}
+                className="rounded border border-border bg-canvas/80 px-2 py-0.5 text-[11px] font-mono text-zinc-200 focus:border-emerald-500 focus:outline-none"
+              >
+                <option value="" disabled>
+                  Presets...
+                </option>
+                {presets.map((p) => (
+                  <option key={p.id} value={p.slug}>
+                    {p.is_default ? `★ ${p.name}` : p.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           {clockText && (
             <div className="hidden 2xl:block border-l border-border pl-3 text-xs font-mono tabular-nums text-zinc-300">
@@ -2105,7 +2353,7 @@ export default function NocTvWallboardPage() {
             probeMap={probeMap}
             initialRange={cfg.range}
             fallbackSeries={seriesByTarget[zTarget.id] ?? []}
-            onClose={() => setZoomTargetId(null)}
+            onClose={handleCloseZoomTarget}
           />
         );
       })()}
@@ -2136,6 +2384,159 @@ export default function NocTvWallboardPage() {
 
             {/* Independently Scrollable Body */}
             <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 space-y-4">
+              {/* Saved 1-Click TV Display Presets */}
+              <div
+                data-testid="tv-presets-section"
+                className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 space-y-2.5"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <Bookmark className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
+                    <p className="text-xs font-semibold uppercase tracking-wider text-zinc-100">
+                      TV Display Presets (1-Click)
+                    </p>
+                  </div>
+                  <span className="font-mono text-[10px] text-zinc-400">
+                    {presets.length} saved
+                  </span>
+                </div>
+
+                {presets.length === 0 ? (
+                  <p className="text-[11px] text-zinc-400">
+                    {isAdmin
+                      ? "Save your current layout below so NOC monitors auto-restore it on reboot."
+                      : "No server presets saved yet. Sign in as Admin to save default NOC layouts."}
+                  </p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {presets.map((p) => {
+                      const isActive = activePresetSlug === p.slug;
+                      return (
+                        <div
+                          key={p.id}
+                          className={`flex items-center justify-between gap-1.5 rounded border px-2 py-1.5 text-xs ${
+                            isActive
+                              ? "border-emerald-500/60 bg-emerald-500/15"
+                              : "border-border bg-canvas/80"
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            data-testid={`tv-preset-btn-${p.slug}`}
+                            onClick={() => applyTvPreset(p)}
+                            className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                          >
+                            {p.is_default && (
+                              <Star
+                                className="h-3 w-3 shrink-0 fill-amber-400 text-amber-400"
+                                aria-label="Default preset"
+                              />
+                            )}
+                            <span
+                              className={`truncate font-medium ${
+                                isActive ? "text-emerald-200" : "text-zinc-100 hover:text-emerald-300"
+                              }`}
+                            >
+                              {p.name}
+                            </span>
+                            {p.is_default && (
+                              <span className="shrink-0 rounded border border-amber-500/40 bg-amber-500/15 px-1 py-0 text-[9px] font-mono uppercase text-amber-300">
+                                Default
+                              </span>
+                            )}
+                          </button>
+
+                          <div className="flex items-center gap-1 shrink-0">
+                            {isAdmin && !p.is_default && (
+                              <button
+                                type="button"
+                                disabled={presetBusy}
+                                aria-label={`Set preset ${p.name} as default`}
+                                title="Set as Default on reboot"
+                                onClick={() =>
+                                  void handleUpdatePreset(p, { setDefault: true })
+                                }
+                                className="rounded border border-border bg-elevated px-1.5 py-0.5 text-[10px] font-mono text-zinc-300 hover:border-amber-500/50 hover:text-amber-300"
+                              >
+                                Set Default
+                              </button>
+                            )}
+                            {isAdmin && (
+                              <button
+                                type="button"
+                                disabled={presetBusy}
+                                aria-label={`Update preset ${p.name} with current layout`}
+                                title="Overwrite with current layout"
+                                onClick={() =>
+                                  void handleUpdatePreset(p, { overwriteConfig: true })
+                                }
+                                className="rounded border border-border bg-elevated p-1 text-zinc-300 hover:border-emerald-500/50 hover:text-emerald-300"
+                              >
+                                <Save className="h-3 w-3" aria-hidden="true" />
+                              </button>
+                            )}
+                            {isAdmin && (
+                              <button
+                                type="button"
+                                disabled={presetBusy}
+                                aria-label={`Delete preset ${p.name}`}
+                                onClick={() => void handleDeletePreset(p)}
+                                className="rounded border border-rose-500/30 bg-rose-500/10 p-1 text-rose-300 hover:bg-rose-500/20"
+                              >
+                                <Trash2 className="h-3 w-3" aria-hidden="true" />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {isAdmin && (
+                  <form
+                    onSubmit={handleSaveNewPreset}
+                    data-testid="tv-preset-admin-form"
+                    className="space-y-2 border-t border-border/60 pt-2"
+                  >
+                    <div className="flex gap-1.5">
+                      <input
+                        type="text"
+                        aria-label="New preset name"
+                        value={newPresetName}
+                        onChange={(e) => setNewPresetName(e.target.value)}
+                        placeholder="Preset name (e.g. NOC Main Wall)"
+                        className="min-w-0 flex-1 rounded border border-border bg-canvas px-2 py-1 text-xs text-zinc-100 placeholder-zinc-500"
+                      />
+                      <button
+                        type="submit"
+                        disabled={presetBusy || !newPresetName.trim()}
+                        className="inline-flex shrink-0 items-center gap-1 rounded bg-emerald-500 px-2.5 py-1 text-xs font-semibold text-zinc-950 hover:bg-emerald-400 disabled:opacity-50"
+                      >
+                        <Save className="h-3 w-3" aria-hidden="true" />
+                        <span>Save</span>
+                      </button>
+                    </div>
+                    <label className="flex items-center gap-1.5 text-[11px] text-zinc-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        aria-label="Set as default preset on reboot"
+                        checked={newPresetDefault}
+                        onChange={(e) => setNewPresetDefault(e.target.checked)}
+                        className="rounded border-border bg-canvas"
+                      />
+                      <span>Auto-load as Default on fresh browser / reboot</span>
+                    </label>
+                  </form>
+                )}
+
+                {presetNotice && (
+                  <p role="status" className="text-[11px] text-cyan-200">
+                    {presetNotice}
+                  </p>
+                )}
+              </div>
+
               {/* Graph Time Range */}
               <div>
                 <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-300">
@@ -2657,59 +3058,64 @@ export default function NocTvWallboardPage() {
                 </button>
               </div>
 
-              {/* Test Highlight & Auto-Switch (30s Simulation) */}
-              <div className="rounded-md border border-border bg-canvas p-3 space-y-2">
-                <label
-                  htmlFor="sim-target-select"
-                  className="block text-xs font-semibold uppercase tracking-wider text-zinc-300"
+              {/* Test Highlight & Auto-Switch (30s Simulation — Admin only) */}
+              {isAdmin && (
+                <div
+                  data-testid="tv-simulate-panel"
+                  className="rounded-md border border-border bg-canvas p-3 space-y-2"
                 >
-                  Test Highlight &amp; Auto-Switch (30s Simulation)
-                </label>
-                <select
-                  id="sim-target-select"
-                  value={simTargetId}
-                  onChange={(e) => setSimTargetId(e.target.value)}
-                  className="w-full rounded border border-border bg-elevated px-2.5 py-1.5 text-xs text-zinc-100"
-                >
-                  {(data?.targets ?? []).map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.name} ({t.host})
-                    </option>
-                  ))}
-                </select>
-                <div className="grid grid-cols-3 gap-1.5">
-                  <button
-                    type="button"
-                    disabled={simRunning}
-                    data-testid="tv-simulate-spike-btn"
-                    onClick={() => void handleSimulateAnomaly("high_latency")}
-                    className="rounded border border-amber-500/40 bg-amber-500/15 px-2 py-1.5 text-[11px] font-semibold text-amber-300"
+                  <label
+                    htmlFor="sim-target-select"
+                    className="block text-xs font-semibold uppercase tracking-wider text-zinc-300"
                   >
-                    Spike RTT (30s)
-                  </button>
-                  <button
-                    type="button"
-                    disabled={simRunning}
-                    data-testid="tv-simulate-loss-btn"
-                    onClick={() => void handleSimulateAnomaly("intermittent_loss")}
-                    className="rounded border border-rose-500/40 bg-rose-500/15 px-2 py-1.5 text-[11px] font-semibold text-rose-300"
+                    Test Highlight &amp; Auto-Switch (30s Simulation)
+                  </label>
+                  <select
+                    id="sim-target-select"
+                    value={simTargetId}
+                    onChange={(e) => setSimTargetId(e.target.value)}
+                    className="w-full rounded border border-border bg-elevated px-2.5 py-1.5 text-xs text-zinc-100"
                   >
-                    Packet Loss (30s)
-                  </button>
-                  <button
-                    type="button"
-                    disabled={simRunning}
-                    data-testid="tv-simulate-clear-btn"
-                    onClick={() => void handleSimulateAnomaly("clear")}
-                    className="rounded border border-border bg-elevated px-2 py-1.5 text-[11px] font-medium text-zinc-200"
-                  >
-                    Clear Sim
-                  </button>
+                    {(data?.targets ?? []).map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.name} ({t.host})
+                      </option>
+                    ))}
+                  </select>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <button
+                      type="button"
+                      disabled={simRunning}
+                      data-testid="tv-simulate-spike-btn"
+                      onClick={() => void handleSimulateAnomaly("high_latency")}
+                      className="rounded border border-amber-500/40 bg-amber-500/15 px-2 py-1.5 text-[11px] font-semibold text-amber-300"
+                    >
+                      Spike RTT (30s)
+                    </button>
+                    <button
+                      type="button"
+                      disabled={simRunning}
+                      data-testid="tv-simulate-loss-btn"
+                      onClick={() => void handleSimulateAnomaly("intermittent_loss")}
+                      className="rounded border border-rose-500/40 bg-rose-500/15 px-2 py-1.5 text-[11px] font-semibold text-rose-300"
+                    >
+                      Packet Loss (30s)
+                    </button>
+                    <button
+                      type="button"
+                      disabled={simRunning}
+                      data-testid="tv-simulate-clear-btn"
+                      onClick={() => void handleSimulateAnomaly("clear")}
+                      className="rounded border border-border bg-elevated px-2 py-1.5 text-[11px] font-medium text-zinc-200"
+                    >
+                      Clear Sim
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-zinc-400">
+                    Injects a 30s synthetic spike into the in-memory rolling cache to test the TV Spotlight slide and event-driven auto-switch.
+                  </p>
                 </div>
-                <p className="text-[11px] text-zinc-400">
-                  Injects a 30s synthetic spike into the in-memory rolling cache to test the TV Spotlight slide and event-driven auto-switch.
-                </p>
-              </div>
+              )}
 
               {/* Persistent Kiosk URL */}
               <div>

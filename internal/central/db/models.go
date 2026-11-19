@@ -1,6 +1,7 @@
 package db
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -67,6 +68,7 @@ type Target struct {
 	IntervalSec           int            `json:"interval_sec"`
 	TimeoutMs             int            `json:"timeout_ms"`
 	Enabled               bool           `json:"enabled"`
+	AlertsEnabled         bool           `json:"alerts_enabled"`
 	AutoMTROnLoss         bool           `json:"auto_mtr_on_loss"`
 	MTRLossThreshold      int            `json:"mtr_loss_threshold"`
 	AssignAllProbes       bool           `json:"assign_all_probes"`
@@ -142,7 +144,18 @@ type SystemSettings struct {
 	AggRetentionDays int       `json:"agg_retention_days"`
 	DefaultQuorumMin int       `json:"default_quorum_min"`
 	BrandName        string    `json:"brand_name"`
+	AlertingEnabled  bool      `json:"alerting_enabled"`
 	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type TVPreset struct {
+	ID        uuid.UUID       `json:"id"`
+	Slug      string          `json:"slug"`
+	Name      string          `json:"name"`
+	Config    json.RawMessage `json:"config"`
+	IsDefault bool            `json:"is_default"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
 }
 
 type ProbeSeries struct {

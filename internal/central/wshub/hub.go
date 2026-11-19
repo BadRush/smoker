@@ -51,6 +51,7 @@ type Hub struct {
 	ingestor         *ingest.Ingestor
 	jwtSecret        string
 	nocTVAllowUnauth bool
+	nocTVKioskToken  string
 
 	mu         sync.RWMutex
 	probes     map[uuid.UUID]*probeConn
@@ -72,6 +73,10 @@ func NewHub(store *db.Store, ingestor *ingest.Ingestor, jwtSecret string) *Hub {
 
 func (h *Hub) SetNocTVAllowUnauth(allow bool) {
 	h.nocTVAllowUnauth = allow
+}
+
+func (h *Hub) SetNocTVKioskToken(token string) {
+	h.nocTVKioskToken = strings.TrimSpace(token)
 }
 
 func (h *Hub) RunStalenessMonitor(ctx context.Context) {
@@ -504,9 +509,28 @@ func (h *Hub) HandleLiveWS(w http.ResponseWriter, r *http.Request) {
 			authenticated = true
 		}
 	}
-	if !authenticated && !(isTVScope && h.nocTVAllowUnauth) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+	if !authenticated {
+		tvAuthorized := false
+		if isTVScope {
+			if h.nocTVKioskToken != "" {
+				kioskCandidate := strings.TrimSpace(r.URL.Query().Get("key"))
+				if kioskCandidate == "" {
+					kioskCandidate = strings.TrimSpace(r.Header.Get("X-TV-Kiosk-Key"))
+				}
+				if kioskCandidate == "" {
+					if cookie, err := r.Cookie(auth.TVKioskCookieName); err == nil {
+						kioskCandidate = strings.TrimSpace(cookie.Value)
+					}
+				}
+				tvAuthorized = auth.VerifyTVKioskToken(h.nocTVKioskToken, kioskCandidate)
+			} else if h.nocTVAllowUnauth {
+				tvAuthorized = true
+			}
+		}
+		if !tvAuthorized {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{

@@ -13,7 +13,7 @@ export interface LiveEventMessage {
 export function useLiveSocket(
   channels: string[],
   onEvent: (ev: LiveEventMessage) => void,
-  options?: { scope?: "tv" }
+  options?: { scope?: "tv"; kioskKey?: string }
 ): WsState {
   const [state, setState] = useState<WsState>("connecting");
   const handlerRef = useRef(onEvent);
@@ -21,6 +21,7 @@ export function useLiveSocket(
 
   const channelKey = channels.join("|");
   const scope = options?.scope;
+  const kioskKey = options?.kioskKey;
 
   useEffect(() => {
     let active = true;
@@ -31,8 +32,11 @@ export function useLiveSocket(
     const connect = () => {
       if (!active) return;
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const query = scope ? `?scope=${encodeURIComponent(scope)}` : "";
-      const url = `${proto}//${window.location.host}/ws/live${query}`;
+      const params = new URLSearchParams();
+      if (scope) params.set("scope", scope);
+      if (kioskKey) params.set("key", kioskKey);
+      const qs = params.toString();
+      const url = `${proto}//${window.location.host}/ws/live${qs ? `?${qs}` : ""}`;
 
       ws = new WebSocket(url);
       ws.onopen = () => {
@@ -73,7 +77,7 @@ export function useLiveSocket(
       ws?.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [channelKey, scope]);
+  }, [channelKey, scope, kioskKey]);
 
   return state;
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,7 +30,9 @@ type ChannelSecret struct {
 type ProbeAlertStat struct {
 	ProbeName        string  `json:"probe_name"`
 	LossPct          float64 `json:"loss_pct"`
+	P50Ms            float64 `json:"p50_ms,omitempty"`
 	P95Ms            float64 `json:"p95_ms,omitempty"`
+	LastRTTMs        float64 `json:"last_rtt_ms,omitempty"`
 	AvgJitterMs      float64 `json:"avg_jitter_ms,omitempty"`
 	BaselineMs       float64 `json:"baseline_ms,omitempty"`
 	BaselineSpikePct float64 `json:"baseline_spike_pct,omitempty"`
@@ -112,32 +115,41 @@ func (n *Notifier) pacerForChat(chatID string) *chatPacer {
 }
 
 type AlertMessage struct {
-	IncidentID       uuid.UUID        `json:"incident_id,omitempty"`
-	IncidentSeverity string           `json:"incident_severity,omitempty"`
-	Status           string           `json:"status"`   // FIRING | ESCALATED | RESOLVED | TEST
-	Severity         string           `json:"severity"` // critical | warn | ok | test
-	RuleName         string           `json:"rule_name"`
-	TargetName       string           `json:"target_name"`
-	TargetHost       string           `json:"target_host,omitempty"`
-	Metric           string           `json:"metric"`
-	Value            float64          `json:"value"`
-	PeakValue        float64          `json:"peak_value,omitempty"`
-	Threshold        float64          `json:"threshold"`
-	QuorumCount      int              `json:"quorum_count"`
-	QuorumRequired   int              `json:"quorum_required"`
-	TotalProbes      int              `json:"total_probes,omitempty"`
-	AffectedProbes   []string         `json:"affected_probes"`
-	ProbeBreakdown   []ProbeAlertStat `json:"probe_breakdown,omitempty"`
-	MTRBottleneck    string           `json:"mtr_bottleneck,omitempty"`
+	IncidentID         uuid.UUID        `json:"incident_id,omitempty"`
+	IncidentSeverity   string           `json:"incident_severity,omitempty"`
+	Status             string           `json:"status"`   // FIRING | ESCALATED | RESOLVED | TEST
+	Severity           string           `json:"severity"` // critical | warn | ok | test
+	RuleName           string           `json:"rule_name"`
+	TargetID           *uuid.UUID       `json:"target_id,omitempty"`
+	TargetName         string           `json:"target_name"`
+	TargetHost         string           `json:"target_host,omitempty"`
+	TargetProtocol     string           `json:"target_protocol,omitempty"`
+	GroupName          string           `json:"group_name,omitempty"`
+	Metric             string           `json:"metric"`
+	Value              float64          `json:"value"`
+	PeakValue          float64          `json:"peak_value,omitempty"`
+	Threshold          float64          `json:"threshold"`
+	QuorumCount        int              `json:"quorum_count"`
+	QuorumRequired     int              `json:"quorum_required"`
+	TotalProbes        int              `json:"total_probes,omitempty"`
+	OnlineProbes       int              `json:"online_probes,omitempty"`
+	AffectedProbes     []string         `json:"affected_probes"`
+	ProbeBreakdown     []ProbeAlertStat `json:"probe_breakdown,omitempty"`
+	CurrentProbes      []ProbeAlertStat `json:"current_probes,omitempty"`
+	MTRBottleneck      string           `json:"mtr_bottleneck,omitempty"`
+	IsReminder         bool             `json:"is_reminder,omitempty"`
+	DashboardBaseURL   string           `json:"-"`
+	FleetSummary       string           `json:"fleet_summary,omitempty"`
+	ChannelSummary     string           `json:"channel_summary,omitempty"`
 	ReplyToMsgID       int64            `json:"reply_to_message_id,omitempty"`
 	ReplyToByChannel   map[string]int64 `json:"-"`
 	PartialInitialOnly bool             `json:"-"`
 	Summary            string           `json:"summary"`
-	StartedAt        string           `json:"started_at,omitempty"`
-	ResolvedAt       string           `json:"resolved_at,omitempty"`
-	DurationSec      int64            `json:"duration_sec,omitempty"`
-	Timestamp        string           `json:"timestamp"`
-	ChannelIDs       []uuid.UUID      `json:"channel_ids,omitempty"`
+	StartedAt          string           `json:"started_at,omitempty"`
+	ResolvedAt         string           `json:"resolved_at,omitempty"`
+	DurationSec        int64            `json:"duration_sec,omitempty"`
+	Timestamp          string           `json:"timestamp"`
+	ChannelIDs         []uuid.UUID      `json:"channel_ids,omitempty"`
 }
 
 func (n *Notifier) SendTelegram(ctx context.Context, botToken, chatID string, threadID int64, msg AlertMessage) error {
@@ -314,7 +326,8 @@ func SummarizeMTRBottleneck(snaps []db.MTRSnapshot, incidentStart time.Time) str
 	return ""
 }
 
-// FormatTelegramHTML formats alerts using plain non-jargon English, HTML-safe escaping,
+// FormatTelegramHTML formats alerts using familiar NOC telemetry terminology (Peak RTT, Avg, Base, Loss),
+// live Status readouts across all states, HTML-safe escaping, 1-tap copyable <code> hosts/hop IPs,
 // SLA start/end/duration fields, adaptive single-probe vs. multi-probe layout, and strictly only the ❌, ⚠️, and ✅ icons.
 func FormatTelegramHTML(msg AlertMessage) string {
 	esc := html.EscapeString
@@ -325,14 +338,24 @@ func FormatTelegramHTML(msg AlertMessage) string {
 		if statusText == "" {
 			statusText = "Notification connection verified"
 		}
-		return strings.Join([]string{
+		lines := []string{
 			"⚠️ <b>[TEST] Notification Check</b>",
 			fmt.Sprintf("<b>Status:</b> %s", esc(statusText)),
-			fmt.Sprintf("<b>Time:</b> %s", esc(formatAlertTimestamp(msg.Timestamp))),
-		}, "\n")
+		}
+		if fleet := strings.TrimSpace(msg.FleetSummary); fleet != "" {
+			lines = append(lines, fmt.Sprintf("<b>Fleet:</b> %s", esc(fleet)))
+		}
+		if chInfo := strings.TrimSpace(msg.ChannelSummary); chInfo != "" {
+			lines = append(lines, fmt.Sprintf("<b>Channel:</b> %s", esc(chInfo)))
+		}
+		lines = append(lines, fmt.Sprintf("<b>Time:</b> %s", esc(formatAlertTimestamp(msg.Timestamp))))
+		return strings.Join(lines, "\n")
 	}
 
-	targetDisplay := formatTargetDisplay(msg.TargetName, msg.TargetHost)
+	targetTitle := firstNonEmpty(strings.TrimSpace(msg.TargetName), strings.TrimSpace(msg.TargetHost))
+	if targetTitle == "" {
+		targetTitle = "Target"
+	}
 	locations := strings.Join(msg.AffectedProbes, ", ")
 	if locations == "" {
 		locations = "All assigned locations"
@@ -345,28 +368,62 @@ func FormatTelegramHTML(msg AlertMessage) string {
 	if total < len(msg.AffectedProbes) {
 		total = len(msg.AffectedProbes)
 	}
-	isSingleProbe := total <= 1 && len(msg.AffectedProbes) == 1
+	if total < len(msg.CurrentProbes) {
+		total = len(msg.CurrentProbes)
+	}
+	isSingleProbe := total <= 1 && (len(msg.AffectedProbes) == 1 || len(msg.CurrentProbes) == 1)
+
+	targetContextHTML := formatTargetContextHTML(msg)
+	graphLinkHTML := formatDashboardZoomLinkHTML(msg)
 
 	if msg.Status == "RESOLVED" || sev == "ok" {
-		headerTitle := fmt.Sprintf("%s — Connection Restored", targetDisplay)
+		headerTitle := fmt.Sprintf("%s — Connection Restored", targetTitle)
 		if msg.Metric == "probe_offline" {
 			headerTitle = "Monitoring Probes — Back Online"
 		}
-		lines := []string{
+		block1 := []string{
 			fmt.Sprintf("✅ <b>[OK] %s</b>", esc(headerTitle)),
 		}
-		if msg.RuleName != "" {
-			lines = append(lines, fmt.Sprintf("<b>Alert:</b> %s", esc(msg.RuleName)))
+		if statusLine := formatResolvedStatusLine(msg, total); statusLine != "" {
+			block1 = append(block1, fmt.Sprintf("<b>Status:</b> %s", esc(statusLine)))
 		}
-		lines = append(lines, fmt.Sprintf("<b>Target:</b> %s", esc(targetDisplay)))
+		if msg.Metric != "probe_offline" && targetContextHTML != "" {
+			block1 = append(block1, fmt.Sprintf("<b>Target:</b> %s", targetContextHTML))
+		}
+		if msg.RuleName != "" {
+			block1 = append(block1, fmt.Sprintf("<b>Alert:</b> %s", esc(msg.RuleName)))
+		}
+
+		block2 := make([]string, 0, 8)
+		if msg.Metric != "probe_offline" && len(msg.CurrentProbes) > 1 {
+			block2 = append(block2, "<b>Current Probes:</b>")
+			for _, cp := range msg.CurrentProbes {
+				if detail := formatCurrentProbeLine(cp); detail != "" {
+					block2 = append(block2, fmt.Sprintf("• %s: %s", esc(cp.ProbeName), esc(detail)))
+				} else {
+					block2 = append(block2, fmt.Sprintf("• %s", esc(cp.ProbeName)))
+				}
+			}
+		} else if isSingleProbe {
+			probeName := ""
+			if len(msg.AffectedProbes) > 0 {
+				probeName = msg.AffectedProbes[0]
+			} else if len(msg.CurrentProbes) > 0 {
+				probeName = msg.CurrentProbes[0].ProbeName
+			}
+			if probeName != "" {
+				block2 = append(block2, fmt.Sprintf("<b>Probe:</b> %s", esc(probeName)))
+			}
+		} else {
+			block2 = append(block2, fmt.Sprintf("<b>Locations:</b> %s", esc(locations)))
+		}
+
+		if mtr := strings.TrimSpace(msg.MTRBottleneck); mtr != "" {
+			block2 = append(block2, fmt.Sprintf("<b>MTR Hop:</b> %s", formatMTRHopHTML(mtr)))
+		}
 
 		startStr := formatAlertTimestamp(firstNonEmpty(msg.StartedAt, msg.Timestamp))
 		endStr := formatAlertTimestamp(firstNonEmpty(msg.ResolvedAt, msg.Timestamp))
-		lines = append(lines,
-			fmt.Sprintf("<b>Start:</b> %s", esc(startStr)),
-			fmt.Sprintf("<b>End:</b> %s", esc(endStr)),
-		)
-
 		peakVal := msg.PeakValue
 		if peakVal <= 0 {
 			peakVal = msg.Value
@@ -375,16 +432,15 @@ func FormatTelegramHTML(msg AlertMessage) string {
 		if peakText := formatPeakLabel(msg.Metric, peakVal); peakText != "" {
 			durationLine = fmt.Sprintf("%s | Peak: %s", durationLine, peakText)
 		}
-		lines = append(lines, fmt.Sprintf("<b>Duration:</b> %s", esc(durationLine)))
-		if isSingleProbe {
-			lines = append(lines, fmt.Sprintf("<b>Probe:</b> %s", esc(msg.AffectedProbes[0])))
-		} else {
-			lines = append(lines, fmt.Sprintf("<b>Locations:</b> %s", esc(locations)))
+		block2 = append(block2,
+			fmt.Sprintf("<b>Start:</b> %s", esc(startStr)),
+			fmt.Sprintf("<b>End:</b> %s", esc(endStr)),
+			fmt.Sprintf("<b>Duration:</b> %s", esc(durationLine)),
+		)
+		if graphLinkHTML != "" {
+			block2 = append(block2, graphLinkHTML)
 		}
-		if mtr := strings.TrimSpace(msg.MTRBottleneck); mtr != "" {
-			lines = append(lines, fmt.Sprintf("<b>MTR Hop:</b> %s", esc(mtr)))
-		}
-		return strings.Join(lines, "\n")
+		return strings.Join(block1, "\n") + "\n\n" + strings.Join(block2, "\n")
 	}
 
 	icon := "⚠️"
@@ -393,76 +449,420 @@ func FormatTelegramHTML(msg AlertMessage) string {
 		icon = "❌"
 		tag = "DOWN"
 	}
-	headerSuffix := ""
+
+	headerDesc := formatHeaderConditionTitle(msg, sev)
 	if msg.Status == "ESCALATED" {
-		headerSuffix = " (Escalated)"
+		headerDesc = "Escalated from WARN"
+	} else if msg.IsReminder || (msg.Status == "FIRING" && msg.DurationSec > 0) {
+		headerDesc = fmt.Sprintf("Ongoing (%s)", formatDurationCompact(msg.DurationSec))
 	}
 
-	lines := []string{
-		fmt.Sprintf("%s <b>[%s] %s%s</b>", icon, tag, esc(targetDisplay), esc(headerSuffix)),
-	}
-	if msg.RuleName != "" {
-		lines = append(lines, fmt.Sprintf("<b>Alert:</b> %s", esc(msg.RuleName)))
+	headerLine := fmt.Sprintf("%s <b>[%s] %s</b>", icon, tag, esc(targetTitle))
+	if headerDesc != "" {
+		headerLine = fmt.Sprintf("%s <b>[%s] %s — %s</b>", icon, tag, esc(targetTitle), esc(headerDesc))
 	}
 
-	condLine := formatPlainCondition(msg)
+	block1 := []string{headerLine}
+	statusLine := formatActiveStatusLine(msg, total)
 	if msg.DurationSec == 0 && msg.PeakValue > msg.Value {
 		if peakText := formatPeakLabel(msg.Metric, msg.PeakValue); peakText != "" {
-			condLine = fmt.Sprintf("%s | Peak: %s", condLine, peakText)
+			statusLine = fmt.Sprintf("%s | Peak: %s", statusLine, peakText)
 		}
 	}
-	lines = append(lines,
-		fmt.Sprintf("<b>Target:</b> %s", esc(targetDisplay)),
-		fmt.Sprintf("<b>Condition:</b> %s", esc(condLine)),
-	)
+	block1 = append(block1, fmt.Sprintf("<b>Status:</b> %s", esc(statusLine)))
+	if msg.Metric != "probe_offline" && targetContextHTML != "" {
+		block1 = append(block1, fmt.Sprintf("<b>Target:</b> %s", targetContextHTML))
+	}
+	if msg.RuleName != "" {
+		block1 = append(block1, fmt.Sprintf("<b>Alert:</b> %s", esc(msg.RuleName)))
+	}
 
+	block2 := make([]string, 0, 8)
 	if isSingleProbe {
-		probeName := msg.AffectedProbes[0]
-		detail := formatSingleProbeDetail(msg, probeName)
-		if detail != "" {
-			lines = append(lines, fmt.Sprintf("<b>Probe:</b> %s (%s)", esc(probeName), esc(detail)))
-		} else {
-			lines = append(lines, fmt.Sprintf("<b>Probe:</b> %s", esc(probeName)))
+		probeName := ""
+		if len(msg.AffectedProbes) > 0 {
+			probeName = msg.AffectedProbes[0]
+		} else if len(msg.ProbeBreakdown) > 0 {
+			probeName = msg.ProbeBreakdown[0].ProbeName
+		}
+		if probeName != "" {
+			detail := formatSingleProbeDetail(msg, probeName)
+			if detail != "" {
+				block2 = append(block2, fmt.Sprintf("<b>Probe:</b> %s (%s)", esc(probeName), esc(detail)))
+			} else {
+				block2 = append(block2, fmt.Sprintf("<b>Probe:</b> %s", esc(probeName)))
+			}
 		}
 	} else {
 		if msg.QuorumCount > 0 && total > 0 {
-			lines = append(lines, fmt.Sprintf("<b>Detected from:</b> %d of %d locations (%s)", msg.QuorumCount, total, esc(locations)))
+			block2 = append(block2, fmt.Sprintf("<b>Detected from:</b> %d of %d locations (%s)", msg.QuorumCount, total, esc(locations)))
 		} else {
-			lines = append(lines, fmt.Sprintf("<b>Detected from:</b> %s", esc(locations)))
+			block2 = append(block2, fmt.Sprintf("<b>Detected from:</b> %s", esc(locations)))
 		}
-		if len(msg.ProbeBreakdown) > 0 {
-			lines = append(lines, "<b>Probe Breakdown:</b>")
-			for _, pb := range msg.ProbeBreakdown {
-				detail := formatProbeStatDetail(msg.Metric, pb)
-				if detail != "" {
-					lines = append(lines, fmt.Sprintf("• %s: %s", esc(pb.ProbeName), esc(detail)))
-				} else {
-					lines = append(lines, fmt.Sprintf("• %s", esc(pb.ProbeName)))
-				}
+		for _, pb := range msg.ProbeBreakdown {
+			detail := formatProbeStatDetail(msg.Metric, pb)
+			if detail != "" {
+				block2 = append(block2, fmt.Sprintf("• %s: %s", esc(pb.ProbeName), esc(detail)))
+			} else {
+				block2 = append(block2, fmt.Sprintf("• %s", esc(pb.ProbeName)))
 			}
 		}
 	}
 
 	if mtr := strings.TrimSpace(msg.MTRBottleneck); mtr != "" {
-		lines = append(lines, fmt.Sprintf("<b>MTR Hop:</b> %s", esc(mtr)))
+		block2 = append(block2, fmt.Sprintf("<b>MTR Hop:</b> %s", formatMTRHopHTML(mtr)))
 	}
 
 	startTime := firstNonEmpty(msg.StartedAt, msg.Timestamp)
-	lines = append(lines, fmt.Sprintf("<b>Start:</b> %s", esc(formatAlertTimestamp(startTime))))
+	block2 = append(block2, fmt.Sprintf("<b>Start:</b> %s", esc(formatAlertTimestamp(startTime))))
 
-	if msg.Status == "ESCALATED" || msg.DurationSec > 0 {
+	if msg.Status == "ESCALATED" || msg.IsReminder || msg.DurationSec > 0 {
 		elapsedLine := FormatDurationSLA(msg.DurationSec)
 		if msg.PeakValue > msg.Value {
 			if peakText := formatPeakLabel(msg.Metric, msg.PeakValue); peakText != "" {
 				elapsedLine = fmt.Sprintf("%s | Peak: %s", elapsedLine, peakText)
 			}
 		}
-		lines = append(lines,
-			fmt.Sprintf("<b>Elapsed:</b> %s", esc(elapsedLine)),
-			fmt.Sprintf("<b>Updated:</b> %s", esc(formatAlertTimestamp(msg.Timestamp))),
-		)
+		updatedShort := formatAlertTimeShort(msg.Timestamp)
+		if updatedShort != "" {
+			elapsedLine = fmt.Sprintf("%s | Updated: %s", elapsedLine, updatedShort)
+		}
+		block2 = append(block2, fmt.Sprintf("<b>Elapsed:</b> %s", esc(elapsedLine)))
 	}
-	return strings.Join(lines, "\n")
+
+	if graphLinkHTML != "" {
+		block2 = append(block2, graphLinkHTML)
+	}
+	return strings.Join(block1, "\n") + "\n\n" + strings.Join(block2, "\n")
+}
+
+func firstPositive(vals ...float64) float64 {
+	for _, v := range vals {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
+func formatRTTMs(ms float64) string {
+	if ms <= 0 {
+		return "0 ms"
+	}
+	if ms < 10 {
+		r := math.Round(ms*10) / 10
+		if math.Abs(r-math.Round(r)) < 0.05 {
+			return fmt.Sprintf("%.0f ms", math.Round(r))
+		}
+		return fmt.Sprintf("%.1f ms", r)
+	}
+	return fmt.Sprintf("%.0f ms", math.Round(ms))
+}
+
+func formatLossPctLabel(loss float64) string {
+	if loss <= 0 {
+		return "0% loss"
+	}
+	if loss >= 99.9 {
+		return "100% loss"
+	}
+	if math.Abs(loss-math.Round(loss)) < 0.05 {
+		return fmt.Sprintf("%.0f%% loss", math.Round(loss))
+	}
+	return fmt.Sprintf("%.1f%% loss", loss)
+}
+
+func formatCurrentProbeLine(st ProbeAlertStat) string {
+	rtt := firstPositive(st.P50Ms, st.LastRTTMs, st.P95Ms)
+	var meta []string
+	meta = append(meta, formatLossPctLabel(st.LossPct))
+	if st.BaselineMs > 0 {
+		meta = append(meta, fmt.Sprintf("Base %s", formatRTTMs(st.BaselineMs)))
+	}
+	if st.AvgJitterMs >= 1.0 {
+		meta = append(meta, fmt.Sprintf("Jitter %s", formatRTTMs(st.AvgJitterMs)))
+	}
+	if rtt > 0 {
+		return fmt.Sprintf("%s (%s)", formatRTTMs(rtt), strings.Join(meta, " · "))
+	}
+	return strings.Join(meta, " · ")
+}
+
+func formatResolvedStatusLine(msg AlertMessage, totalProbes int) string {
+	if msg.Metric == "probe_offline" {
+		if msg.OnlineProbes > 0 && totalProbes > 0 {
+			unit := "probes"
+			if totalProbes == 1 {
+				unit = "probe"
+			}
+			return fmt.Sprintf("Online (%d/%d %s active)", msg.OnlineProbes, totalProbes, unit)
+		}
+		return "Online"
+	}
+	if len(msg.CurrentProbes) == 0 {
+		return ""
+	}
+	if len(msg.CurrentProbes) == 1 {
+		return formatCurrentProbeLine(msg.CurrentProbes[0])
+	}
+	minRTT := math.MaxFloat64
+	maxRTT := 0.0
+	maxLoss := 0.0
+	normalCount := 0
+	for _, cp := range msg.CurrentProbes {
+		rtt := firstPositive(cp.P50Ms, cp.LastRTTMs, cp.P95Ms)
+		if rtt > 0 {
+			if rtt < minRTT {
+				minRTT = rtt
+			}
+			if rtt > maxRTT {
+				maxRTT = rtt
+			}
+		}
+		if cp.LossPct > maxLoss {
+			maxLoss = cp.LossPct
+		}
+		if cp.LossPct < 50 && rtt > 0 {
+			normalCount++
+		}
+	}
+	denom := totalProbes
+	if denom < len(msg.CurrentProbes) {
+		denom = len(msg.CurrentProbes)
+	}
+	var meta []string
+	if maxLoss <= 0 {
+		meta = append(meta, "0% loss")
+	} else {
+		meta = append(meta, fmt.Sprintf("up to %s", formatLossPctLabel(maxLoss)))
+	}
+	meta = append(meta, fmt.Sprintf("%d/%d probes normal", normalCount, denom))
+	if maxRTT > 0 && minRTT < math.MaxFloat64 {
+		minStr := formatRTTMs(minRTT)
+		maxStr := formatRTTMs(maxRTT)
+		rttRange := minStr
+		if minStr != maxStr {
+			minNum := strings.TrimSuffix(minStr, " ms")
+			rttRange = fmt.Sprintf("%s–%s", minNum, maxStr)
+		}
+		return fmt.Sprintf("%s (%s)", rttRange, strings.Join(meta, " · "))
+	}
+	return strings.Join(meta, " · ")
+}
+
+func formatHeaderConditionTitle(msg AlertMessage, sev string) string {
+	switch msg.Metric {
+	case "loss_pct":
+		if msg.Value >= 99.9 {
+			return "Connection Down"
+		}
+		if sev == "critical" {
+			return "Severe Packet Loss"
+		}
+		return "Packet Loss"
+	case "latency_p95":
+		return "Slow Connection"
+	case "jitter":
+		return "High Jitter"
+	case "baseline_spike_pct":
+		return "Latency Spike"
+	case "probe_offline":
+		return "Probe Offline"
+	default:
+		return ""
+	}
+}
+
+func formatActiveStatusLine(msg AlertMessage, totalProbes int) string {
+	var singleStat *ProbeAlertStat
+	if len(msg.ProbeBreakdown) == 1 {
+		singleStat = &msg.ProbeBreakdown[0]
+	} else if len(msg.CurrentProbes) == 1 {
+		singleStat = &msg.CurrentProbes[0]
+	}
+
+	switch msg.Metric {
+	case "loss_pct":
+		if msg.Value >= 99.9 {
+			var meta []string
+			meta = append(meta, "No reply")
+			if singleStat != nil && singleStat.BaselineMs > 0 {
+				meta = append(meta, fmt.Sprintf("Base %s", formatRTTMs(singleStat.BaselineMs)))
+			} else if len(msg.ProbeBreakdown) > 1 && totalProbes > 1 {
+				meta = append(meta, fmt.Sprintf("%d of %d locations", len(msg.ProbeBreakdown), totalProbes))
+			}
+			return fmt.Sprintf("100%% loss (%s)", strings.Join(meta, " · "))
+		}
+		head := formatLossPctLabel(msg.Value)
+		if singleStat != nil {
+			rtt := firstPositive(singleStat.P50Ms, singleStat.LastRTTMs)
+			if rtt > 0 {
+				head = fmt.Sprintf("%s · %s", head, formatRTTMs(rtt))
+			}
+		}
+		var meta []string
+		if singleStat != nil && singleStat.P95Ms > 0 {
+			meta = append(meta, fmt.Sprintf("Peak RTT %s", formatRTTMs(singleStat.P95Ms)))
+		}
+		if singleStat != nil && singleStat.BaselineMs > 0 {
+			meta = append(meta, fmt.Sprintf("Base %s", formatRTTMs(singleStat.BaselineMs)))
+		}
+		if msg.Threshold > 0 {
+			meta = append(meta, fmt.Sprintf("Limit %.0f%%", msg.Threshold))
+		}
+		if len(meta) > 0 {
+			return fmt.Sprintf("%s (%s)", head, strings.Join(meta, " · "))
+		}
+		return head
+
+	case "latency_p95":
+		if len(msg.ProbeBreakdown) > 1 {
+			minPeak := math.MaxFloat64
+			maxPeak := 0.0
+			maxLoss := 0.0
+			for _, pb := range msg.ProbeBreakdown {
+				if pb.P95Ms > 0 {
+					if pb.P95Ms < minPeak {
+						minPeak = pb.P95Ms
+					}
+					if pb.P95Ms > maxPeak {
+						maxPeak = pb.P95Ms
+					}
+				}
+				if pb.LossPct > maxLoss {
+					maxLoss = pb.LossPct
+				}
+			}
+			head := formatRTTMs(msg.Value)
+			if maxPeak > 0 && minPeak < math.MaxFloat64 {
+				minStr := formatRTTMs(minPeak)
+				maxStr := formatRTTMs(maxPeak)
+				if minStr != maxStr {
+					head = fmt.Sprintf("%s–%s", strings.TrimSuffix(minStr, " ms"), maxStr)
+				} else {
+					head = maxStr
+				}
+			}
+			var meta []string
+			meta = append(meta, formatLossPctLabel(maxLoss))
+			if msg.Threshold > 0 {
+				meta = append(meta, fmt.Sprintf("Limit < %s", formatRTTMs(msg.Threshold)))
+			}
+			return fmt.Sprintf("%s (%s)", head, strings.Join(meta, " · "))
+		}
+		var meta []string
+		if singleStat != nil {
+			if avg := firstPositive(singleStat.P50Ms, singleStat.LastRTTMs); avg > 0 {
+				meta = append(meta, fmt.Sprintf("Avg %s", formatRTTMs(avg)))
+			}
+			meta = append(meta, formatLossPctLabel(singleStat.LossPct))
+			if singleStat.BaselineMs > 0 {
+				meta = append(meta, fmt.Sprintf("Base %s", formatRTTMs(singleStat.BaselineMs)))
+			}
+		}
+		if msg.Threshold > 0 {
+			meta = append(meta, fmt.Sprintf("Limit < %s", formatRTTMs(msg.Threshold)))
+		}
+		if len(meta) > 0 {
+			return fmt.Sprintf("%s (%s)", formatRTTMs(msg.Value), strings.Join(meta, " · "))
+		}
+		return formatRTTMs(msg.Value)
+
+	case "jitter":
+		var meta []string
+		if singleStat != nil {
+			if avg := firstPositive(singleStat.P50Ms, singleStat.LastRTTMs); avg > 0 {
+				meta = append(meta, fmt.Sprintf("Avg %s", formatRTTMs(avg)))
+			}
+			meta = append(meta, formatLossPctLabel(singleStat.LossPct))
+		}
+		if msg.Threshold > 0 {
+			meta = append(meta, fmt.Sprintf("Limit < %s", formatRTTMs(msg.Threshold)))
+		}
+		if len(meta) > 0 {
+			return fmt.Sprintf("%s jitter (%s)", formatRTTMs(msg.Value), strings.Join(meta, " · "))
+		}
+		return fmt.Sprintf("%s jitter", formatRTTMs(msg.Value))
+
+	case "baseline_spike_pct":
+		head := fmt.Sprintf("+%.0f%% spike", msg.Value)
+		if singleStat != nil && singleStat.BaselineMs > 0 {
+			head = fmt.Sprintf("+%.0f%% vs Base %s", msg.Value, formatRTTMs(singleStat.BaselineMs))
+		}
+		var meta []string
+		if singleStat != nil && singleStat.P95Ms > 0 {
+			meta = append(meta, fmt.Sprintf("Peak RTT %s", formatRTTMs(singleStat.P95Ms)))
+		}
+		if singleStat != nil {
+			meta = append(meta, formatLossPctLabel(singleStat.LossPct))
+		}
+		if msg.Threshold > 0 {
+			meta = append(meta, fmt.Sprintf("Limit +%.0f%%", msg.Threshold))
+		}
+		if len(meta) > 0 {
+			return fmt.Sprintf("%s (%s)", head, strings.Join(meta, " · "))
+		}
+		return head
+
+	case "probe_offline":
+		if msg.QuorumCount > 0 && totalProbes > 0 {
+			unit := "probes"
+			if totalProbes == 1 {
+				unit = "probe"
+			}
+			return fmt.Sprintf("Offline %s (%d/%d %s offline)", formatDurationCompact(int64(msg.Value)), msg.QuorumCount, totalProbes, unit)
+		}
+		return fmt.Sprintf("Offline %s", formatDurationCompact(int64(msg.Value)))
+
+	default:
+		return formatPlainCondition(msg)
+	}
+}
+
+func formatTargetContextHTML(msg AlertMessage) string {
+	esc := html.EscapeString
+	var parts []string
+	if host := strings.TrimSpace(msg.TargetHost); host != "" {
+		parts = append(parts, fmt.Sprintf("<code>%s</code>", esc(host)))
+	}
+	if proto := strings.TrimSpace(msg.TargetProtocol); proto != "" {
+		parts = append(parts, esc(proto))
+	}
+	if grp := strings.TrimSpace(msg.GroupName); grp != "" {
+		parts = append(parts, esc(grp))
+	}
+	return strings.Join(parts, " · ")
+}
+
+func formatMTRHopHTML(mtr string) string {
+	esc := html.EscapeString
+	s := strings.TrimSpace(mtr)
+	openIdx := strings.Index(s, "(")
+	closeIdx := strings.Index(s, ")")
+	if openIdx <= 0 || closeIdx <= openIdx+1 {
+		return esc(s)
+	}
+	prefix := strings.TrimSpace(s[:openIdx])
+	inside := strings.TrimSpace(s[openIdx+1 : closeIdx])
+	suffix := s[closeIdx+1:]
+	if inside == "*" {
+		return esc(s)
+	}
+	if slashIdx := strings.Index(inside, " / "); slashIdx > 0 {
+		host := strings.TrimSpace(inside[:slashIdx])
+		ip := strings.TrimSpace(inside[slashIdx+3:])
+		return fmt.Sprintf("%s %s (<code>%s</code>)%s", esc(prefix), esc(host), esc(ip), esc(suffix))
+	}
+	return fmt.Sprintf("%s (<code>%s</code>)%s", esc(prefix), esc(inside), esc(suffix))
+}
+
+func formatDashboardZoomLinkHTML(msg AlertMessage) string {
+	base := strings.TrimRight(strings.TrimSpace(msg.DashboardBaseURL), "/")
+	if base == "" || msg.TargetID == nil || *msg.TargetID == uuid.Nil {
+		return ""
+	}
+	href := fmt.Sprintf("%s/?zoom=%s", base, url.QueryEscape(msg.TargetID.String()))
+	return fmt.Sprintf(`<a href="%s">Open Live Graph</a>`, html.EscapeString(href))
 }
 
 func formatProbeStatDetail(metric string, st ProbeAlertStat) string {
@@ -474,22 +874,24 @@ func formatProbeStatDetail(metric string, st ProbeAlertStat) string {
 	}
 	var parts []string
 	if st.LossPct > 0 {
-		parts = append(parts, fmt.Sprintf("%.1f%% loss", st.LossPct))
+		parts = append(parts, formatLossPctLabel(st.LossPct))
 	} else if metric == "loss_pct" {
 		parts = append(parts, "0% loss")
 	}
 	if st.P95Ms > 0 {
-		parts = append(parts, fmt.Sprintf("P95 %.0f ms", st.P95Ms))
+		parts = append(parts, fmt.Sprintf("Peak RTT %s", formatRTTMs(st.P95Ms)))
 	}
 	if metric == "baseline_spike_pct" && st.BaselineSpikePct > 0 {
 		if st.BaselineMs > 0 {
-			parts = append(parts, fmt.Sprintf("+%.0f%% vs %.0f ms base", st.BaselineSpikePct, st.BaselineMs))
+			parts = append(parts, fmt.Sprintf("+%.0f%% vs Base %s", st.BaselineSpikePct, formatRTTMs(st.BaselineMs)))
 		} else {
 			parts = append(parts, fmt.Sprintf("+%.0f%% spike", st.BaselineSpikePct))
 		}
+	} else if metric == "latency_p95" && st.BaselineMs > 0 {
+		parts = append(parts, fmt.Sprintf("Base %s", formatRTTMs(st.BaselineMs)))
 	}
 	if st.AvgJitterMs > 0 && (metric == "jitter" || st.AvgJitterMs >= 1.0) {
-		parts = append(parts, fmt.Sprintf("jitter %.0f ms", st.AvgJitterMs))
+		parts = append(parts, fmt.Sprintf("jitter %s", formatRTTMs(st.AvgJitterMs)))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -513,15 +915,15 @@ func formatSingleProbeDetail(msg AlertMessage, probeName string) string {
 			return "100% loss"
 		}
 		if msg.Value > 0 {
-			return fmt.Sprintf("%.1f%% loss", msg.Value)
+			return formatLossPctLabel(msg.Value)
 		}
 	case "latency_p95":
 		if msg.Value > 0 {
-			return fmt.Sprintf("P95 %.0f ms", msg.Value)
+			return fmt.Sprintf("Peak RTT %s", formatRTTMs(msg.Value))
 		}
 	case "jitter":
 		if msg.Value > 0 {
-			return fmt.Sprintf("jitter %.0f ms", msg.Value)
+			return fmt.Sprintf("jitter %s", formatRTTMs(msg.Value))
 		}
 	case "baseline_spike_pct":
 		if msg.Value > 0 {
@@ -688,6 +1090,27 @@ func formatAlertTimestamp(raw string) string {
 	return localT.Format("02 Jan 2006 15:04:05") + " " + zoneAbbr
 }
 
+func formatAlertTimeShort(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return raw
+		}
+	}
+	loc, tzName := resolveAlertLocation()
+	localT := t.In(loc)
+	zoneAbbr, _ := localT.Zone()
+	if tzName == "Asia/Jakarta" && (zoneAbbr == "+07" || zoneAbbr == "") {
+		zoneAbbr = "WIB"
+	}
+	return localT.Format("15:04:05") + " " + zoneAbbr
+}
+
 func firstNonEmpty(a, b string) string {
 	if strings.TrimSpace(a) != "" {
 		return a
@@ -721,6 +1144,15 @@ func (n *Notifier) SendWebhook(ctx context.Context, webhookURL string, msg Alert
 	fields := []map[string]any{
 		{"name": "Target", "value": formatTargetDisplay(msg.TargetName, msg.TargetHost), "inline": true},
 		{"name": "Detected From", "value": strings.Join(msg.AffectedProbes, ", "), "inline": true},
+	}
+	var currentStatus string
+	if msg.Status == "RESOLVED" || sev == "ok" {
+		currentStatus = formatResolvedStatusLine(msg, msg.TotalProbes)
+	} else if msg.Status != "TEST" && sev != "test" {
+		currentStatus = formatActiveStatusLine(msg, msg.TotalProbes)
+	}
+	if currentStatus != "" {
+		fields = append(fields, map[string]any{"name": "Current Status", "value": currentStatus, "inline": false})
 	}
 	if msg.PeakValue > 0 {
 		if peakText := formatPeakLabel(msg.Metric, msg.PeakValue); peakText != "" {

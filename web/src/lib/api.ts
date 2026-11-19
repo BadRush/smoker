@@ -22,6 +22,8 @@ export type AlertChannelUpdateInput = components["schemas"]["AlertChannelUpdateI
 export type Incident = components["schemas"]["Incident"];
 export type SystemSettings = components["schemas"]["SystemSettings"];
 export type SessionInfo = components["schemas"]["SessionInfo"];
+export type TVPreset = components["schemas"]["TVPreset"];
+export type TVPresetInput = components["schemas"]["TVPresetInput"];
 
 export class ApiError extends Error {
   status: number;

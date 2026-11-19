@@ -354,4 +354,18 @@ describe("MatrixWallPage (Dashboard)", () => {
     expect(screen.getAllByTestId("dash-section-grid")).toHaveLength(1);
     expect(screen.getAllByTestId("grid-target-card")).toHaveLength(1);
   });
+
+  it("auto-opens TargetZoomModal when visited via /?zoom=<target_id> deep link and cleans query on close", async () => {
+    window.history.replaceState(null, "", "/?zoom=t-icmp");
+    const user = userEvent.setup();
+    render(<MatrixWallPage />);
+
+    const zoomModal = await screen.findByTestId("tv-zoom-modal");
+    expect(zoomModal).toBeInTheDocument();
+    expect(zoomModal).toHaveTextContent("Custom Ping Host");
+
+    await user.click(screen.getByTestId("tv-zoom-close-btn"));
+    expect(screen.queryByTestId("tv-zoom-modal")).not.toBeInTheDocument();
+    expect(window.location.search).toBe("");
+  });
 });

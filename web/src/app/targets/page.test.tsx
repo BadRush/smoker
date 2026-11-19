@@ -371,4 +371,113 @@ describe("TargetsPage search, filters, and pagination", () => {
       }),
     });
   });
+
+  it("supports Include in Alerting vs Monitoring Only checklist and quick Packet Loss rule creation", async () => {
+    const requests: Array<{ method: string; url: string; body: unknown }> = [];
+    const mockTargets = makeTargets().slice(0, 2);
+    mockTargets[1].alerts_enabled = false;
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (method === "POST" || method === "PUT") {
+          const body = init?.body ? JSON.parse(String(init.body)) : null;
+          requests.push({ method, url, body });
+          if (url === "/api/targets") {
+            return new Response(
+              JSON.stringify({
+                ...mockTargets[0],
+                id: "t-created",
+                ...body,
+              }),
+              { status: 201 }
+            );
+          }
+          if (url === "/api/alerts/rules") {
+            return new Response(JSON.stringify({ id: "r-loss-new", ...body }), {
+              status: 201,
+            });
+          }
+        }
+        if (url === "/api/targets") {
+          return new Response(JSON.stringify(mockTargets), { status: 200 });
+        }
+        if (url === "/api/groups") {
+          return new Response(JSON.stringify(GROUPS), { status: 200 });
+        }
+        if (url === "/api/probes") {
+          return new Response(JSON.stringify([PROBES[0]]), { status: 200 });
+        }
+        if (url === "/api/alerts/rules") {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        return new Response(JSON.stringify({ username: "admin" }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<TargetsPage />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("target-row")).toHaveLength(2);
+    });
+    // Row with alerts_enabled=false displays Monitor Only badge
+    expect(screen.getByTestId("target-monitor-only-badge")).toHaveTextContent(
+      "Monitor Only"
+    );
+
+    // 1. Add Target unchecked -> Monitoring Only (alerts_enabled: false)
+    await user.click(screen.getByRole("button", { name: "Add Target" }));
+    const alertCheck = screen.getByLabelText("Include target in alerting") as HTMLInputElement;
+    expect(alertCheck.checked).toBe(true);
+
+    await user.type(screen.getByLabelText("Target Name *"), "Passive Lab Switch");
+    await user.type(screen.getByLabelText("Host / IP / URL *"), "10.10.0.50");
+    await user.click(alertCheck);
+    expect(screen.getByTestId("target-monitor-only-info")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Sync Telegram Loss alert rule")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Save & Sync to Probes" }));
+    await waitFor(() => {
+      expect(requests).toHaveLength(1);
+    });
+    expect(requests[0]).toEqual({
+      method: "POST",
+      url: "/api/targets",
+      body: expect.objectContaining({
+        name: "Passive Lab Switch",
+        alerts_enabled: false,
+      }),
+    });
+
+    // 2. Add Target checked + Sync Telegram Loss alert rule -> creates target (alerts_enabled: true) & loss_pct rule
+    await user.click(screen.getByRole("button", { name: "Add Target" }));
+    await user.type(screen.getByLabelText("Target Name *"), "Critical Core Link");
+    await user.type(screen.getByLabelText("Host / IP / URL *"), "10.10.0.1");
+    await user.click(screen.getByLabelText("Sync Telegram Loss alert rule"));
+    await user.click(screen.getByRole("button", { name: "Save & Sync to Probes" }));
+
+    await waitFor(() => {
+      expect(requests).toHaveLength(3);
+    });
+    expect(requests[1]).toEqual({
+      method: "POST",
+      url: "/api/targets",
+      body: expect.objectContaining({
+        name: "Critical Core Link",
+        alerts_enabled: true,
+      }),
+    });
+    expect(requests[2]).toEqual({
+      method: "POST",
+      url: "/api/alerts/rules",
+      body: expect.objectContaining({
+        target_id: "t-created",
+        metric: "loss_pct",
+        threshold_value: 20,
+      }),
+    });
+  });
 });

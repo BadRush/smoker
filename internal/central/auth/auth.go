@@ -19,7 +19,10 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const SessionCookieName = "smoker_session"
+const (
+	SessionCookieName = "smoker_session"
+	TVKioskCookieName = "smoker_tv_kiosk"
+)
 
 type ctxKey string
 
@@ -61,6 +64,15 @@ func ConstantTimeEqualHex(a, b string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func VerifyTVKioskToken(expected, candidate string) bool {
+	exp := strings.TrimSpace(expected)
+	cand := strings.TrimSpace(candidate)
+	if exp == "" || len(exp) != len(cand) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(exp), []byte(cand)) == 1
 }
 
 type Claims struct {

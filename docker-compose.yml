@@ -38,7 +38,9 @@ services:
       LOCAL_PROBE_TOKEN: ${LOCAL_PROBE_TOKEN:-smk_local_dev_probe_token_change_in_production}
       SEED_PUBLIC_MONITORS: ${SEED_PUBLIC_MONITORS:-true}
       NOC_TV_ALLOW_UNAUTH: ${NOC_TV_ALLOW_UNAUTH:-true}
+      NOC_TV_KIOSK_TOKEN: ${NOC_TV_KIOSK_TOKEN:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-auto}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/readyz || exit 1"]
       interval: 10s

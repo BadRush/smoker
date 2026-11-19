@@ -3,9 +3,12 @@ package wshub
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/google/uuid"
+	"smoker/internal/central/auth"
 	"smoker/internal/central/db"
 	"smoker/internal/protocol"
 )
@@ -123,5 +126,38 @@ func TestUpdateProbeMetaUpdatesConnAndBroadcastsMatrix(t *testing.T) {
 		}
 	default:
 		t.Fatalf("expected probe_status event broadcast to matrix subscribers")
+	}
+}
+
+func TestHandleLiveWSKioskTokenBoundary(t *testing.T) {
+	t.Parallel()
+
+	h := NewHub(nil, nil, "test-jwt-secret")
+	h.SetNocTVAllowUnauth(true)
+	h.SetNocTVKioskToken("kiosk_secret_2026")
+
+	// Missing kiosk token on /ws/live?scope=tv -> 401 Unauthorized
+	reqNoKey := httptest.NewRequest(http.MethodGet, "/ws/live?scope=tv", nil)
+	recNoKey := httptest.NewRecorder()
+	h.HandleLiveWS(recNoKey, reqNoKey)
+	if recNoKey.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing kiosk token, got %d", recNoKey.Code)
+	}
+
+	// Wrong kiosk token -> 401 Unauthorized
+	reqBadKey := httptest.NewRequest(http.MethodGet, "/ws/live?scope=tv&key=wrong", nil)
+	recBadKey := httptest.NewRecorder()
+	h.HandleLiveWS(recBadKey, reqBadKey)
+	if recBadKey.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong kiosk token, got %d", recBadKey.Code)
+	}
+
+	// Valid kiosk cookie on non-tv scope (/ws/live without scope=tv) -> still 401!
+	reqWrongScope := httptest.NewRequest(http.MethodGet, "/ws/live", nil)
+	reqWrongScope.AddCookie(&http.Cookie{Name: auth.TVKioskCookieName, Value: "kiosk_secret_2026"})
+	recWrongScope := httptest.NewRecorder()
+	h.HandleLiveWS(recWrongScope, reqWrongScope)
+	if recWrongScope.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when kiosk cookie used without scope=tv, got %d", recWrongScope.Code)
 	}
 }

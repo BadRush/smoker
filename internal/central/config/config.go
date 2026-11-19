@@ -20,6 +20,8 @@ type CentralConfig struct {
 	LocalProbeToken      string
 	SeedPublicMonitors   bool
 	NocTVAllowUnauth     bool
+	NocTVKioskToken      string
+	PublicBaseURL        string
 }
 
 func LoadCentral() (CentralConfig, error) {
@@ -37,6 +39,8 @@ func LoadCentral() (CentralConfig, error) {
 		LocalProbeToken:      strings.TrimSpace(os.Getenv("LOCAL_PROBE_TOKEN")),
 		SeedPublicMonitors:   strings.EqualFold(getEnvDefault("SEED_PUBLIC_MONITORS", "true"), "true"),
 		NocTVAllowUnauth:     strings.EqualFold(getEnvDefault("NOC_TV_ALLOW_UNAUTH", "false"), "true"),
+		NocTVKioskToken:      strings.TrimSpace(os.Getenv("NOC_TV_KIOSK_TOKEN")),
+		PublicBaseURL:        strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_BASE_URL")), "/"),
 	}
 
 	if cfg.DatabaseURL == "" {

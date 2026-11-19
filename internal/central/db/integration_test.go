@@ -61,6 +61,7 @@ func TestTimescaleMigrationsAndIdempotentIngest(t *testing.T) {
 		IntervalSec:      1,
 		TimeoutMs:        1000,
 		Enabled:          true,
+		AlertsEnabled:    true,
 		AutoMTROnLoss:    true,
 		MTRLossThreshold: 3,
 		AssignAllProbes:  true,
@@ -173,5 +174,105 @@ func TestTimescaleMigrationsAndIdempotentIngest(t *testing.T) {
 	resolved, err := store.ResolveOpenIncident(ctx, rule.ID, &target.ID, tNow.Add(time.Minute))
 	if err != nil || resolved == nil || resolved.TelegramMessageIDs[ch.ID.String()] != 555 || resolved.TelegramMessageIDs["fired:"+ch.ID.String()] != 1 || resolved.NotifiedSeverity != "warn" {
 		t.Fatalf("ResolveOpenIncident failed: resolved=%+v err=%v", resolved, err)
+	}
+
+	// Verify migration 009 columns & controls (SetAlertingEnabled, CloseIncidentByID, ClearIncidents, AlertsEnabled=false auto-close)
+	st, err := store.GetSettings(ctx)
+	if err != nil || !st.AlertingEnabled {
+		t.Fatalf("expected default alerting_enabled=true, got st=%+v err=%v", st, err)
+	}
+	stOff, err := store.SetAlertingEnabled(ctx, false)
+	if err != nil || stOff.AlertingEnabled {
+		t.Fatalf("SetAlertingEnabled(false) failed: st=%+v err=%v", stOff, err)
+	}
+	stPreserved, err := store.UpdateSettingsAndRetention(ctx, stOff.RawRetentionDays, stOff.AggRetentionDays, stOff.DefaultQuorumMin, stOff.BrandName, nil)
+	if err != nil || stPreserved.AlertingEnabled {
+		t.Fatalf("UpdateSettingsAndRetention(nil) should preserve alerting_enabled=false, got st=%+v err=%v", stPreserved, err)
+	}
+	if stOn, err := store.SetAlertingEnabled(ctx, true); err != nil || !stOn.AlertingEnabled {
+		t.Fatalf("SetAlertingEnabled(true) failed: st=%+v err=%v", stOn, err)
+	}
+
+	// Manual CloseIncidentByID
+	inc2, isNew2, _, err := store.UpsertOpenIncident(ctx, rule.ID, &target.ID, []string{"Integration Probe"}, 55, "critical", tNow.Add(2*time.Minute), "Outage")
+	if err != nil || !isNew2 {
+		t.Fatalf("second UpsertOpenIncident failed: inc=%+v isNew=%v err=%v", inc2, isNew2, err)
+	}
+	closed, err := store.CloseIncidentByID(ctx, inc2.ID, "admin", tNow.Add(3*time.Minute))
+	if err != nil || closed.Status != "resolved" || closed.ResolvedAt == nil {
+		t.Fatalf("CloseIncidentByID failed: closed=%+v err=%v", closed, err)
+	}
+
+	// Switching target to Monitoring Only (alerts_enabled=false) must auto-close open incidents for that target
+	inc3, isNew3, _, err := store.UpsertOpenIncident(ctx, rule.ID, &target.ID, []string{"Integration Probe"}, 40, "warn", tNow.Add(4*time.Minute), "Degraded")
+	if err != nil || !isNew3 {
+		t.Fatalf("third UpsertOpenIncident failed: inc=%+v isNew=%v err=%v", inc3, isNew3, err)
+	}
+	monOnly, err := store.UpdateTarget(ctx, target.ID, db.TargetInput{
+		Name:             target.Name,
+		Host:             target.Host,
+		ProbeType:        target.ProbeType,
+		IntervalSec:      target.IntervalSec,
+		TimeoutMs:        target.TimeoutMs,
+		Enabled:          true,
+		AlertsEnabled:    false,
+		AutoMTROnLoss:    true,
+		MTRLossThreshold: 3,
+		AssignAllProbes:  true,
+	})
+	if err != nil || monOnly.AlertsEnabled {
+		t.Fatalf("UpdateTarget(AlertsEnabled=false) failed: target=%+v err=%v", monOnly, err)
+	}
+	openCount, err := store.CountOpenIncidents(ctx)
+	if err != nil || openCount != 0 {
+		t.Fatalf("expected open incidents to auto-close on Monitoring Only switch, got openCount=%d err=%v", openCount, err)
+	}
+
+	// ClearIncidents(false) deletes resolved incidents only; ClearIncidents(true) deletes all
+	inc4, _, _, err := store.UpsertOpenIncident(ctx, rule.ID, &target.ID, []string{"Integration Probe"}, 45, "warn", tNow.Add(5*time.Minute), "Open for clear test")
+	if err != nil || inc4.Status != "open" {
+		t.Fatalf("fourth UpsertOpenIncident failed: inc=%+v err=%v", inc4, err)
+	}
+	clearedResolved, err := store.ClearIncidents(ctx, false)
+	if err != nil || clearedResolved < 3 {
+		t.Fatalf("ClearIncidents(false) expected >=3 resolved rows cleared, got %d err=%v", clearedResolved, err)
+	}
+	remaining, err := store.ListIncidents(ctx, 50)
+	if err != nil || len(remaining) != 1 || remaining[0].ID != inc4.ID {
+		t.Fatalf("expected only open incident to remain after ClearIncidents(false), got %+v err=%v", remaining, err)
+	}
+	clearedAll, err := store.ClearIncidents(ctx, true)
+	if err != nil || clearedAll != 1 {
+		t.Fatalf("ClearIncidents(true) expected 1 row cleared, got %d err=%v", clearedAll, err)
+	}
+
+	// Verify migration 010 tv_presets CRUD and single-default uniqueness
+	pA, err := store.CreateTVPreset(ctx, db.TVPresetInput{
+		Slug:      "noc-main",
+		Name:      "NOC Main Wall",
+		Config:    []byte(`{"range":"3h","layoutMode":"auto"}`),
+		IsDefault: true,
+	})
+	if err != nil || !pA.IsDefault || pA.Slug != "noc-main" {
+		t.Fatalf("CreateTVPreset A failed: p=%+v err=%v", pA, err)
+	}
+	pB, err := store.CreateTVPreset(ctx, db.TVPresetInput{
+		Slug:      "core-4k",
+		Name:      "Core Links 4K",
+		Config:    []byte(`{"range":"1h","layoutMode":"single-col"}`),
+		IsDefault: true, // atomically supersedes pA as default
+	})
+	if err != nil || !pB.IsDefault {
+		t.Fatalf("CreateTVPreset B failed: p=%+v err=%v", pB, err)
+	}
+	presets, err := store.ListTVPresets(ctx)
+	if err != nil || len(presets) != 2 || !presets[0].IsDefault || presets[0].ID != pB.ID || presets[1].IsDefault {
+		t.Fatalf("expected pB as sole default first in ListTVPresets, got %+v err=%v", presets, err)
+	}
+	if err := store.DeleteTVPreset(ctx, pA.ID); err != nil {
+		t.Fatalf("DeleteTVPreset A failed: %v", err)
+	}
+	if err := store.DeleteTVPreset(ctx, pB.ID); err != nil {
+		t.Fatalf("DeleteTVPreset B failed: %v", err)
 	}
 }

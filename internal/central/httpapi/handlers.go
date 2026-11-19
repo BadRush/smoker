@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -166,24 +167,59 @@ func (s *Server) handleGetMatrix(w http.ResponseWriter, r *http.Request) {
 		"cells":            cells,
 		"active_incidents": activeIncidents,
 		"brand_name":       st.BrandName,
+		"is_admin":         s.isAdminAuthenticated(r),
 		"generated_at":     time.Now().UTC(),
 	})
 }
 
+func (s *Server) isAdminAuthenticated(r *http.Request) bool {
+	cookie, err := r.Cookie(auth.SessionCookieName)
+	if err != nil {
+		return false
+	}
+	_, err = auth.VerifySessionToken(s.cfg.JWTSecret, cookie.Value)
+	return err == nil
+}
+
 func (s *Server) authorizeTVRequest(w http.ResponseWriter, r *http.Request) bool {
+	if s.isAdminAuthenticated(r) {
+		return true
+	}
+	if s.cfg.NocTVKioskToken != "" {
+		queryKey := strings.TrimSpace(r.URL.Query().Get("key"))
+		headerKey := strings.TrimSpace(r.Header.Get("X-TV-Kiosk-Key"))
+		var cookieKey string
+		if c, err := r.Cookie(auth.TVKioskCookieName); err == nil {
+			cookieKey = strings.TrimSpace(c.Value)
+		}
+
+		matchedViaQueryOrHeader := auth.VerifyTVKioskToken(s.cfg.NocTVKioskToken, queryKey) ||
+			auth.VerifyTVKioskToken(s.cfg.NocTVKioskToken, headerKey)
+		if matchedViaQueryOrHeader {
+			if !auth.VerifyTVKioskToken(s.cfg.NocTVKioskToken, cookieKey) {
+				http.SetCookie(w, &http.Cookie{
+					Name:     auth.TVKioskCookieName,
+					Value:    s.cfg.NocTVKioskToken,
+					Path:     "/",
+					HttpOnly: true,
+					Secure:   auth.ShouldUseSecureCookie(s.cfg.CookieSecure, r),
+					SameSite: http.SameSiteLaxMode,
+					MaxAge:   365 * 24 * 3600,
+				})
+			}
+			return true
+		}
+		if auth.VerifyTVKioskToken(s.cfg.NocTVKioskToken, cookieKey) {
+			return true
+		}
+		writeProblem(w, r, http.StatusUnauthorized, "unauthorized", "Valid NOC TV kiosk key or admin session required")
+		return false
+	}
 	if s.cfg.NocTVAllowUnauth {
 		return true
 	}
-	cookie, err := r.Cookie(auth.SessionCookieName)
-	if err != nil {
-		writeProblem(w, r, http.StatusUnauthorized, "unauthorized", "Authentication required")
-		return false
-	}
-	if _, err := auth.VerifySessionToken(s.cfg.JWTSecret, cookie.Value); err != nil {
-		writeProblem(w, r, http.StatusUnauthorized, "unauthorized", "Invalid or expired session")
-		return false
-	}
-	return true
+	writeProblem(w, r, http.StatusUnauthorized, "unauthorized", "Authentication required")
+	return false
 }
 
 func (s *Server) handleGetTVMatrix(w http.ResponseWriter, r *http.Request) {
@@ -234,6 +270,7 @@ func (s *Server) handleGetTVMatrix(w http.ResponseWriter, r *http.Request) {
 		"cells":            cells,
 		"active_incidents": activeIncidents,
 		"brand_name":       st.BrandName,
+		"is_admin":         s.isAdminAuthenticated(r),
 		"generated_at":     time.Now().UTC(),
 	})
 }
@@ -493,6 +530,7 @@ type targetRequest struct {
 	IntervalSec           *int           `json:"interval_sec"`
 	TimeoutMs             *int           `json:"timeout_ms"`
 	Enabled               *bool          `json:"enabled"`
+	AlertsEnabled         *bool          `json:"alerts_enabled"`
 	AutoMTROnLoss         *bool          `json:"auto_mtr_on_loss"`
 	MTRLossThreshold      *int           `json:"mtr_loss_threshold"`
 	PinnedOnTV            *bool          `json:"pinned_on_tv"`
@@ -558,6 +596,10 @@ func validateTargetInput(req targetRequest) (db.TargetInput, string) {
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
+	alertsEnabled := true
+	if req.AlertsEnabled != nil {
+		alertsEnabled = *req.AlertsEnabled
+	}
 	autoMTR := true
 	if req.AutoMTROnLoss != nil {
 		autoMTR = *req.AutoMTROnLoss
@@ -618,6 +660,7 @@ func validateTargetInput(req targetRequest) (db.TargetInput, string) {
 		IntervalSec:           interval,
 		TimeoutMs:             timeout,
 		Enabled:               enabled,
+		AlertsEnabled:         alertsEnabled,
 		AutoMTROnLoss:         autoMTR,
 		MTRLossThreshold:      mtrThresh,
 		PinnedOnTV:            pinnedOnTV,
@@ -689,6 +732,13 @@ func (s *Server) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		handleStoreErr(w, r, err)
 		return
+	}
+	if !t.AlertsEnabled && s.hub != nil {
+		s.hub.BroadcastUI("matrix", protocol.LiveEvent{
+			Type:    "incident_update",
+			Channel: "matrix",
+			Data:    map[string]any{"target_id": t.ID, "alerts_enabled": false},
+		})
 	}
 	s.syncProbesAsync()
 	writeJSON(w, http.StatusOK, t)
@@ -848,9 +898,43 @@ func (s *Server) handleListTVTargetMTR(w http.ResponseWriter, r *http.Request) {
 	s.handleListTargetMTR(w, r)
 }
 
+func (s *Server) allowTVManualMTR(targetID uuid.UUID, now time.Time) (bool, int) {
+	cooldown := s.tvMTRCooldown
+	if cooldown <= 0 {
+		cooldown = 30 * time.Second
+	}
+	s.tvMTRMu.Lock()
+	defer s.tvMTRMu.Unlock()
+	if s.tvMTRLastRun == nil {
+		s.tvMTRLastRun = make(map[uuid.UUID]time.Time)
+	}
+	if last, ok := s.tvMTRLastRun[targetID]; ok {
+		if rem := cooldown - now.Sub(last); rem > 0 {
+			secs := int(rem.Seconds()) + 1
+			if secs < 1 {
+				secs = 1
+			}
+			return false, secs
+		}
+	}
+	s.tvMTRLastRun[targetID] = now
+	return true, 0
+}
+
 func (s *Server) handleTriggerTVTargetMTR(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeTVRequest(w, r) {
 		return
+	}
+	if !s.isAdminAuthenticated(r) {
+		id, ok := parseUUIDParam(w, r, "id")
+		if !ok {
+			return
+		}
+		if allowed, retryAfterSec := s.allowTVManualMTR(id, time.Now().UTC()); !allowed {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
+			writeProblem(w, r, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf("TV manual MTR is rate-limited; retry in %ds", retryAfterSec))
+			return
+		}
 	}
 	s.handleTriggerTargetMTR(w, r)
 }
@@ -887,10 +971,6 @@ func (s *Server) handleTriggerTargetMTR(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleSimulateTarget(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeTVRequest(w, r) {
-		return
-	}
-
 	id, ok := parseUUIDParam(w, r, "id")
 	if !ok {
 		return
@@ -1378,6 +1458,35 @@ func (s *Server) handleTestAlertChannel(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	alertingState := "ON"
+	if st, err := s.store.GetSettings(r.Context()); err == nil && !st.AlertingEnabled {
+		alertingState = "OFF"
+	}
+	probes, _ := s.store.ListProbes(r.Context())
+	onlineProbes := 0
+	for _, p := range probes {
+		if p.Status != "offline" {
+			onlineProbes++
+		}
+	}
+	targets, _ := s.store.ListTargets(r.Context())
+	activeTargets := 0
+	for _, t := range targets {
+		if t.Enabled {
+			activeTargets++
+		}
+	}
+	openIncidents, _ := s.store.CountOpenIncidents(r.Context())
+
+	probeUnit := "probes"
+	if len(probes) == 1 {
+		probeUnit = "probe"
+	}
+	sevLabel := "All severities"
+	if strings.EqualFold(ch.SeverityFilter, "critical") {
+		sevLabel = "Critical only"
+	}
+
 	msg := alerts.AlertMessage{
 		Status:         "TEST",
 		Severity:       "test",
@@ -1387,7 +1496,9 @@ func (s *Server) handleTestAlertChannel(w http.ResponseWriter, r *http.Request) 
 		QuorumCount:    1,
 		QuorumRequired: 1,
 		AffectedProbes: []string{"Local Central Probe"},
-		Summary:        "Notification connection verified",
+		Summary:        fmt.Sprintf("Connected · Alerting %s", alertingState),
+		FleetSummary:   fmt.Sprintf("%d/%d %s online · %d active targets (%d open incidents)", onlineProbes, len(probes), probeUnit, activeTargets, openIncidents),
+		ChannelSummary: fmt.Sprintf("%s (%s)", ch.Name, sevLabel),
 		Timestamp:      time.Now().UTC().Format(time.RFC3339),
 	}
 
@@ -1420,6 +1531,29 @@ func (s *Server) handleListIncidents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, items)
 }
 
+func (s *Server) handleSetAlertingStatus(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AlertingEnabled *bool `json:"alerting_enabled"`
+	}
+	if err := decodeJSON(w, r, &req); err != nil || req.AlertingEnabled == nil {
+		writeProblem(w, r, http.StatusBadRequest, "bad_json", "alerting_enabled boolean is required")
+		return
+	}
+	st, err := s.store.SetAlertingEnabled(r.Context(), *req.AlertingEnabled)
+	if err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	if s.hub != nil {
+		s.hub.BroadcastUI("matrix", protocol.LiveEvent{
+			Type:    "incident_update",
+			Channel: "matrix",
+			Data:    map[string]any{"alerting_enabled": st.AlertingEnabled},
+		})
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
 func (s *Server) handleAcknowledgeIncident(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseUUIDParam(w, r, "id")
 	if !ok {
@@ -1444,6 +1578,54 @@ func (s *Server) handleAcknowledgeIncident(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, inc)
 }
 
+func (s *Server) handleCloseIncident(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseUUIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	closedBy := strings.TrimSpace(auth.UsernameFromCtx(r.Context()))
+	if closedBy == "" {
+		closedBy = "admin"
+	}
+	inc, err := s.store.CloseIncidentByID(r.Context(), id, closedBy, time.Now().UTC())
+	if err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	if s.hub != nil {
+		s.hub.BroadcastUI("matrix", protocol.LiveEvent{
+			Type:    "incident_update",
+			Channel: "matrix",
+			Data:    inc,
+		})
+	}
+	writeJSON(w, http.StatusOK, inc)
+}
+
+func (s *Server) handleClearIncidents(w http.ResponseWriter, r *http.Request) {
+	scope := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("scope")))
+	if scope == "" {
+		scope = "resolved"
+	}
+	if scope != "resolved" && scope != "all" {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", "scope must be 'resolved' or 'all'")
+		return
+	}
+	deleted, err := s.store.ClearIncidents(r.Context(), scope == "all")
+	if err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	if s.hub != nil {
+		s.hub.BroadcastUI("matrix", protocol.LiveEvent{
+			Type:    "incident_update",
+			Channel: "matrix",
+			Data:    map[string]any{"cleared": deleted, "scope": scope},
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "scope": scope})
+}
+
 // --- Settings ---
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -1461,6 +1643,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		AggRetentionDays int    `json:"agg_retention_days"`
 		DefaultQuorumMin int    `json:"default_quorum_min"`
 		BrandName        string `json:"brand_name"`
+		AlertingEnabled  *bool  `json:"alerting_enabled"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeProblem(w, r, http.StatusBadRequest, "bad_json", "Invalid settings payload")
@@ -1484,10 +1667,150 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	st, err := s.store.UpdateSettingsAndRetention(r.Context(), req.RawRetentionDays, req.AggRetentionDays, req.DefaultQuorumMin, brandName)
+	st, err := s.store.UpdateSettingsAndRetention(r.Context(), req.RawRetentionDays, req.AggRetentionDays, req.DefaultQuorumMin, brandName, req.AlertingEnabled)
 	if err != nil {
 		handleStoreErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+// --- TV Display Presets ---
+
+type tvPresetRequest struct {
+	Slug      string          `json:"slug"`
+	Name      string          `json:"name"`
+	Config    json.RawMessage `json:"config"`
+	IsDefault bool            `json:"is_default"`
+}
+
+func slugifyPresetName(name string) string {
+	var b strings.Builder
+	prevDash := false
+	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevDash = false
+		} else if !prevDash && b.Len() > 0 {
+			b.WriteByte('-')
+			prevDash = true
+		}
+		if b.Len() >= 48 {
+			break
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func isValidPresetSlug(slug string) bool {
+	if len(slug) < 1 || len(slug) > 64 {
+		return false
+	}
+	for i, r := range slug {
+		isAlphaNum := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if i == 0 && !isAlphaNum {
+			return false
+		}
+		if !isAlphaNum && r != '-' {
+			return false
+		}
+	}
+	return slug[len(slug)-1] != '-'
+}
+
+func validateTVPresetRequest(req tvPresetRequest) (db.TVPresetInput, string) {
+	name := strings.TrimSpace(req.Name)
+	if len(name) < 1 || len(name) > 80 {
+		return db.TVPresetInput{}, "Preset name must be 1..80 characters"
+	}
+	slug := strings.ToLower(strings.TrimSpace(req.Slug))
+	if slug == "" {
+		slug = slugifyPresetName(name)
+	}
+	if !isValidPresetSlug(slug) {
+		return db.TVPresetInput{}, "Preset slug must use lowercase letters, digits, and hyphens (1..64 chars)"
+	}
+	cfgBytes := req.Config
+	if len(cfgBytes) == 0 {
+		cfgBytes = json.RawMessage(`{}`)
+	}
+	if len(cfgBytes) > 32768 {
+		return db.TVPresetInput{}, "Preset config exceeds 32KB limit"
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(cfgBytes, &obj); err != nil || obj == nil {
+		return db.TVPresetInput{}, "Preset config must be a valid JSON object"
+	}
+	return db.TVPresetInput{
+		Slug:      slug,
+		Name:      name,
+		Config:    cfgBytes,
+		IsDefault: req.IsDefault,
+	}, ""
+}
+
+func (s *Server) handleListTVPresets(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeTVRequest(w, r) {
+		return
+	}
+	presets, err := s.store.ListTVPresets(r.Context())
+	if err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, presets)
+}
+
+func (s *Server) handleCreateTVPreset(w http.ResponseWriter, r *http.Request) {
+	var req tvPresetRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "bad_json", "Invalid TV preset payload")
+		return
+	}
+	in, errMsg := validateTVPresetRequest(req)
+	if errMsg != "" {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", errMsg)
+		return
+	}
+	p, err := s.store.CreateTVPreset(r.Context(), in)
+	if err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, p)
+}
+
+func (s *Server) handleUpdateTVPreset(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseUUIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	var req tvPresetRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "bad_json", "Invalid TV preset payload")
+		return
+	}
+	in, errMsg := validateTVPresetRequest(req)
+	if errMsg != "" {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", errMsg)
+		return
+	}
+	p, err := s.store.UpdateTVPreset(r.Context(), id, in)
+	if err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Server) handleDeleteTVPreset(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseUUIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	if err := s.store.DeleteTVPreset(r.Context(), id); err != nil {
+		handleStoreErr(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

@@ -19,7 +19,8 @@ import (
 )
 
 type fakeHub struct {
-	updatedProbes []db.Probe
+	updatedProbes   []db.Probe
+	broadcastEvents []protocol.LiveEvent
 }
 
 func (h *fakeHub) HandleProbeWS(http.ResponseWriter, *http.Request) {}
@@ -31,16 +32,20 @@ func (h *fakeHub) UpdateProbeMeta(probe db.Probe) {
 func (h *fakeHub) SendRunMTR(context.Context, db.Target, *uuid.UUID) ([]string, error) {
 	return nil, nil
 }
-func (h *fakeHub) BroadcastUI(string, protocol.LiveEvent) {}
+func (h *fakeHub) BroadcastUI(_ string, ev protocol.LiveEvent) {
+	h.broadcastEvents = append(h.broadcastEvents, ev)
+}
 
 type fakeStore struct {
-	adminHash     string
-	targets       []db.Target
-	probes        []db.Probe
-	alertRules    []db.AlertRule
-	alertChannels []db.AlertChannel
-	incidents     []db.Incident
-	brandName     string
+	adminHash        string
+	targets          []db.Target
+	probes           []db.Probe
+	alertRules       []db.AlertRule
+	alertChannels    []db.AlertChannel
+	incidents        []db.Incident
+	brandName        string
+	alertingDisabled bool
+	tvPresets        []db.TVPreset
 }
 
 func (f *fakeStore) Ping(context.Context) error { return nil }
@@ -127,6 +132,7 @@ func (f *fakeStore) CreateTarget(_ context.Context, in db.TargetInput) (db.Targe
 		IntervalSec:           in.IntervalSec,
 		TimeoutMs:             in.TimeoutMs,
 		Enabled:               in.Enabled,
+		AlertsEnabled:         in.AlertsEnabled,
 		AssignAllProbes:       in.AssignAllProbes,
 		ProbeIDs:              probeIDs,
 		ProbeLatencyOverrides: overrides,
@@ -147,10 +153,21 @@ func (f *fakeStore) UpdateTarget(_ context.Context, id uuid.UUID, in db.TargetIn
 			existing.Host = in.Host
 			existing.ProbeType = in.ProbeType
 			existing.Enabled = in.Enabled
+			existing.AlertsEnabled = in.AlertsEnabled
 			existing.AssignAllProbes = in.AssignAllProbes
 			existing.ProbeIDs = probeIDs
 			existing.ProbeLatencyOverrides = in.ProbeLatencyOverrides
 			f.targets[i] = existing
+			if !in.AlertsEnabled {
+				now := time.Now().UTC()
+				for j, inc := range f.incidents {
+					if inc.Status == "open" && inc.TargetID != nil && *inc.TargetID == id {
+						inc.Status = "resolved"
+						inc.ResolvedAt = &now
+						f.incidents[j] = inc
+					}
+				}
+			}
 			return existing, nil
 		}
 	}
@@ -329,13 +346,144 @@ func (f *fakeStore) AcknowledgeIncident(_ context.Context, id uuid.UUID, ackBy s
 	}
 	return db.Incident{}, db.ErrNotFound
 }
-func (f *fakeStore) CountOpenIncidents(context.Context) (int, error) { return 0, nil }
-func (f *fakeStore) GetSettings(context.Context) (db.SystemSettings, error) {
-	return db.SystemSettings{RawRetentionDays: 14, AggRetentionDays: 730, DefaultQuorumMin: 2, BrandName: f.brandName}, nil
+func (f *fakeStore) CloseIncidentByID(_ context.Context, id uuid.UUID, closedBy string, now time.Time) (db.Incident, error) {
+	for i, inc := range f.incidents {
+		if inc.ID == id && inc.Status == "open" {
+			t := now
+			inc.Status = "resolved"
+			inc.ResolvedAt = &t
+			inc.Summary = "Manually closed by " + closedBy
+			f.incidents[i] = inc
+			return inc, nil
+		}
+	}
+	return db.Incident{}, db.ErrNotFound
 }
-func (f *fakeStore) UpdateSettingsAndRetention(_ context.Context, rawDays, aggDays, defaultQuorum int, brandName string) (db.SystemSettings, error) {
+func (f *fakeStore) ClearIncidents(_ context.Context, includeOpen bool) (int64, error) {
+	if includeOpen {
+		n := int64(len(f.incidents))
+		f.incidents = nil
+		return n, nil
+	}
+	kept := make([]db.Incident, 0, len(f.incidents))
+	var deleted int64
+	for _, inc := range f.incidents {
+		if inc.Status == "resolved" {
+			deleted++
+			continue
+		}
+		kept = append(kept, inc)
+	}
+	f.incidents = kept
+	return deleted, nil
+}
+func (f *fakeStore) CountOpenIncidents(context.Context) (int, error) {
+	n := 0
+	for _, inc := range f.incidents {
+		if inc.Status == "open" {
+			n++
+		}
+	}
+	return n, nil
+}
+func (f *fakeStore) GetSettings(context.Context) (db.SystemSettings, error) {
+	return db.SystemSettings{
+		RawRetentionDays: 14,
+		AggRetentionDays: 730,
+		DefaultQuorumMin: 2,
+		BrandName:        f.brandName,
+		AlertingEnabled:  !f.alertingDisabled,
+	}, nil
+}
+func (f *fakeStore) SetAlertingEnabled(_ context.Context, enabled bool) (db.SystemSettings, error) {
+	f.alertingDisabled = !enabled
+	return f.GetSettings(context.Background())
+}
+func (f *fakeStore) UpdateSettingsAndRetention(_ context.Context, rawDays, aggDays, defaultQuorum int, brandName string, alertingEnabled *bool) (db.SystemSettings, error) {
 	f.brandName = brandName
-	return db.SystemSettings{RawRetentionDays: rawDays, AggRetentionDays: aggDays, DefaultQuorumMin: defaultQuorum, BrandName: brandName}, nil
+	if alertingEnabled != nil {
+		f.alertingDisabled = !*alertingEnabled
+	}
+	return db.SystemSettings{
+		RawRetentionDays: rawDays,
+		AggRetentionDays: aggDays,
+		DefaultQuorumMin: defaultQuorum,
+		BrandName:        brandName,
+		AlertingEnabled:  !f.alertingDisabled,
+	}, nil
+}
+func (f *fakeStore) ListTVPresets(context.Context) ([]db.TVPreset, error) {
+	out := make([]db.TVPreset, 0, len(f.tvPresets))
+	for _, p := range f.tvPresets {
+		if p.IsDefault {
+			out = append(out, p)
+		}
+	}
+	for _, p := range f.tvPresets {
+		if !p.IsDefault {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) CreateTVPreset(_ context.Context, in db.TVPresetInput) (db.TVPreset, error) {
+	for _, existing := range f.tvPresets {
+		if existing.Slug == in.Slug {
+			return db.TVPreset{}, db.ErrConflict
+		}
+	}
+	if in.IsDefault {
+		for i := range f.tvPresets {
+			f.tvPresets[i].IsDefault = false
+		}
+	}
+	now := time.Now().UTC()
+	p := db.TVPreset{
+		ID:        uuid.New(),
+		Slug:      in.Slug,
+		Name:      in.Name,
+		Config:    in.Config,
+		IsDefault: in.IsDefault,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	f.tvPresets = append(f.tvPresets, p)
+	return p, nil
+}
+func (f *fakeStore) UpdateTVPreset(_ context.Context, id uuid.UUID, in db.TVPresetInput) (db.TVPreset, error) {
+	for _, existing := range f.tvPresets {
+		if existing.ID != id && existing.Slug == in.Slug {
+			return db.TVPreset{}, db.ErrConflict
+		}
+	}
+	if in.IsDefault {
+		for i := range f.tvPresets {
+			if f.tvPresets[i].ID != id {
+				f.tvPresets[i].IsDefault = false
+			}
+		}
+	}
+	for i, existing := range f.tvPresets {
+		if existing.ID == id {
+			existing.Slug = in.Slug
+			existing.Name = in.Name
+			existing.Config = in.Config
+			existing.IsDefault = in.IsDefault
+			existing.UpdatedAt = time.Now().UTC()
+			f.tvPresets[i] = existing
+			return existing, nil
+		}
+	}
+	return db.TVPreset{}, db.ErrNotFound
+}
+func (f *fakeStore) DeleteTVPreset(_ context.Context, id uuid.UUID) error {
+	for i, existing := range f.tvPresets {
+		if existing.ID == id {
+			f.tvPresets = append(f.tvPresets[:i], f.tvPresets[i+1:]...)
+			return nil
+		}
+	}
+	return db.ErrNotFound
 }
 
 func TestRouterAuthAndTargetValidation(t *testing.T) {
@@ -486,19 +634,21 @@ func TestTVMatrixEndpointAuthGuard(t *testing.T) {
 	}
 	var payload struct {
 		Targets []db.Target `json:"targets"`
+		IsAdmin bool        `json:"is_admin"`
 	}
 	if err := json.Unmarshal(rec2.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode tv matrix failed: %v", err)
 	}
-	if len(payload.Targets) != 1 || payload.Targets[0].Name != "Active Core" {
-		t.Fatalf("expected only 1 enabled target 'Active Core', got %+v", payload.Targets)
+	if len(payload.Targets) != 1 || payload.Targets[0].Name != "Active Core" || payload.IsAdmin {
+		t.Fatalf("expected only 1 enabled target 'Active Core' and is_admin=false, got %+v", payload)
 	}
 
+	// Unauthenticated POST /api/targets/{id}/simulate must be rejected (401) even when NocTVAllowUnauth=true
 	simReq := httptest.NewRequest(http.MethodPost, "/api/targets/"+payload.Targets[0].ID.String()+"/simulate", bytes.NewBufferString(`{"mode":"high_latency","duration_sec":30}`))
 	simRec := httptest.NewRecorder()
 	openRouter.ServeHTTP(simRec, simReq)
-	if simRec.Code != http.StatusOK {
-		t.Fatalf("POST /api/targets/{id}/simulate got %d, want 200", simRec.Code)
+	if simRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated POST /api/targets/{id}/simulate got %d, want 401", simRec.Code)
 	}
 
 	// Case 3: /api/tv/series follows the same NocTVAllowUnauth guard & enabled-target filter
@@ -986,5 +1136,365 @@ func TestTelegramAlertChannelWithThreadID(t *testing.T) {
 	router.ServeHTTP(autoRttRec, autoRttReq)
 	if autoRttRec.Code != http.StatusCreated {
 		t.Fatalf("expected 201 creating latency_p95 threshold_value=0 rule, got %d (%s)", autoRttRec.Code, autoRttRec.Body.String())
+	}
+}
+
+func TestAlertingControlsAndTargetOptIn(t *testing.T) {
+	t.Parallel()
+	pwHash, _ := auth.HashPassword("supersecret123")
+	store := &fakeStore{adminHash: pwHash}
+	hub := &fakeHub{}
+	cfg := config.CentralConfig{
+		JWTSecret:        "test-jwt-secret-at-least-32-chars!!",
+		AppEncryptionKey: "test-aes-secret-at-least-32-chars!!",
+		CookieSecure:     "false",
+	}
+	router := NewRouter(Dependencies{
+		Config: cfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		Hub:    hub,
+		AESKey: auth.DeriveAESKey(cfg.AppEncryptionKey),
+	})
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"username":"admin","password":"supersecret123"}`))
+	loginRec := httptest.NewRecorder()
+	router.ServeHTTP(loginRec, loginReq)
+	sessionCookie := loginRec.Result().Cookies()[0]
+
+	// 1. Toggle global alerting status OFF -> 200, broadcasts incident_update, preserved by PUT /api/settings when omitted
+	offReq := httptest.NewRequest(http.MethodPut, "/api/alerts/status", bytes.NewBufferString(`{"alerting_enabled":false}`))
+	offReq.AddCookie(sessionCookie)
+	offRec := httptest.NewRecorder()
+	router.ServeHTTP(offRec, offReq)
+	if offRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 turning alerting OFF, got %d (%s)", offRec.Code, offRec.Body.String())
+	}
+	var st db.SystemSettings
+	if err := json.Unmarshal(offRec.Body.Bytes(), &st); err != nil || st.AlertingEnabled {
+		t.Fatalf("expected alerting_enabled=false, got %+v err=%v", st, err)
+	}
+
+	updSetReq := httptest.NewRequest(http.MethodPut, "/api/settings", bytes.NewBufferString(`{"raw_retention_days":14,"agg_retention_days":365,"default_quorum_min":2,"brand_name":"NOC Lab"}`))
+	updSetReq.AddCookie(sessionCookie)
+	updSetRec := httptest.NewRecorder()
+	router.ServeHTTP(updSetRec, updSetReq)
+	if updSetRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 updating settings, got %d (%s)", updSetRec.Code, updSetRec.Body.String())
+	}
+	if err := json.Unmarshal(updSetRec.Body.Bytes(), &st); err != nil || st.AlertingEnabled {
+		t.Fatalf("expected omitted alerting_enabled in PUT /api/settings to preserve false, got %+v err=%v", st, err)
+	}
+
+	// Bad payload on PUT /api/alerts/status -> 400
+	badStatusReq := httptest.NewRequest(http.MethodPut, "/api/alerts/status", bytes.NewBufferString(`{}`))
+	badStatusReq.AddCookie(sessionCookie)
+	badStatusRec := httptest.NewRecorder()
+	router.ServeHTTP(badStatusRec, badStatusReq)
+	if badStatusRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when alerting_enabled missing, got %d", badStatusRec.Code)
+	}
+
+	// 2. Create Monitoring-Only target (alerts_enabled=false) & default target (alerts_enabled=true)
+	monReq := httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{"name":"Monitor Only Node","host":"1.1.1.1","probe_type":"icmp","alerts_enabled":false,"assign_all_probes":true}`))
+	monReq.AddCookie(sessionCookie)
+	monRec := httptest.NewRecorder()
+	router.ServeHTTP(monRec, monReq)
+	if monRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating monitor-only target, got %d (%s)", monRec.Code, monRec.Body.String())
+	}
+	var monTarget db.Target
+	if err := json.Unmarshal(monRec.Body.Bytes(), &monTarget); err != nil || monTarget.AlertsEnabled {
+		t.Fatalf("expected alerts_enabled=false, got %+v err=%v", monTarget, err)
+	}
+
+	defReq := httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{"name":"Alerted Node","host":"8.8.8.8","probe_type":"icmp","assign_all_probes":true}`))
+	defReq.AddCookie(sessionCookie)
+	defRec := httptest.NewRecorder()
+	router.ServeHTTP(defRec, defReq)
+	if defRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating default alerted target, got %d (%s)", defRec.Code, defRec.Body.String())
+	}
+	var alertedTarget db.Target
+	if err := json.Unmarshal(defRec.Body.Bytes(), &alertedTarget); err != nil || !alertedTarget.AlertsEnabled {
+		t.Fatalf("expected default alerts_enabled=true, got %+v err=%v", alertedTarget, err)
+	}
+
+	// 3. Seed open incidents, manually Close one via POST /api/alerts/incidents/{id}/close, auto-close another via PUT /api/targets/{id}
+	inc1 := uuid.New()
+	inc2 := uuid.New()
+	store.incidents = []db.Incident{
+		{ID: inc1, RuleID: uuid.New(), TargetID: &alertedTarget.ID, Status: "open", Severity: "critical", StartedAt: time.Now().UTC()},
+		{ID: inc2, RuleID: uuid.New(), TargetID: &alertedTarget.ID, Status: "open", Severity: "warn", StartedAt: time.Now().UTC()},
+	}
+
+	closeReq := httptest.NewRequest(http.MethodPost, "/api/alerts/incidents/"+inc1.String()+"/close", nil)
+	closeReq.AddCookie(sessionCookie)
+	closeRec := httptest.NewRecorder()
+	router.ServeHTTP(closeRec, closeReq)
+	if closeRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 closing open incident, got %d (%s)", closeRec.Code, closeRec.Body.String())
+	}
+	var closedInc db.Incident
+	if err := json.Unmarshal(closeRec.Body.Bytes(), &closedInc); err != nil || closedInc.Status != "resolved" || closedInc.ResolvedAt == nil {
+		t.Fatalf("expected closed incident status=resolved, got %+v err=%v", closedInc, err)
+	}
+
+	// Closing an already resolved incident -> 404
+	closeAgainReq := httptest.NewRequest(http.MethodPost, "/api/alerts/incidents/"+inc1.String()+"/close", nil)
+	closeAgainReq.AddCookie(sessionCookie)
+	closeAgainRec := httptest.NewRecorder()
+	router.ServeHTTP(closeAgainRec, closeAgainReq)
+	if closeAgainRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 closing already-resolved incident, got %d", closeAgainRec.Code)
+	}
+
+	// Clear resolved only -> removes inc1, leaves open inc2
+	clearResReq := httptest.NewRequest(http.MethodDelete, "/api/alerts/incidents?scope=resolved", nil)
+	clearResReq.AddCookie(sessionCookie)
+	clearResRec := httptest.NewRecorder()
+	router.ServeHTTP(clearResRec, clearResReq)
+	if clearResRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 clearing resolved incidents, got %d (%s)", clearResRec.Code, clearResRec.Body.String())
+	}
+	if len(store.incidents) != 1 || store.incidents[0].ID != inc2 {
+		t.Fatalf("expected only open inc2 remaining, got %+v", store.incidents)
+	}
+
+	// Invalid scope -> 400
+	badScopeReq := httptest.NewRequest(http.MethodDelete, "/api/alerts/incidents?scope=invalid", nil)
+	badScopeReq.AddCookie(sessionCookie)
+	badScopeRec := httptest.NewRecorder()
+	router.ServeHTTP(badScopeRec, badScopeReq)
+	if badScopeRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid clear scope, got %d", badScopeRec.Code)
+	}
+
+	// Update target to alerts_enabled=false -> auto-closes inc2 and broadcasts incident_update
+	beforeEvents := len(hub.broadcastEvents)
+	updTargetReq := httptest.NewRequest(http.MethodPut, "/api/targets/"+alertedTarget.ID.String(), bytes.NewBufferString(`{"name":"Alerted Node","host":"8.8.8.8","probe_type":"icmp","alerts_enabled":false,"assign_all_probes":true}`))
+	updTargetReq.AddCookie(sessionCookie)
+	updTargetRec := httptest.NewRecorder()
+	router.ServeHTTP(updTargetRec, updTargetReq)
+	if updTargetRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 updating target to monitor only, got %d (%s)", updTargetRec.Code, updTargetRec.Body.String())
+	}
+	if store.incidents[0].Status != "resolved" || len(hub.broadcastEvents) <= beforeEvents {
+		t.Fatalf("expected inc2 auto-closed and incident_update broadcast, got inc=%+v events=%d->%d", store.incidents[0], beforeEvents, len(hub.broadcastEvents))
+	}
+
+	// Clear all -> empties history completely
+	clearAllReq := httptest.NewRequest(http.MethodDelete, "/api/alerts/incidents?scope=all", nil)
+	clearAllReq.AddCookie(sessionCookie)
+	clearAllRec := httptest.NewRecorder()
+	router.ServeHTTP(clearAllRec, clearAllReq)
+	if clearAllRec.Code != http.StatusOK || len(store.incidents) != 0 {
+		t.Fatalf("expected 200 and 0 incidents after scope=all, got code=%d len=%d", clearAllRec.Code, len(store.incidents))
+	}
+}
+
+func TestAlertChannelTestMessageIncludesFleetSummary(t *testing.T) {
+	t.Parallel()
+	var gotText string
+	tgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotText, _ = body["text"].(string)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":101}}`))
+	}))
+	defer tgSrv.Close()
+
+	pwHash, _ := auth.HashPassword("supersecret123")
+	cfg := config.CentralConfig{
+		JWTSecret:        "test-jwt-secret-at-least-32-chars!!",
+		AppEncryptionKey: "test-aes-secret-at-least-32-chars!!",
+		CookieSecure:     "false",
+	}
+	aesKey := auth.DeriveAESKey(cfg.AppEncryptionKey)
+	enc, _ := auth.EncryptAESGCM(aesKey, []byte(`{"bot_token":"123:ABC","chat_id":"-1009"}`))
+	chID := uuid.New()
+	store := &fakeStore{
+		adminHash: pwHash,
+		probes: []db.Probe{
+			{ID: uuid.New(), Name: "Localhost", Status: "online"},
+		},
+		targets: []db.Target{
+			{ID: uuid.New(), Name: "CF", Host: "1.1.1.1", Enabled: true, AlertsEnabled: true},
+		},
+		alertChannels: []db.AlertChannel{
+			{ID: chID, Type: "telegram", Name: "LAB VI", ConfigEncrypted: enc, SeverityFilter: "all", Enabled: true},
+		},
+	}
+	router := NewRouter(Dependencies{
+		Config:   cfg,
+		Store:    store,
+		Cache:    ingest.NewRollingCache(time.Minute),
+		Hub:      &fakeHub{},
+		Notifier: alerts.NewNotifierWithHTTP(tgSrv.Client(), tgSrv.URL),
+		AESKey:   aesKey,
+	})
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"username":"admin","password":"supersecret123"}`))
+	loginRec := httptest.NewRecorder()
+	router.ServeHTTP(loginRec, loginReq)
+	sessionCookie := loginRec.Result().Cookies()[0]
+
+	testReq := httptest.NewRequest(http.MethodPost, "/api/alerts/channels/"+chID.String()+"/test", nil)
+	testReq.AddCookie(sessionCookie)
+	testRec := httptest.NewRecorder()
+	router.ServeHTTP(testRec, testReq)
+	if testRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 sending test notification, got %d (%s)", testRec.Code, testRec.Body.String())
+	}
+	if !bytes.Contains([]byte(gotText), []byte("Connected · Alerting ON")) ||
+		!bytes.Contains([]byte(gotText), []byte("1/1 probe online · 1 active targets (0 open incidents)")) ||
+		!bytes.Contains([]byte(gotText), []byte("LAB VI (All severities)")) {
+		t.Fatalf("unexpected [TEST] fleet message:\n%s", gotText)
+	}
+}
+
+func TestTVSecurityHardeningKioskTokenAndPresets(t *testing.T) {
+	t.Parallel()
+	pwHash, _ := auth.HashPassword("supersecret123")
+	targetID := uuid.New()
+	store := &fakeStore{
+		adminHash: pwHash,
+		targets: []db.Target{
+			{ID: targetID, Name: "Core-1", Host: "1.1.1.1", ProbeType: "icmp", Enabled: true, AlertsEnabled: true, AssignAllProbes: true},
+		},
+	}
+
+	// 1. Mode LAN Unauth (no kiosk token): TV MTR rate-limited to 1x per 30s; simulate requires Admin
+	openCfg := config.CentralConfig{
+		JWTSecret:        "test-jwt-secret-at-least-32-chars!!",
+		AppEncryptionKey: "test-aes-secret-at-least-32-chars!!",
+		CookieSecure:     "false",
+		NocTVAllowUnauth: true,
+	}
+	openRouter := NewRouter(Dependencies{
+		Config: openCfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		Hub:    &fakeHub{},
+		AESKey: auth.DeriveAESKey(openCfg.AppEncryptionKey),
+	})
+
+	mtr1Req := httptest.NewRequest(http.MethodPost, "/api/tv/targets/"+targetID.String()+"/mtr/run", nil)
+	mtr1Rec := httptest.NewRecorder()
+	openRouter.ServeHTTP(mtr1Rec, mtr1Req)
+	if mtr1Rec.Code != http.StatusAccepted {
+		t.Fatalf("first unauth TV MTR trigger got %d, want 202", mtr1Rec.Code)
+	}
+	mtr2Req := httptest.NewRequest(http.MethodPost, "/api/tv/targets/"+targetID.String()+"/mtr/run", nil)
+	mtr2Rec := httptest.NewRecorder()
+	openRouter.ServeHTTP(mtr2Rec, mtr2Req)
+	if mtr2Rec.Code != http.StatusTooManyRequests || mtr2Rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("second immediate unauth TV MTR trigger got %d (Retry-After=%q), want 429", mtr2Rec.Code, mtr2Rec.Header().Get("Retry-After"))
+	}
+
+	// Unauthenticated preset write must fail (401), read succeeds (200)
+	unauthCreate := httptest.NewRequest(http.MethodPost, "/api/tv/presets", bytes.NewBufferString(`{"name":"Hack","config":{}}`))
+	unauthCreateRec := httptest.NewRecorder()
+	openRouter.ServeHTTP(unauthCreateRec, unauthCreate)
+	if unauthCreateRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauth POST /api/tv/presets got %d, want 401", unauthCreateRec.Code)
+	}
+
+	// Login as Admin -> simulate succeeds (200), MTR not throttled, CRUD presets works, /api/tv/matrix sets is_admin=true
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"username":"admin","password":"supersecret123"}`))
+	loginRec := httptest.NewRecorder()
+	openRouter.ServeHTTP(loginRec, loginReq)
+	adminCookie := loginRec.Result().Cookies()[0]
+
+	simAdminReq := httptest.NewRequest(http.MethodPost, "/api/targets/"+targetID.String()+"/simulate", bytes.NewBufferString(`{"mode":"high_latency","duration_sec":30}`))
+	simAdminReq.AddCookie(adminCookie)
+	simAdminRec := httptest.NewRecorder()
+	openRouter.ServeHTTP(simAdminRec, simAdminReq)
+	if simAdminRec.Code != http.StatusOK {
+		t.Fatalf("admin POST /api/targets/{id}/simulate got %d, want 200", simAdminRec.Code)
+	}
+
+	tvAdminReq := httptest.NewRequest(http.MethodGet, "/api/tv/matrix", nil)
+	tvAdminReq.AddCookie(adminCookie)
+	tvAdminRec := httptest.NewRecorder()
+	openRouter.ServeHTTP(tvAdminRec, tvAdminReq)
+	var adminMatrix struct {
+		IsAdmin bool `json:"is_admin"`
+	}
+	_ = json.Unmarshal(tvAdminRec.Body.Bytes(), &adminMatrix)
+	if !adminMatrix.IsAdmin {
+		t.Fatalf("expected is_admin=true for admin cookie on /api/tv/matrix")
+	}
+
+	createP1 := httptest.NewRequest(http.MethodPost, "/api/tv/presets", bytes.NewBufferString(`{"name":"NOC Main Wall","config":{"range":"3h","layoutMode":"auto"},"is_default":true}`))
+	createP1.AddCookie(adminCookie)
+	createP1Rec := httptest.NewRecorder()
+	openRouter.ServeHTTP(createP1Rec, createP1)
+	if createP1Rec.Code != http.StatusCreated {
+		t.Fatalf("admin POST /api/tv/presets got %d (%s), want 201", createP1Rec.Code, createP1Rec.Body.String())
+	}
+	var preset1 db.TVPreset
+	_ = json.Unmarshal(createP1Rec.Body.Bytes(), &preset1)
+	if preset1.Slug != "noc-main-wall" || !preset1.IsDefault {
+		t.Fatalf("unexpected created preset: %+v", preset1)
+	}
+
+	listOpen := httptest.NewRequest(http.MethodGet, "/api/tv/presets", nil)
+	listOpenRec := httptest.NewRecorder()
+	openRouter.ServeHTTP(listOpenRec, listOpen)
+	if listOpenRec.Code != http.StatusOK || !bytes.Contains(listOpenRec.Body.Bytes(), []byte("noc-main-wall")) {
+		t.Fatalf("GET /api/tv/presets failed: code=%d body=%s", listOpenRec.Code, listOpenRec.Body.String())
+	}
+
+	// 2. Kiosk Token Mode: /api/tv/* requires key/cookie, sets smoker_tv_kiosk cookie, cannot access Admin /api/targets
+	kioskCfg := openCfg
+	kioskCfg.NocTVKioskToken = "kiosk_secret_token_2026"
+	kioskRouter := NewRouter(Dependencies{
+		Config: kioskCfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		Hub:    &fakeHub{},
+		AESKey: auth.DeriveAESKey(kioskCfg.AppEncryptionKey),
+	})
+
+	noKeyReq := httptest.NewRequest(http.MethodGet, "/api/tv/matrix", nil)
+	noKeyRec := httptest.NewRecorder()
+	kioskRouter.ServeHTTP(noKeyRec, noKeyReq)
+	if noKeyRec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/tv/matrix without kiosk key got %d, want 401", noKeyRec.Code)
+	}
+
+	withKeyReq := httptest.NewRequest(http.MethodGet, "/api/tv/matrix?key=kiosk_secret_token_2026", nil)
+	withKeyRec := httptest.NewRecorder()
+	kioskRouter.ServeHTTP(withKeyRec, withKeyReq)
+	if withKeyRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/tv/matrix?key=valid got %d, want 200", withKeyRec.Code)
+	}
+	var kioskCookie *http.Cookie
+	for _, c := range withKeyRec.Result().Cookies() {
+		if c.Name == auth.TVKioskCookieName {
+			kioskCookie = c
+		}
+	}
+	if kioskCookie == nil || !kioskCookie.HttpOnly {
+		t.Fatalf("expected HttpOnly smoker_tv_kiosk cookie issued, got %+v", withKeyRec.Result().Cookies())
+	}
+
+	// Subsequent request with kiosk cookie only -> 200 on /api/tv/presets, 401 on Admin /api/targets
+	cookieTVReq := httptest.NewRequest(http.MethodGet, "/api/tv/presets", nil)
+	cookieTVReq.AddCookie(kioskCookie)
+	cookieTVRec := httptest.NewRecorder()
+	kioskRouter.ServeHTTP(cookieTVRec, cookieTVReq)
+	if cookieTVRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/tv/presets with kiosk cookie got %d, want 200", cookieTVRec.Code)
+	}
+
+	cookieAdminReq := httptest.NewRequest(http.MethodGet, "/api/targets", nil)
+	cookieAdminReq.AddCookie(kioskCookie)
+	cookieAdminRec := httptest.NewRecorder()
+	kioskRouter.ServeHTTP(cookieAdminRec, cookieAdminReq)
+	if cookieAdminRec.Code != http.StatusUnauthorized {
+		t.Fatalf("kiosk cookie MUST NOT access Admin /api/targets, got %d want 401", cookieAdminRec.Code)
 	}
 }

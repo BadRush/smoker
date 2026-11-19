@@ -26,7 +26,14 @@ export default function LoginPage() {
         method: "POST",
         body: JSON.stringify({ username: username.trim(), password }),
       });
-      router.replace("/");
+      let dest = "/";
+      if (typeof window !== "undefined") {
+        const nextParam = new URLSearchParams(window.location.search).get("next");
+        if (nextParam && nextParam.startsWith("/") && !nextParam.startsWith("//")) {
+          dest = nextParam;
+        }
+      }
+      router.replace(dest);
     } catch (err) {
       if (err instanceof ApiError) {
         setError(err.detail);

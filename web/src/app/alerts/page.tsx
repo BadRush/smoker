@@ -15,6 +15,7 @@ import {
   Sparkles,
   Trash2,
   X,
+  XCircle,
 } from "lucide-react";
 import { NocShell } from "@/components/layout/NocShell";
 import { formatDateTime24 } from "@/lib/date-format";
@@ -31,6 +32,7 @@ import {
   type MatrixCell,
   type MatrixSnapshot,
   type Probe,
+  type SystemSettings,
   type Target,
   type TargetGroup,
 } from "@/lib/api";
@@ -161,6 +163,9 @@ export default function AlertsPage() {
   const [groups, setGroups] = useState<TargetGroup[]>([]);
   const [probes, setProbes] = useState<Probe[]>([]);
   const [matrixCells, setMatrixCells] = useState<MatrixCell[]>([]);
+  const [alertingEnabled, setAlertingEnabled] = useState(true);
+  const [togglingAlerting, setTogglingAlerting] = useState(false);
+  const [clearingIncidents, setClearingIncidents] = useState(false);
   const [loading, setLoading] = useState(true);
   const [feedback, setFeedback] = useState<string | null>(null);
   const handledQueryPrefillRef = useRef(false);
@@ -198,7 +203,7 @@ export default function AlertsPage() {
 
   const loadAlerts = useCallback(async () => {
     try {
-      const [incRes, ruleRes, chanRes, tRes, pRes, gRes, mRes] = await Promise.all([
+      const [incRes, ruleRes, chanRes, tRes, pRes, gRes, mRes, settingsRes] = await Promise.all([
         apiRequest<Incident[]>("/api/alerts/incidents"),
         apiRequest<AlertRule[]>("/api/alerts/rules"),
         apiRequest<AlertChannel[]>("/api/alerts/channels"),
@@ -206,6 +211,7 @@ export default function AlertsPage() {
         apiRequest<Probe[]>("/api/probes"),
         apiRequest<TargetGroup[]>("/api/groups").catch(() => [] as TargetGroup[]),
         apiRequest<MatrixSnapshot>("/api/matrix").catch(() => null as MatrixSnapshot | null),
+        apiRequest<SystemSettings>("/api/settings").catch(() => null as SystemSettings | null),
       ]);
       const loadedProbes = Array.isArray(pRes) ? pRes : [];
       setIncidents(Array.isArray(incRes) ? incRes : []);
@@ -215,6 +221,7 @@ export default function AlertsPage() {
       setProbes(loadedProbes);
       setGroups(Array.isArray(gRes) ? gRes : []);
       setMatrixCells(Array.isArray(mRes?.cells) ? mRes.cells : []);
+      setAlertingEnabled(settingsRes?.alerting_enabled ?? true);
 
       const activeFleetCount =
         loadedProbes.filter((p) => p.status !== "offline").length || loadedProbes.length;
@@ -565,6 +572,28 @@ export default function AlertsPage() {
     }
   }
 
+  async function handleToggleAlertingMaster() {
+    setFeedback(null);
+    setTogglingAlerting(true);
+    const nextEnabled = !alertingEnabled;
+    try {
+      const updated = await apiRequest<SystemSettings>("/api/alerts/status", {
+        method: "PUT",
+        body: JSON.stringify({ alerting_enabled: nextEnabled }),
+      });
+      setAlertingEnabled(updated?.alerting_enabled ?? nextEnabled);
+      setFeedback(
+        nextEnabled
+          ? "Alerting & Incident History enabled — alert rules are actively evaluated."
+          : "Alerting & Incident History turned OFF — no new incidents or notifications will be triggered while monitoring continues."
+      );
+    } catch (err) {
+      setFeedback(err instanceof ApiError ? err.detail : "Failed to update alerting status");
+    } finally {
+      setTogglingAlerting(false);
+    }
+  }
+
   async function handleAcknowledgeIncident(inc: Incident) {
     setFeedback(null);
     try {
@@ -575,6 +604,42 @@ export default function AlertsPage() {
       await loadAlerts();
     } catch (err) {
       setFeedback(err instanceof ApiError ? err.detail : "Failed to acknowledge incident");
+    }
+  }
+
+  async function handleCloseIncident(inc: Incident) {
+    setFeedback(null);
+    try {
+      await apiRequest(`/api/alerts/incidents/${inc.id}/close`, {
+        method: "POST",
+      });
+      setFeedback(
+        "Incident manually closed. If the target is still impaired and the rule remains enabled, it may reopen after the confirm delay unless muted or set to Monitoring Only."
+      );
+      await loadAlerts();
+    } catch (err) {
+      setFeedback(err instanceof ApiError ? err.detail : "Failed to close incident");
+    }
+  }
+
+  async function handleClearIncidents(scope: "resolved" | "all") {
+    setFeedback(null);
+    setClearingIncidents(true);
+    try {
+      const res = await apiRequest<{ deleted: number; scope: string }>(
+        `/api/alerts/incidents?scope=${scope}`,
+        { method: "DELETE" }
+      );
+      setFeedback(
+        scope === "all"
+          ? `Cleared all incident history (${res?.deleted ?? 0} removed).`
+          : `Cleared resolved incident history (${res?.deleted ?? 0} removed).`
+      );
+      await loadAlerts();
+    } catch (err) {
+      setFeedback(err instanceof ApiError ? err.detail : "Failed to clear incident history");
+    } finally {
+      setClearingIncidents(false);
     }
   }
 
@@ -598,6 +663,7 @@ export default function AlertsPage() {
   }
 
   const openCount = incidents.filter((i) => i.status === "open").length;
+  const resolvedCount = incidents.length - openCount;
 
   return (
     <NocShell activeIncidents={openCount}>
@@ -623,50 +689,114 @@ export default function AlertsPage() {
         {/* Incidents Log */}
         <section className="rounded-lg border border-border bg-surface p-4 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2.5">
               <Bell className="h-4 w-4 text-rose-400" aria-hidden="true" />
               <h2 className="text-sm font-semibold text-zinc-100">Incident History</h2>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={alertingEnabled}
+                aria-label="Toggle alerting and incident history"
+                data-testid="alerting-master-toggle"
+                disabled={togglingAlerting}
+                onClick={() => void handleToggleAlertingMaster()}
+                className={`inline-flex items-center gap-2 rounded-full border px-2.5 py-0.5 text-[11px] font-mono font-semibold transition-colors disabled:opacity-50 ${
+                  alertingEnabled
+                    ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25"
+                    : "border-amber-500/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25"
+                }`}
+              >
+                <span
+                  className={`inline-block h-2 w-2 rounded-full ${
+                    alertingEnabled ? "bg-emerald-400" : "bg-amber-400"
+                  }`}
+                />
+                <span>{alertingEnabled ? "Alerting: ON" : "Alerting: OFF"}</span>
+              </button>
             </div>
 
-            {targets.length > 0 && (
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                <BellOff className="h-3.5 w-3.5 text-amber-400" aria-hidden="true" />
-                <select
-                  aria-label="Mute target"
-                  value={muteTargetId}
-                  onChange={(e) => setMuteTargetId(e.target.value)}
-                  className="rounded border border-border bg-canvas px-2 py-1 text-xs text-zinc-200"
-                >
-                  <option value="">Maintenance Mute Target...</option>
-                  {targets.map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.name}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  aria-label="Mute duration"
-                  value={muteDuration}
-                  onChange={(e) => setMuteDuration(e.target.value)}
-                  className="rounded border border-border bg-canvas px-2 py-1 text-xs text-zinc-200"
-                >
-                  <option value="15m">15 min</option>
-                  <option value="1h">1 hour</option>
-                  <option value="4h">4 hours</option>
-                  <option value="24h">24 hours</option>
-                  <option value="off">Unmute</option>
-                </select>
-                <button
-                  type="button"
-                  disabled={!muteTargetId}
-                  onClick={() => void handleMuteTarget(muteTargetId, muteDuration)}
-                  className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-200 hover:bg-amber-500/25 disabled:opacity-50"
-                >
-                  <span>Apply Mute</span>
-                </button>
-              </div>
-            )}
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              {incidents.length > 0 && (
+                <div className="flex items-center gap-1.5">
+                  {resolvedCount > 0 && (
+                    <button
+                      type="button"
+                      disabled={clearingIncidents}
+                      aria-label="Clear resolved incident history"
+                      onClick={() => void handleClearIncidents("resolved")}
+                      className="inline-flex items-center gap-1 rounded border border-border bg-canvas px-2 py-1 text-xs text-zinc-300 hover:border-zinc-500 hover:text-zinc-100 disabled:opacity-50"
+                    >
+                      <Trash2 className="h-3 w-3" aria-hidden="true" />
+                      <span>Clear Resolved</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={clearingIncidents}
+                    aria-label="Clear all incident history"
+                    onClick={() => void handleClearIncidents("all")}
+                    className="inline-flex items-center gap-1 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-200 hover:bg-rose-500/20 disabled:opacity-50"
+                  >
+                    <Trash2 className="h-3 w-3" aria-hidden="true" />
+                    <span>Clear All</span>
+                  </button>
+                </div>
+              )}
+
+              {targets.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <BellOff className="h-3.5 w-3.5 text-amber-400" aria-hidden="true" />
+                  <select
+                    aria-label="Mute target"
+                    value={muteTargetId}
+                    onChange={(e) => setMuteTargetId(e.target.value)}
+                    className="rounded border border-border bg-canvas px-2 py-1 text-xs text-zinc-200"
+                  >
+                    <option value="">Maintenance Mute Target...</option>
+                    {targets.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    aria-label="Mute duration"
+                    value={muteDuration}
+                    onChange={(e) => setMuteDuration(e.target.value)}
+                    className="rounded border border-border bg-canvas px-2 py-1 text-xs text-zinc-200"
+                  >
+                    <option value="15m">15 min</option>
+                    <option value="1h">1 hour</option>
+                    <option value="4h">4 hours</option>
+                    <option value="24h">24 hours</option>
+                    <option value="off">Unmute</option>
+                  </select>
+                  <button
+                    type="button"
+                    disabled={!muteTargetId}
+                    onClick={() => void handleMuteTarget(muteTargetId, muteDuration)}
+                    className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-200 hover:bg-amber-500/25 disabled:opacity-50"
+                  >
+                    <span>Apply Mute</span>
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
+
+          {!alertingEnabled && (
+            <div
+              data-testid="alerting-paused-banner"
+              className="flex flex-wrap items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200"
+            >
+              <div className="flex items-center gap-2">
+                <BellOff className="h-4 w-4 shrink-0 text-amber-300" aria-hidden="true" />
+                <span>
+                  <strong>Alerting &amp; Incident History is OFF.</strong> Probes, live graphs, and NOC TV continue monitoring normally, but no new incidents will be recorded and no Telegram/Webhook alerts will be sent.
+                </span>
+              </div>
+            </div>
+          )}
 
           {mutedTargets.length > 0 && (
             <div className="flex flex-wrap items-center gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
@@ -752,16 +882,29 @@ export default function AlertsPage() {
                         {formatDurationSeconds(inc.started_at, inc.resolved_at)}
                       </td>
                       <td className="py-2 text-right">
-                        {inc.status === "open" && !inc.acknowledged_at && (
-                          <button
-                            type="button"
-                            aria-label={`Acknowledge incident ${inc.id}`}
-                            onClick={() => void handleAcknowledgeIncident(inc)}
-                            className="inline-flex items-center gap-1 rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 font-sans text-[11px] text-cyan-200 hover:bg-cyan-500/20"
-                          >
-                            <Check className="h-3 w-3" aria-hidden="true" />
-                            <span>Acknowledge</span>
-                          </button>
+                        {inc.status === "open" && (
+                          <div className="inline-flex items-center justify-end gap-1.5">
+                            {!inc.acknowledged_at && (
+                              <button
+                                type="button"
+                                aria-label={`Acknowledge incident ${inc.id}`}
+                                onClick={() => void handleAcknowledgeIncident(inc)}
+                                className="inline-flex items-center gap-1 rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 font-sans text-[11px] text-cyan-200 hover:bg-cyan-500/20"
+                              >
+                                <Check className="h-3 w-3" aria-hidden="true" />
+                                <span>Acknowledge</span>
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              aria-label={`Close incident ${inc.id}`}
+                              onClick={() => void handleCloseIncident(inc)}
+                              className="inline-flex items-center gap-1 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-0.5 font-sans text-[11px] text-rose-200 hover:bg-rose-500/20"
+                            >
+                              <XCircle className="h-3 w-3" aria-hidden="true" />
+                              <span>Close</span>
+                            </button>
+                          </div>
                         )}
                       </td>
                     </tr>
@@ -950,6 +1093,7 @@ export default function AlertsPage() {
                       {targets.map((t) => (
                         <option key={t.id} value={t.id}>
                           {t.name}
+                          {t.alerts_enabled === false ? " (Monitor Only)" : ""}
                         </option>
                       ))}
                     </select>
@@ -1112,6 +1256,19 @@ export default function AlertsPage() {
                   <span>
                     Target &ldquo;{selectedTarget?.name}&rdquo; is only assigned to{" "}
                     {selectedTargetProbeCount} probe(s); quorum {rQuorum} will never trigger.
+                  </span>
+                </p>
+              )}
+
+              {selectedTarget?.alerts_enabled === false && (
+                <p
+                  role="status"
+                  data-testid="alert-target-monitor-only-warning"
+                  className="flex items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-300"
+                >
+                  <BellOff className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                  <span>
+                    Target &ldquo;{selectedTarget.name}&rdquo; is set to <strong>Monitoring Only</strong> — alert rules will skip it until &ldquo;Include in Alerting&rdquo; is checked in /targets.
                   </span>
                 </p>
               )}

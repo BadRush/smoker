@@ -380,4 +380,130 @@ describe("NocTvWallboardPage layout controls", () => {
     await user.click(screen.getByTestId("tv-drawer-spotlight-all"));
     expect(screen.getByTestId("tv-spotlight-btn")).toHaveTextContent("(2)");
   });
+
+  it("auto-opens TargetZoomModal when visited via /tv?zoom=<target_id> deep link", async () => {
+    window.history.replaceState(null, "", "/tv?zoom=t-1");
+    const user = userEvent.setup();
+    render(<NocTvWallboardPage />);
+
+    const zoomModal = await screen.findByTestId("tv-zoom-modal");
+    expect(zoomModal).toBeInTheDocument();
+    expect(zoomModal).toHaveTextContent("Host 1");
+
+    await user.click(screen.getByTestId("tv-zoom-close-btn"));
+    expect(screen.queryByTestId("tv-zoom-modal")).not.toBeInTheDocument();
+    expect(window.location.search).not.toContain("zoom=");
+  });
+
+  it("auto-loads server Default Preset on fresh reboot, supports 1-click switching, and gates Admin Preset CRUD & Simulate by is_admin", async () => {
+    window.localStorage.clear();
+    window.history.replaceState(null, "", "/tv");
+    const savedPresets = [
+      {
+        id: "pre-1",
+        slug: "noc-main",
+        name: "NOC Main Wall",
+        config: { range: "6h", layoutMode: "single-col", orientation: "landscape" },
+        is_default: true,
+        created_at: "2026-11-19T00:00:00Z",
+        updated_at: "2026-11-19T00:00:00Z",
+      },
+      {
+        id: "pre-2",
+        slug: "portrait-ops",
+        name: "Portrait Ops",
+        config: { range: "1h", layoutMode: "auto", orientation: "portrait" },
+        is_default: false,
+        created_at: "2026-11-19T00:00:00Z",
+        updated_at: "2026-11-19T00:00:00Z",
+      },
+    ];
+    let isAdmin = false;
+    const reqLog: Array<{ method: string; url: string; body: unknown }> = [];
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (method !== "GET") {
+          const body = init?.body ? JSON.parse(String(init.body)) : null;
+          reqLog.push({ method, url, body });
+          if (method === "POST" && url === "/api/tv/presets") {
+            return new Response(
+              JSON.stringify({
+                id: "pre-new",
+                slug: "core-focus",
+                name: body.name,
+                config: body.config,
+                is_default: Boolean(body.is_default),
+                created_at: "2026-11-19T00:00:00Z",
+                updated_at: "2026-11-19T00:00:00Z",
+              }),
+              { status: 201 }
+            );
+          }
+        }
+        if (url.startsWith("/api/tv/matrix")) {
+          return new Response(
+            JSON.stringify({ ...TV_SNAPSHOT, is_admin: isAdmin }),
+            { status: 200 }
+          );
+        }
+        if (url.startsWith("/api/tv/presets")) {
+          return new Response(JSON.stringify(savedPresets), { status: 200 });
+        }
+        if (url.startsWith("/api/tv/series")) {
+          return new Response(JSON.stringify({ range: "6h", targets: {} }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    const { unmount } = render(<NocTvWallboardPage />);
+
+    // 1. Non-admin reboot (empty localStorage): auto-loads Default preset ("noc-main": range 6h, single-col)
+    await waitFor(() => {
+      expect(screen.getByTestId("tv-header-preset-select")).toHaveValue("noc-main");
+    });
+    expect(screen.getByTestId("tv-range-selector")).toBeInTheDocument();
+
+    // Open Config Drawer -> 1-click presets visible, Admin Save form & Simulate hidden
+    await user.click(screen.getByRole("button", { name: "Configure TV Display" }));
+    expect(screen.getByTestId("tv-preset-btn-noc-main")).toBeInTheDocument();
+    expect(screen.queryByTestId("tv-preset-admin-form")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("tv-simulate-panel")).not.toBeInTheDocument();
+
+    // 1-click switch to "Portrait Ops" updates URL to short ?preset=portrait-ops
+    await user.click(screen.getByTestId("tv-preset-btn-portrait-ops"));
+    expect(window.location.search).toBe("?preset=portrait-ops");
+    unmount();
+
+    // 2. Admin session (is_admin: true): shows Save Preset form & Simulate panel
+    isAdmin = true;
+    render(<NocTvWallboardPage />);
+    await waitFor(() => {
+      expect(screen.getByTestId("tv-header-preset-select")).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole("button", { name: "Configure TV Display" }));
+    expect(screen.getByTestId("tv-preset-admin-form")).toBeInTheDocument();
+    expect(screen.getByTestId("tv-simulate-panel")).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("New preset name"), "Core Focus");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(reqLog).toContainEqual({
+        method: "POST",
+        url: "/api/tv/presets",
+        body: expect.objectContaining({
+          name: "Core Focus",
+          is_default: true,
+        }),
+      });
+    });
+  });
 });

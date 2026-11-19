@@ -146,16 +146,16 @@ func TestNotifierTelegramHTMLAndRetry429(t *testing.T) {
 		t.Fatalf("expected message_thread_id omitted when threadID=0, got %+v", p0)
 	}
 	text0, _ := p0["text"].(string)
-	if !strings.Contains(text0, "❌ <b>[DOWN]") ||
+	if !strings.Contains(text0, "❌ <b>[DOWN] e1-vhp_edge — Connection Down</b>") ||
 		!strings.Contains(text0, "Alert:</b> Global Check &lt;prod_core&gt;") ||
-		!strings.Contains(text0, "Condition:</b> Connection Down (100% failed)") ||
-		!strings.Contains(text0, "Detected from:</b> 2 of 3 locations (Probe_A, Probe_B)") ||
-		!strings.Contains(text0, "Probe Breakdown:</b>\n• Probe_A: 100% loss\n• Probe_B: 100% loss") ||
-		!strings.Contains(text0, "MTR Hop:</b> #4 (ae1.core.jkt / 103.10.10.1) — 60% loss, 84.5 ms") ||
+		!strings.Contains(text0, "Status:</b> 100% loss (No reply · 2 of 3 locations)") ||
+		!strings.Contains(text0, "Target:</b> <code>https://e1-vhp.com/health?a=1&amp;b=2</code>") ||
+		!strings.Contains(text0, "Detected from:</b> 2 of 3 locations (Probe_A, Probe_B)\n• Probe_A: 100% loss\n• Probe_B: 100% loss") ||
+		!strings.Contains(text0, "MTR Hop:</b> #4 ae1.core.jkt (<code>103.10.10.1</code>) — 60% loss, 84.5 ms") ||
 		!strings.Contains(text0, "Start:</b> 17 Nov 2026 11:30:00 WIB") {
 		t.Fatalf("unexpected DOWN telegram text:\n%s", text0)
 	}
-	for _, forbidden := range []string{"🔴", "🟢", "🧪", "Quorum", "FIRING"} {
+	for _, forbidden := range []string{"🔴", "🟢", "🧪", "Quorum", "FIRING", "P95", "P50"} {
 		if strings.Contains(text0, forbidden) {
 			t.Fatalf("telegram text contains forbidden token %q:\n%s", forbidden, text0)
 		}
@@ -229,7 +229,8 @@ func TestNotifierTelegramHTMLAndRetry429(t *testing.T) {
 		t.Fatalf("expected message_thread_id=4281, got %+v", p1)
 	}
 	text1, _ := p1["text"].(string)
-	if !strings.Contains(text1, "⚠️ <b>[WARN]") || !strings.Contains(text1, "Slow Connection (215 ms, normal &lt; 150 ms)") {
+	if !strings.Contains(text1, "⚠️ <b>[WARN] e1-vhp.com — Slow Connection</b>") ||
+		!strings.Contains(text1, "Status:</b> 215 ms (Limit &lt; 150 ms)") {
 		t.Fatalf("unexpected WARN telegram text:\n%s", text1)
 	}
 
@@ -252,7 +253,8 @@ func TestNotifierTelegramHTMLAndRetry429(t *testing.T) {
 		t.Fatalf("SendTelegram resolved with 429 retry failed: %v", err)
 	}
 	textOk, _ := gotTelegramPayloads[len(gotTelegramPayloads)-1]["text"].(string)
-	if !strings.Contains(textOk, "✅ <b>[OK] e1-vhp.com (https://e1-vhp.com) — Connection Restored</b>") ||
+	if !strings.Contains(textOk, "✅ <b>[OK] e1-vhp.com — Connection Restored</b>") ||
+		!strings.Contains(textOk, "Target:</b> <code>https://e1-vhp.com</code>") ||
 		!strings.Contains(textOk, "Start:</b> 17 Nov 2026 11:30:00 WIB") ||
 		!strings.Contains(textOk, "End:</b> 17 Nov 2026 11:34:25 WIB") ||
 		!strings.Contains(textOk, "Duration:</b> 4m 25s (265s) | Peak: 100% failed") ||
@@ -279,13 +281,27 @@ func TestNotifierTelegramHTMLAndRetry429(t *testing.T) {
 }
 
 type fakeAlertStore struct {
-	mu           sync.Mutex
-	rules        []db.AlertRule
-	probes       []db.Probe
-	targets      []db.Target
-	channels     []db.AlertChannel
-	incidents    []db.Incident
-	mtrSnapshots map[uuid.UUID][]db.MTRSnapshot
+	mu               sync.Mutex
+	rules            []db.AlertRule
+	probes           []db.Probe
+	targets          []db.Target
+	groups           []db.TargetGroup
+	channels         []db.AlertChannel
+	incidents        []db.Incident
+	mtrSnapshots     map[uuid.UUID][]db.MTRSnapshot
+	alertingDisabled bool
+}
+
+func (f *fakeAlertStore) ListGroups(context.Context) ([]db.TargetGroup, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]db.TargetGroup(nil), f.groups...), nil
+}
+
+func (f *fakeAlertStore) GetSettings(context.Context) (db.SystemSettings, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return db.SystemSettings{AlertingEnabled: !f.alertingDisabled}, nil
 }
 
 func (f *fakeAlertStore) ListAlertRules(context.Context) ([]db.AlertRule, error) {
@@ -449,7 +465,7 @@ func TestEvaluatorEscalationOfflineGuardAndChannelRouting(t *testing.T) {
 			{ID: p1ID, Name: "Probe-JKT", Status: "online"},
 		},
 		targets: []db.Target{
-			{ID: t1ID, Name: "e1-vhp.com", Host: "https://e1-vhp.com", IntervalSec: 1, Enabled: true, AssignAllProbes: true},
+			{ID: t1ID, Name: "e1-vhp.com", Host: "https://e1-vhp.com", IntervalSec: 1, Enabled: true, AlertsEnabled: true, AssignAllProbes: true},
 		},
 		channels: []db.AlertChannel{
 			{ID: ch1ID, Type: "telegram", Name: "Ops Thread", ConfigEncrypted: encCh1, Enabled: true},
@@ -609,8 +625,8 @@ func TestEvaluatorAntiFalseAlarmHoldDownAndSLATimestamps(t *testing.T) {
 	store := &fakeAlertStore{
 		probes: []db.Probe{{ID: p1ID, Name: "Probe-JKT", Status: "online"}},
 		targets: []db.Target{
-			{ID: tWarnID, Name: "Intermittent-Link", Host: "1.1.1.1", IntervalSec: 1, Enabled: true, AssignAllProbes: true},
-			{ID: tDownID, Name: "HardDown-Link", Host: "8.8.8.8", IntervalSec: 1, Enabled: true, AssignAllProbes: true},
+			{ID: tWarnID, Name: "Intermittent-Link", Host: "1.1.1.1", IntervalSec: 1, Enabled: true, AlertsEnabled: true, AssignAllProbes: true},
+			{ID: tDownID, Name: "HardDown-Link", Host: "8.8.8.8", IntervalSec: 1, Enabled: true, AlertsEnabled: true, AssignAllProbes: true},
 		},
 		channels: []db.AlertChannel{
 			{ID: uuid.New(), Type: "telegram", Name: "Ops", ConfigEncrypted: encCh, Enabled: true},
@@ -721,11 +737,13 @@ func TestEvaluatorAntiFalseAlarmHoldDownAndSLATimestamps(t *testing.T) {
 	if len(sent) != 2 || store.incidents[0].Status != "resolved" {
 		t.Fatalf("expected [OK] sent after 45s clean streak, sent=%d status=%s", len(sent), store.incidents[0].Status)
 	}
-	if !strings.Contains(sent[1], "✅ <b>[OK] HardDown-Link (8.8.8.8) — Connection Restored</b>") ||
+	if !strings.Contains(sent[1], "✅ <b>[OK] HardDown-Link — Connection Restored</b>") ||
+		!strings.Contains(sent[1], "<b>Status:</b> 20 ms (0% loss · Base 20 ms)") ||
+		!strings.Contains(sent[1], "<b>Target:</b> <code>8.8.8.8</code>") ||
 		!strings.Contains(sent[1], "Start:</b> 17 Nov 2026 11:00:00 WIB") ||
 		!strings.Contains(sent[1], "End:</b> 17 Nov 2026 11:02:00 WIB") ||
 		!strings.Contains(sent[1], "Duration:</b> 2m 00s (120s)") {
-		t.Fatalf("expected exact SLA Start/End/Duration in [OK] message, got:\n%s", sent[1])
+		t.Fatalf("expected exact SLA Start/End/Duration + live Status in [OK] message, got:\n%s", sent[1])
 	}
 }
 
@@ -778,6 +796,7 @@ func TestEvaluatorReliabilitySeverityFilterAckMuteAndMTR(t *testing.T) {
 				Host:            "103.10.10.2",
 				IntervalSec:     1,
 				Enabled:         true,
+				AlertsEnabled:   true,
 				AssignAllProbes: false,
 				ProbeIDs:        []uuid.UUID{pOnline, pOffline}, // 2 assigned, only 1 online!
 				MutedUntil:      &muteUntil,
@@ -866,7 +885,7 @@ func TestEvaluatorReliabilitySeverityFilterAckMuteAndMTR(t *testing.T) {
 	if len(sentByChat["-100ALL"]) != 1 || len(sentByChat["-100CRIT"]) != 0 {
 		t.Fatalf("expected 1 message on -100ALL and 0 on -100CRIT for WARN, got ALL=%d CRIT=%d", len(sentByChat["-100ALL"]), len(sentByChat["-100CRIT"]))
 	}
-	if !strings.Contains(sentByChat["-100ALL"][0], "MTR Hop:</b> #2 (ae0.jkt.edge / 103.10.10.1) — 40% loss, 45.2 ms") {
+	if !strings.Contains(sentByChat["-100ALL"][0], "MTR Hop:</b> #2 ae0.jkt.edge (<code>103.10.10.1</code>) — 40% loss, 45.2 ms") {
 		t.Fatalf("expected MTR Hop in Telegram alert, got:\n%s", sentByChat["-100ALL"][0])
 	}
 
@@ -961,9 +980,10 @@ func TestPerChatPacingAndCurrentVsPeakTelemetry(t *testing.T) {
 		DurationSec:    300,
 		Timestamp:      "2026-11-17T05:05:00Z",
 	})
-	if !strings.Contains(reminderText, "Slow Connection (180 ms, normal &lt; 150 ms)") ||
+	if !strings.Contains(reminderText, "— Ongoing (5m 00s)</b>") ||
+		!strings.Contains(reminderText, "Status:</b> 180 ms (Limit &lt; 150 ms)") ||
 		!strings.Contains(reminderText, "Elapsed:</b> 5m 00s (300s) | Peak: 420 ms") {
-		t.Fatalf("expected both current value (180 ms) and incident peak (420 ms) in reminder, got:\n%s", reminderText)
+		t.Fatalf("expected ongoing label, current value (180 ms), and incident peak (420 ms) in reminder, got:\n%s", reminderText)
 	}
 }
 
@@ -1130,7 +1150,7 @@ func TestEvaluatorPartialMultiChannelRetryAndPreMuteRecovery(t *testing.T) {
 
 	store := &fakeAlertStore{
 		probes:  []db.Probe{{ID: p1, Name: "Probe-JKT", Status: "online"}},
-		targets: []db.Target{{ID: t1, Name: "Edge-1", Host: "10.1.1.1", IntervalSec: 1, Enabled: true, AssignAllProbes: true}},
+		targets: []db.Target{{ID: t1, Name: "Edge-1", Host: "10.1.1.1", IntervalSec: 1, Enabled: true, AlertsEnabled: true, AssignAllProbes: true}},
 		channels: []db.AlertChannel{
 			{ID: uuid.New(), Type: "webhook", Name: "Discord", ConfigEncrypted: encWh, SeverityFilter: "all", Enabled: true},
 			{ID: uuid.New(), Type: "telegram", Name: "NOC Tg", ConfigEncrypted: encTg, SeverityFilter: "all", Enabled: true},
@@ -1259,6 +1279,7 @@ func TestLatencyP95AutoBestPathPerProbeResolution(t *testing.T) {
 			pSGP.String(): 40,
 		},
 		Enabled:         true,
+		AlertsEnabled:   true,
 		AssignAllProbes: true,
 	}
 
@@ -1359,11 +1380,292 @@ func TestLatencyP95AutoBestPathPerProbeResolution(t *testing.T) {
 	if len(tgMsgs) != 1 {
 		t.Fatalf("expected 1 Telegram alert from JKT dynamic best-path breach, got %d", len(tgMsgs))
 	}
-	if !strings.Contains(tgMsgs[0], "normal &lt; 23 ms") || strings.Contains(tgMsgs[0], "normal &lt; 0 ms") {
+	if !strings.Contains(tgMsgs[0], "Limit &lt; 23 ms") || strings.Contains(tgMsgs[0], "Limit &lt; 0 ms") {
 		t.Fatalf("expected Telegram message to display resolved 23 ms threshold (never 0 ms), got:\n%s", tgMsgs[0])
 	}
 	if len(store.incidents) != 1 || len(store.incidents[0].AffectedProbes) != 1 || store.incidents[0].AffectedProbes[0] != "Probe-JKT" {
 		t.Fatalf("expected only Probe-JKT to breach its threshold, got %+v", store.incidents)
+	}
+}
+
+func TestEvaluatorGlobalToggleAndTargetMonitoringOnly(t *testing.T) {
+	t.Parallel()
+
+	var tgCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tgCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":4242}}`))
+	}))
+	defer srv.Close()
+
+	aesKey := auth.DeriveAESKey("test-aes-secret-at-least-32-chars!!")
+	encTg, _ := auth.EncryptAESGCM(aesKey, []byte(`{"bot_token":"123:ABC","chat_id":"-1001"}`))
+
+	p1 := uuid.New()
+	g1 := uuid.New()
+	tMonitorOnly := uuid.New()
+	tAlerted := uuid.New()
+
+	store := &fakeAlertStore{
+		alertingDisabled: true,
+		probes: []db.Probe{
+			{ID: p1, Name: "Probe-JKT", Status: "online"},
+		},
+		targets: []db.Target{
+			{ID: tMonitorOnly, GroupID: &g1, Name: "Lab-Switch", Host: "10.0.0.10", IntervalSec: 5, Enabled: true, AlertsEnabled: false, AssignAllProbes: true},
+			{ID: tAlerted, GroupID: &g1, Name: "Core-Router", Host: "10.0.0.1", IntervalSec: 5, Enabled: true, AlertsEnabled: true, AssignAllProbes: true},
+		},
+		channels: []db.AlertChannel{
+			{ID: uuid.New(), Type: "telegram", Name: "NOC Tg", ConfigEncrypted: encTg, SeverityFilter: "all", Enabled: true},
+		},
+		rules: []db.AlertRule{
+			{ID: uuid.New(), Name: "Global Loss", Metric: "loss_pct", ThresholdValue: 20, DurationSec: 30, QuorumMinProbes: 1, ConfirmSec: 1, RecoverSec: 0, Enabled: true},
+			{ID: uuid.New(), Name: "Group Loss", GroupID: &g1, Metric: "loss_pct", ThresholdValue: 20, DurationSec: 30, QuorumMinProbes: 1, ConfirmSec: 1, RecoverSec: 0, Enabled: true},
+			{ID: uuid.New(), Name: "Single MonitorOnly Loss", TargetID: &tMonitorOnly, Metric: "loss_pct", ThresholdValue: 20, DurationSec: 30, QuorumMinProbes: 1, ConfirmSec: 1, RecoverSec: 0, Enabled: true},
+		},
+	}
+
+	t0 := time.Date(2026, 11, 19, 6, 0, 0, 0, time.UTC)
+	now := t0
+	cache := ingest.NewRollingCache(10 * time.Minute)
+	ev := NewEvaluator(store, cache, nil, NewNotifierWithHTTP(srv.Client(), srv.URL), aesKey, func() time.Time { return now })
+	ev.SetSyncDispatch(true)
+
+	// Both targets suffer 100% packet loss
+	for i := 0; i < 6; i++ {
+		ts := now.Add(-time.Duration(i*5) * time.Second)
+		cache.Add(p1, tMonitorOnly, ts, nil, 0, true, now)
+		cache.Add(p1, tAlerted, ts, nil, 0, true, now)
+	}
+
+	// 1. While global alerting_enabled == false: zero incidents & zero notifications
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("EvaluateOnce (disabled #1) failed: %v", err)
+	}
+	now = t0.Add(5 * time.Second)
+	for i := 0; i < 6; i++ {
+		ts := now.Add(-time.Duration(i*5) * time.Second)
+		cache.Add(p1, tMonitorOnly, ts, nil, 0, true, now)
+		cache.Add(p1, tAlerted, ts, nil, 0, true, now)
+	}
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("EvaluateOnce (disabled #2) failed: %v", err)
+	}
+	if len(store.incidents) != 0 || tgCalls.Load() != 0 {
+		t.Fatalf("expected 0 incidents and 0 notifications while alerting_enabled=false, got incidents=%d tg=%d", len(store.incidents), tgCalls.Load())
+	}
+
+	// 2. Re-enable global alerting: tAlerted fires on Global + Group rules, while tMonitorOnly is skipped on Global, Group, AND Single-Target rules
+	store.alertingDisabled = false
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("EvaluateOnce (enabled #1) failed: %v", err)
+	}
+	now = now.Add(2 * time.Second)
+	for i := 0; i < 6; i++ {
+		ts := now.Add(-time.Duration(i*5) * time.Second)
+		cache.Add(p1, tMonitorOnly, ts, nil, 0, true, now)
+		cache.Add(p1, tAlerted, ts, nil, 0, true, now)
+	}
+	if err := ev.EvaluateOnce(context.Background()); err != nil {
+		t.Fatalf("EvaluateOnce (enabled #2) failed: %v", err)
+	}
+
+	if len(store.incidents) != 2 {
+		t.Fatalf("expected exactly 2 incidents (Global + Group for Core-Router only), got %d: %+v", len(store.incidents), store.incidents)
+	}
+	for _, inc := range store.incidents {
+		if inc.TargetID == nil || *inc.TargetID != tAlerted {
+			t.Fatalf("expected only Core-Router to open incidents, got incident for target %v", inc.TargetID)
+		}
+	}
+	if tgCalls.Load() != 2 {
+		t.Fatalf("expected 2 telegram alerts for Core-Router, got %d", tgCalls.Load())
+	}
+}
+
+func TestTelegramLiveStatusPeakRTTAndDirectZoomLink(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var tgMsgs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		txt, _ := body["text"].(string)
+		mu.Lock()
+		tgMsgs = append(tgMsgs, txt)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":8080}}`))
+	}))
+	defer srv.Close()
+
+	aesKey := auth.DeriveAESKey("test-aes-secret-at-least-32-chars!!")
+	encTg, _ := auth.EncryptAESGCM(aesKey, []byte(`{"bot_token":"123:ABC","chat_id":"-1001"}`))
+
+	p1 := uuid.New()
+	g1 := uuid.New()
+	t1 := uuid.New()
+	t0 := time.Date(2026, 11, 19, 7, 0, 0, 0, time.UTC)
+	now := t0
+
+	store := &fakeAlertStore{
+		probes: []db.Probe{{ID: p1, Name: "Localhost", Status: "online"}},
+		groups: []db.TargetGroup{{ID: g1, Name: "Public DNS"}},
+		targets: []db.Target{
+			{
+				ID:              t1,
+				GroupID:         &g1,
+				Name:            "Cloudflare DNS",
+				Host:            "1.1.1.1",
+				ProbeType:       "icmp",
+				IntervalSec:     5,
+				TimeoutMs:       1000,
+				Enabled:         true,
+				AlertsEnabled:   true,
+				AssignAllProbes: true,
+			},
+		},
+		channels: []db.AlertChannel{
+			{ID: uuid.New(), Type: "telegram", Name: "LAB VI", ConfigEncrypted: encTg, SeverityFilter: "all", Enabled: true},
+		},
+		rules: []db.AlertRule{
+			{
+				ID:              uuid.New(),
+				Name:            "Global Loss Check",
+				Metric:          "loss_pct",
+				ThresholdValue:  20,
+				DurationSec:     30,
+				QuorumMinProbes: 1,
+				ConfirmSec:      1,
+				RecoverSec:      0,
+				Enabled:         true,
+			},
+		},
+		mtrSnapshots: map[uuid.UUID][]db.MTRSnapshot{
+			t1: {
+				{
+					CapturedAt: t0.Add(3 * time.Second),
+					Hops: []protocol.MTRHop{
+						{Hop: 4, Host: "ae1.core.jkt", IP: "103.10.10.1", LossPct: 60, AvgUs: 84500},
+					},
+				},
+			},
+		},
+	}
+
+	cache := ingest.NewRollingCache(10 * time.Minute)
+	baseRTT := int32(2000) // 2 ms baseline
+	for i := 0; i < 15; i++ {
+		cache.Add(p1, t1, t0.Add(-3*time.Minute+time.Duration(i)*5*time.Second), &baseRTT, 100, false, now)
+	}
+
+	ev := NewEvaluator(store, cache, nil, NewNotifierWithHTTP(srv.Client(), srv.URL), aesKey, func() time.Time { return now })
+	ev.SetSyncDispatch(true)
+	ev.SetPublicBaseURL("https://smoker.noc.local/")
+
+	// Trigger DOWN (100% loss)
+	for i := 0; i < 6; i++ {
+		cache.Add(p1, t1, now.Add(-time.Duration(i*5)*time.Second), nil, 0, true, now)
+	}
+	_ = ev.EvaluateOnce(context.Background())
+	now = t0.Add(2 * time.Second)
+	for i := 0; i < 6; i++ {
+		cache.Add(p1, t1, now.Add(-time.Duration(i*5)*time.Second), nil, 0, true, now)
+	}
+	_ = ev.EvaluateOnce(context.Background())
+
+	// Recover to 2 ms
+	now = t0.Add(60 * time.Second)
+	for i := 0; i < 6; i++ {
+		cache.Add(p1, t1, now.Add(-time.Duration(i*5)*time.Second), &baseRTT, 100, false, now)
+	}
+	_ = ev.EvaluateOnce(context.Background())
+
+	if len(tgMsgs) != 2 {
+		t.Fatalf("expected 2 telegram alerts (DOWN + OK), got %d", len(tgMsgs))
+	}
+
+	downTxt := tgMsgs[0]
+	okTxt := tgMsgs[1]
+	wantLink := `<a href="https://smoker.noc.local/?zoom=` + t1.String() + `">Open Live Graph</a>`
+
+	if !strings.Contains(downTxt, "❌ <b>[DOWN] Cloudflare DNS — Connection Down</b>") ||
+		!strings.Contains(downTxt, "<b>Status:</b> 100% loss (No reply · Base 2 ms)") ||
+		!strings.Contains(downTxt, "<b>Target:</b> <code>1.1.1.1</code> · ICMP · Public DNS") ||
+		!strings.Contains(downTxt, wantLink) ||
+		strings.Contains(downTxt, "Incident History") ||
+		strings.Contains(downTxt, "/alerts") {
+		t.Fatalf("unexpected DOWN message:\n%s", downTxt)
+	}
+
+	if !strings.Contains(okTxt, "✅ <b>[OK] Cloudflare DNS — Connection Restored</b>") ||
+		!strings.Contains(okTxt, "<b>Status:</b> 2 ms (0% loss · Base 2 ms)") ||
+		!strings.Contains(okTxt, "<b>Target:</b> <code>1.1.1.1</code> · ICMP · Public DNS") ||
+		!strings.Contains(okTxt, "<b>MTR Hop:</b> #4 ae1.core.jkt (<code>103.10.10.1</code>) — 60% loss, 84.5 ms") ||
+		!strings.Contains(okTxt, wantLink) ||
+		strings.Contains(okTxt, "Incident History") ||
+		strings.Contains(okTxt, "P95") ||
+		strings.Contains(okTxt, "P50") {
+		t.Fatalf("unexpected OK message:\n%s", okTxt)
+	}
+
+	// Verify WARN latency uses familiar Peak RTT & Avg terms (never P95 / P50) + Multi-Probe [OK] Current Probes
+	warnLatencyTxt := FormatTelegramHTML(AlertMessage{
+		Status:         "FIRING",
+		Severity:       "warn",
+		RuleName:       "Cloudflare RTT",
+		TargetID:       &t1,
+		TargetName:     "Cloudflare DNS",
+		TargetHost:     "1.1.1.1",
+		TargetProtocol: "ICMP",
+		GroupName:      "Public DNS",
+		Metric:         "latency_p95",
+		Value:          42,
+		Threshold:      17,
+		QuorumCount:    1,
+		QuorumRequired: 1,
+		TotalProbes:    1,
+		AffectedProbes: []string{"Localhost"},
+		ProbeBreakdown: []ProbeAlertStat{
+			{ProbeName: "Localhost", P50Ms: 38, P95Ms: 42, BaselineMs: 2, AvgJitterMs: 6, LossPct: 0},
+		},
+		StartedAt: "2026-11-19T07:05:00Z",
+		Timestamp: "2026-11-19T07:05:00Z",
+	})
+	if !strings.Contains(warnLatencyTxt, "<b>Status:</b> 42 ms (Avg 38 ms · 0% loss · Base 2 ms · Limit &lt; 17 ms)") ||
+		!strings.Contains(warnLatencyTxt, "<b>Probe:</b> Localhost (Peak RTT 42 ms, Base 2 ms, jitter 6 ms)") ||
+		strings.Contains(warnLatencyTxt, "P95") ||
+		strings.Contains(warnLatencyTxt, "P50") {
+		t.Fatalf("unexpected WARN latency message:\n%s", warnLatencyTxt)
+	}
+
+	multiOkTxt := FormatTelegramHTML(AlertMessage{
+		Status:         "RESOLVED",
+		Severity:       "ok",
+		RuleName:       "Global Loss Check",
+		TargetID:       &t1,
+		TargetName:     "Cloudflare DNS",
+		TargetHost:     "1.1.1.1",
+		TargetProtocol: "ICMP",
+		GroupName:      "Public DNS",
+		Metric:         "loss_pct",
+		PeakValue:      100,
+		TotalProbes:    2,
+		AffectedProbes: []string{"Probe-JKT", "Probe-SGP"},
+		CurrentProbes: []ProbeAlertStat{
+			{ProbeName: "Probe-JKT", P50Ms: 2.0, BaselineMs: 2.0, LossPct: 0},
+			{ProbeName: "Probe-SGP", P50Ms: 18.0, BaselineMs: 17.0, LossPct: 0},
+		},
+		StartedAt:   "2026-11-19T07:00:00Z",
+		ResolvedAt:  "2026-11-19T07:02:00Z",
+		DurationSec: 120,
+		Timestamp:   "2026-11-19T07:02:00Z",
+	})
+	if !strings.Contains(multiOkTxt, "<b>Status:</b> 2–18 ms (0% loss · 2/2 probes normal)") ||
+		!strings.Contains(multiOkTxt, "<b>Current Probes:</b>\n• Probe-JKT: 2 ms (0% loss · Base 2 ms)\n• Probe-SGP: 18 ms (0% loss · Base 17 ms)") {
+		t.Fatalf("unexpected Multi-Probe OK message:\n%s", multiOkTxt)
 	}
 }
 

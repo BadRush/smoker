@@ -59,6 +59,14 @@ func TestRollingCacheSparklineAndStatus(t *testing.T) {
 	if cell.WarnMs == nil || *cell.WarnMs <= 0 {
 		t.Fatalf("expected WarnMs > 0, got %v", cell.WarnMs)
 	}
+
+	ws := cache.WindowStats(targetID, probeID, 60*time.Second, now)
+	if ws.P50Ms < 10 || ws.P50Ms > 14 {
+		t.Fatalf("expected WindowStats.P50Ms in [10,14], got %v", ws.P50Ms)
+	}
+	if ws.LastRTTMs != 10 {
+		t.Fatalf("expected WindowStats.LastRTTMs=10 (most recent sample i=0), got %v", ws.LastRTTMs)
+	}
 }
 
 func TestRollingCacheMultiProbeAutoBaselineAndSimulation(t *testing.T) {

@@ -158,10 +158,11 @@ detect_roles() {
 
   local has_central="false"
   local has_probe="false"
-  if [[ -f "${ROOT_DIR}/.env" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qE '^smoker-(central|db|web|gateway)$'; then
+  if [[ -f "${ROOT_DIR}/.env" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | awk '/^smoker-(central|db|web|gateway)$/ { found=1 } END { exit !found }'; then
     has_central="true"
   fi
-  if [[ -n "$(list_probe_env_files)" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qE '^smoker-probe($|-)'; then
+  # Exclude built-in 'smoker-probe-local' (managed by Central compose) when detecting standalone Remote Probe containers
+  if [[ -n "$(list_probe_env_files)" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | awk '/^smoker-probe($|-)/ && $0 != "smoker-probe-local" { found=1 } END { exit !found }'; then
     has_probe="true"
   fi
 

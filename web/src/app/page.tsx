@@ -279,9 +279,35 @@ export default function MatrixWallPage() {
   );
   const [showLayoutCustomizer, setShowLayoutCustomizer] = useState(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const handledZoomQueryRef = useRef(false);
 
   useEffect(() => {
     setDashboardLayout(loadDashboardLayout());
+  }, []);
+
+  useEffect(() => {
+    if (handledZoomQueryRef.current || !data || typeof window === "undefined") return;
+    const zId = new URLSearchParams(window.location.search).get("zoom");
+    handledZoomQueryRef.current = true;
+    if (zId && data.targets.some((t) => t.id === zId)) {
+      setZoomTargetId(zId);
+    }
+  }, [data]);
+
+  const handleCloseZoom = useCallback(() => {
+    setZoomTargetId(null);
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      if (params.has("zoom")) {
+        params.delete("zoom");
+        const qs = params.toString();
+        window.history.replaceState(
+          null,
+          "",
+          qs ? `${window.location.pathname}?${qs}` : window.location.pathname
+        );
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -329,7 +355,8 @@ export default function MatrixWallPage() {
       setData(snap);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
-        router.replace("/login");
+        const qs = typeof window !== "undefined" ? window.location.search : "";
+        router.replace(qs ? `/login?next=${encodeURIComponent(`/${qs}`)}` : "/login");
         return;
       }
       setError(err instanceof Error ? err.message : "Failed to load matrix");
@@ -1247,7 +1274,7 @@ export default function MatrixWallPage() {
               cells={data.cells}
               probeMap={probeMap}
               initialRange="3h"
-              onClose={() => setZoomTargetId(null)}
+              onClose={handleCloseZoom}
             />
           );
         })()}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -60,10 +61,18 @@ type Store interface {
 
 	ListIncidents(ctx context.Context, limit int) ([]db.Incident, error)
 	AcknowledgeIncident(ctx context.Context, id uuid.UUID, ackBy string, now time.Time) (db.Incident, error)
+	CloseIncidentByID(ctx context.Context, id uuid.UUID, closedBy string, now time.Time) (db.Incident, error)
+	ClearIncidents(ctx context.Context, includeOpen bool) (int64, error)
 	CountOpenIncidents(ctx context.Context) (int, error)
 
 	GetSettings(ctx context.Context) (db.SystemSettings, error)
-	UpdateSettingsAndRetention(ctx context.Context, rawDays, aggDays, defaultQuorum int, brandName string) (db.SystemSettings, error)
+	SetAlertingEnabled(ctx context.Context, enabled bool) (db.SystemSettings, error)
+	UpdateSettingsAndRetention(ctx context.Context, rawDays, aggDays, defaultQuorum int, brandName string, alertingEnabled *bool) (db.SystemSettings, error)
+
+	ListTVPresets(ctx context.Context) ([]db.TVPreset, error)
+	CreateTVPreset(ctx context.Context, in db.TVPresetInput) (db.TVPreset, error)
+	UpdateTVPreset(ctx context.Context, id uuid.UUID, in db.TVPresetInput) (db.TVPreset, error)
+	DeleteTVPreset(ctx context.Context, id uuid.UUID) error
 }
 
 type HubController interface {
@@ -85,24 +94,29 @@ type Dependencies struct {
 }
 
 type Server struct {
-	cfg      config.CentralConfig
-	store    Store
-	cache    *ingest.RollingCache
-	hub      HubController
-	notifier *alerts.Notifier
-	aesKey   []byte
-	limiter  *auth.LoginRateLimiter
+	cfg           config.CentralConfig
+	store         Store
+	cache         *ingest.RollingCache
+	hub           HubController
+	notifier      *alerts.Notifier
+	aesKey        []byte
+	limiter       *auth.LoginRateLimiter
+	tvMTRMu       sync.Mutex
+	tvMTRLastRun  map[uuid.UUID]time.Time
+	tvMTRCooldown time.Duration
 }
 
 func NewRouter(deps Dependencies) http.Handler {
 	s := &Server{
-		cfg:      deps.Config,
-		store:    deps.Store,
-		cache:    deps.Cache,
-		hub:      deps.Hub,
-		notifier: deps.Notifier,
-		aesKey:   deps.AESKey,
-		limiter:  auth.NewLoginRateLimiter(12, time.Minute),
+		cfg:           deps.Config,
+		store:         deps.Store,
+		cache:         deps.Cache,
+		hub:           deps.Hub,
+		notifier:      deps.Notifier,
+		aesKey:        deps.AESKey,
+		limiter:       auth.NewLoginRateLimiter(12, time.Minute),
+		tvMTRLastRun:  make(map[uuid.UUID]time.Time),
+		tvMTRCooldown: 30 * time.Second,
 	}
 
 	r := chi.NewRouter()
@@ -130,16 +144,16 @@ func NewRouter(deps Dependencies) http.Handler {
 		r.Get("/ws/live", s.hub.HandleLiveWS)
 	}
 
-	// Public Auth & Read-Only TV Kiosk Routes
+	// Public Auth & TV Kiosk Routes
 	r.Post("/api/auth/login", s.handleLogin)
 	r.Post("/api/auth/logout", s.handleLogout)
 	r.Get("/api/tv/matrix", s.handleGetTVMatrix)
 	r.Get("/api/tv/series", s.handleGetTVSeries)
+	r.Get("/api/tv/presets", s.handleListTVPresets)
 	r.Get("/api/tv/targets/{id}/mtr", s.handleListTVTargetMTR)
 	r.Post("/api/tv/targets/{id}/mtr/run", s.handleTriggerTVTargetMTR)
-	r.Post("/api/targets/{id}/simulate", s.handleSimulateTarget)
 
-	// Protected API Routes
+	// Protected API Routes (Admin-only)
 	r.Group(func(pr chi.Router) {
 		pr.Use(s.requireAuth)
 
@@ -147,6 +161,10 @@ func NewRouter(deps Dependencies) http.Handler {
 		pr.Put("/api/auth/password", s.handleUpdatePassword)
 
 		pr.Get("/api/matrix", s.handleGetMatrix)
+
+		pr.Post("/api/tv/presets", s.handleCreateTVPreset)
+		pr.Put("/api/tv/presets/{id}", s.handleUpdateTVPreset)
+		pr.Delete("/api/tv/presets/{id}", s.handleDeleteTVPreset)
 
 		pr.Get("/api/probes", s.handleListProbes)
 		pr.Post("/api/probes", s.handleCreateProbe)
@@ -165,6 +183,7 @@ func NewRouter(deps Dependencies) http.Handler {
 		pr.Get("/api/targets/{id}", s.handleGetTarget)
 		pr.Put("/api/targets/{id}", s.handleUpdateTarget)
 		pr.Post("/api/targets/{id}/mute", s.handleMuteTarget)
+		pr.Post("/api/targets/{id}/simulate", s.handleSimulateTarget)
 		pr.Delete("/api/targets/{id}", s.handleDeleteTarget)
 		pr.Get("/api/targets/{id}/series", s.handleGetTargetSeries)
 		pr.Get("/api/targets/{id}/mtr", s.handleListTargetMTR)
@@ -181,9 +200,13 @@ func NewRouter(deps Dependencies) http.Handler {
 		pr.Delete("/api/alerts/channels/{id}", s.handleDeleteAlertChannel)
 		pr.Post("/api/alerts/channels/{id}/test", s.handleTestAlertChannel)
 
+		pr.Put("/api/alerts/status", s.handleSetAlertingStatus)
 		pr.Get("/api/alerts/incidents", s.handleListIncidents)
+		pr.Delete("/api/alerts/incidents", s.handleClearIncidents)
 		pr.Post("/api/alerts/incidents/{id}/ack", s.handleAcknowledgeIncident)
 		pr.Post("/api/alerts/incidents/{id}/acknowledge", s.handleAcknowledgeIncident)
+		pr.Post("/api/alerts/incidents/{id}/close", s.handleCloseIncident)
+		pr.Post("/api/alerts/incidents/{id}/resolve", s.handleCloseIncident)
 
 		pr.Get("/api/settings", s.handleGetSettings)
 		pr.Put("/api/settings", s.handleUpdateSettings)

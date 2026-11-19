@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -102,8 +103,9 @@ func (s *Store) EnsureBootstrap(ctx context.Context, cfg config.CentralConfig) e
 
 	if _, err := s.pool.Exec(ctx, `
 		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS brand_name TEXT NOT NULL DEFAULT '';
-		INSERT INTO system_settings (id, raw_retention_days, agg_retention_days, default_quorum_min, brand_name, updated_at)
-		VALUES (1, 14, 730, 2, '', NOW())
+		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS alerting_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+		INSERT INTO system_settings (id, raw_retention_days, agg_retention_days, default_quorum_min, brand_name, alerting_enabled, updated_at)
+		VALUES (1, 14, 730, 2, '', TRUE, NOW())
 		ON CONFLICT (id) DO NOTHING;
 		ALTER TABLE mtr_snapshots DROP CONSTRAINT IF EXISTS mtr_snapshots_trigger_reason_check;
 		ALTER TABLE mtr_snapshots ADD CONSTRAINT mtr_snapshots_trigger_reason_check CHECK (trigger_reason IN ('auto_loss', 'auto_latency', 'manual'));
@@ -113,6 +115,19 @@ func (s *Store) EnsureBootstrap(ctx context.Context, cfg config.CentralConfig) e
 		ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ;
 		ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_by TEXT NOT NULL DEFAULT '';
 		ALTER TABLE targets ADD COLUMN IF NOT EXISTS muted_until TIMESTAMPTZ;
+		ALTER TABLE targets ADD COLUMN IF NOT EXISTS alerts_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+		CREATE TABLE IF NOT EXISTS tv_presets (
+			id         UUID PRIMARY KEY,
+			slug       TEXT NOT NULL UNIQUE,
+			name       TEXT NOT NULL,
+			config     JSONB NOT NULL DEFAULT '{}'::jsonb,
+			is_default BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_tv_presets_single_default
+			ON tv_presets (is_default)
+			WHERE is_default = TRUE;
 	`); err != nil {
 		return fmt.Errorf("seed system_settings: %w", err)
 	}
@@ -428,6 +443,7 @@ type TargetInput struct {
 	IntervalSec           int
 	TimeoutMs             int
 	Enabled               bool
+	AlertsEnabled         bool
 	AutoMTROnLoss         bool
 	MTRLossThreshold      int
 	AssignAllProbes       bool
@@ -440,7 +456,7 @@ type TargetInput struct {
 func (s *Store) ListTargets(ctx context.Context) ([]Target, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT t.id, t.group_id, t.name, t.host, t.probe_type, t.port_or_path,
-		       t.interval_sec, t.timeout_ms, t.enabled, t.auto_mtr_on_loss,
+		       t.interval_sec, t.timeout_ms, t.enabled, t.alerts_enabled, t.auto_mtr_on_loss,
 		       t.mtr_loss_threshold, t.assign_all_probes, t.pinned_on_tv,
 		       t.latency_warn_ms, t.probe_latency_overrides, t.muted_until, t.created_at, t.updated_at,
 		       COALESCE(ARRAY(SELECT pta.probe_id FROM probe_target_assignments pta WHERE pta.target_id = t.id), '{}')
@@ -458,7 +474,7 @@ func (s *Store) ListTargets(ctx context.Context) ([]Target, error) {
 		var overridesRaw []byte
 		if err := rows.Scan(
 			&t.ID, &t.GroupID, &t.Name, &t.Host, &t.ProbeType, &t.PortOrPath,
-			&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AutoMTROnLoss,
+			&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AlertsEnabled, &t.AutoMTROnLoss,
 			&t.MTRLossThreshold, &t.AssignAllProbes, &t.PinnedOnTV,
 			&t.LatencyWarnMs, &overridesRaw, &t.MutedUntil, &t.CreatedAt, &t.UpdatedAt, &t.ProbeIDs,
 		); err != nil {
@@ -481,7 +497,7 @@ func (s *Store) GetTarget(ctx context.Context, id uuid.UUID) (Target, error) {
 	var overridesRaw []byte
 	err := s.pool.QueryRow(ctx, `
 		SELECT t.id, t.group_id, t.name, t.host, t.probe_type, t.port_or_path,
-		       t.interval_sec, t.timeout_ms, t.enabled, t.auto_mtr_on_loss,
+		       t.interval_sec, t.timeout_ms, t.enabled, t.alerts_enabled, t.auto_mtr_on_loss,
 		       t.mtr_loss_threshold, t.assign_all_probes, t.pinned_on_tv,
 		       t.latency_warn_ms, t.probe_latency_overrides, t.muted_until, t.created_at, t.updated_at,
 		       COALESCE(ARRAY(SELECT pta.probe_id FROM probe_target_assignments pta WHERE pta.target_id = t.id), '{}')
@@ -489,7 +505,7 @@ func (s *Store) GetTarget(ctx context.Context, id uuid.UUID) (Target, error) {
 		WHERE t.id = $1
 	`, id).Scan(
 		&t.ID, &t.GroupID, &t.Name, &t.Host, &t.ProbeType, &t.PortOrPath,
-		&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AutoMTROnLoss,
+		&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AlertsEnabled, &t.AutoMTROnLoss,
 		&t.MTRLossThreshold, &t.AssignAllProbes, &t.PinnedOnTV,
 		&t.LatencyWarnMs, &overridesRaw, &t.MutedUntil, &t.CreatedAt, &t.UpdatedAt, &t.ProbeIDs,
 	)
@@ -527,20 +543,20 @@ func (s *Store) CreateTarget(ctx context.Context, in TargetInput) (Target, error
 	var overridesRaw []byte
 	err = tx.QueryRow(ctx, `
 		INSERT INTO targets (id, group_id, name, host, probe_type, port_or_path,
-		                     interval_sec, timeout_ms, enabled, auto_mtr_on_loss,
+		                     interval_sec, timeout_ms, enabled, alerts_enabled, auto_mtr_on_loss,
 		                     mtr_loss_threshold, assign_all_probes, pinned_on_tv,
 		                     latency_warn_ms, probe_latency_overrides)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING id, group_id, name, host, probe_type, port_or_path,
-		          interval_sec, timeout_ms, enabled, auto_mtr_on_loss,
+		          interval_sec, timeout_ms, enabled, alerts_enabled, auto_mtr_on_loss,
 		          mtr_loss_threshold, assign_all_probes, pinned_on_tv,
 		          latency_warn_ms, probe_latency_overrides, muted_until, created_at, updated_at
 	`, id, in.GroupID, in.Name, in.Host, in.ProbeType, in.PortOrPath,
-		in.IntervalSec, in.TimeoutMs, in.Enabled, in.AutoMTROnLoss,
+		in.IntervalSec, in.TimeoutMs, in.Enabled, in.AlertsEnabled, in.AutoMTROnLoss,
 		in.MTRLossThreshold, in.AssignAllProbes, in.PinnedOnTV,
 		in.LatencyWarnMs, overridesJSON).Scan(
 		&t.ID, &t.GroupID, &t.Name, &t.Host, &t.ProbeType, &t.PortOrPath,
-		&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AutoMTROnLoss,
+		&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AlertsEnabled, &t.AutoMTROnLoss,
 		&t.MTRLossThreshold, &t.AssignAllProbes, &t.PinnedOnTV,
 		&t.LatencyWarnMs, &overridesRaw, &t.MutedUntil, &t.CreatedAt, &t.UpdatedAt,
 	)
@@ -590,20 +606,20 @@ func (s *Store) UpdateTarget(ctx context.Context, id uuid.UUID, in TargetInput) 
 	err = tx.QueryRow(ctx, `
 		UPDATE targets
 		SET group_id = $2, name = $3, host = $4, probe_type = $5, port_or_path = $6,
-		    interval_sec = $7, timeout_ms = $8, enabled = $9, auto_mtr_on_loss = $10,
-		    mtr_loss_threshold = $11, assign_all_probes = $12, pinned_on_tv = $13,
-		    latency_warn_ms = $14, probe_latency_overrides = $15, updated_at = NOW()
+		    interval_sec = $7, timeout_ms = $8, enabled = $9, alerts_enabled = $10, auto_mtr_on_loss = $11,
+		    mtr_loss_threshold = $12, assign_all_probes = $13, pinned_on_tv = $14,
+		    latency_warn_ms = $15, probe_latency_overrides = $16, updated_at = NOW()
 		WHERE id = $1
 		RETURNING id, group_id, name, host, probe_type, port_or_path,
-		          interval_sec, timeout_ms, enabled, auto_mtr_on_loss,
+		          interval_sec, timeout_ms, enabled, alerts_enabled, auto_mtr_on_loss,
 		          mtr_loss_threshold, assign_all_probes, pinned_on_tv,
 		          latency_warn_ms, probe_latency_overrides, muted_until, created_at, updated_at
 	`, id, in.GroupID, in.Name, in.Host, in.ProbeType, in.PortOrPath,
-		in.IntervalSec, in.TimeoutMs, in.Enabled, in.AutoMTROnLoss,
+		in.IntervalSec, in.TimeoutMs, in.Enabled, in.AlertsEnabled, in.AutoMTROnLoss,
 		in.MTRLossThreshold, in.AssignAllProbes, in.PinnedOnTV,
 		in.LatencyWarnMs, overridesJSON).Scan(
 		&t.ID, &t.GroupID, &t.Name, &t.Host, &t.ProbeType, &t.PortOrPath,
-		&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AutoMTROnLoss,
+		&t.IntervalSec, &t.TimeoutMs, &t.Enabled, &t.AlertsEnabled, &t.AutoMTROnLoss,
 		&t.MTRLossThreshold, &t.AssignAllProbes, &t.PinnedOnTV,
 		&t.LatencyWarnMs, &overridesRaw, &t.MutedUntil, &t.CreatedAt, &t.UpdatedAt,
 	)
@@ -627,6 +643,16 @@ func (s *Store) UpdateTarget(ctx context.Context, id uuid.UUID, in TargetInput) 
 		t.ProbeIDs = in.ProbeIDs
 	} else {
 		t.ProbeIDs = []uuid.UUID{}
+	}
+
+	if !in.AlertsEnabled {
+		if _, err := tx.Exec(ctx, `
+			UPDATE incidents
+			SET status = 'resolved', resolved_at = COALESCE(resolved_at, NOW())
+			WHERE target_id = $1 AND status = 'open'
+		`, id); err != nil {
+			return Target{}, err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1232,25 +1258,91 @@ func (s *Store) AcknowledgeIncident(ctx context.Context, id uuid.UUID, ackBy str
 	return inc, nil
 }
 
+func (s *Store) CloseIncidentByID(ctx context.Context, id uuid.UUID, closedBy string, now time.Time) (Incident, error) {
+	if strings.TrimSpace(closedBy) == "" {
+		closedBy = "admin"
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var inc Incident
+	var rawProbes, rawMsgIDs []byte
+	err := s.pool.QueryRow(ctx, `
+		UPDATE incidents i
+		SET status = 'resolved',
+		    resolved_at = COALESCE(i.resolved_at, $2),
+		    summary = CASE
+		        WHEN i.summary = '' THEN 'Manually closed by ' || $3
+		        WHEN POSITION('Manually closed by ' IN i.summary) > 0 THEN i.summary
+		        ELSE i.summary || ' (Manually closed by ' || $3 || ')'
+		    END
+		WHERE i.id = $1 AND i.status = 'open'
+		RETURNING i.id, i.rule_id,
+		          COALESCE((SELECT r.name FROM alert_rules r WHERE r.id = i.rule_id), 'Deleted Rule'),
+		          i.target_id,
+		          COALESCE((SELECT t.name FROM targets t WHERE t.id = i.target_id), 'Fleet / System'),
+		          i.status, i.severity, i.affected_probes, i.peak_value, i.started_at, i.resolved_at,
+		          i.last_notified_at, COALESCE(i.notified_severity, ''), COALESCE(i.telegram_message_ids, '{}'::jsonb),
+		          i.acknowledged_at, COALESCE(i.acknowledged_by, ''), i.summary
+	`, id, now, closedBy).Scan(
+		&inc.ID, &inc.RuleID, &inc.RuleName, &inc.TargetID, &inc.TargetName,
+		&inc.Status, &inc.Severity, &rawProbes, &inc.PeakValue, &inc.StartedAt, &inc.ResolvedAt,
+		&inc.LastNotifiedAt, &inc.NotifiedSeverity, &rawMsgIDs,
+		&inc.AcknowledgedAt, &inc.AcknowledgedBy, &inc.Summary,
+	)
+	if err != nil {
+		return Incident{}, mapPGError(err)
+	}
+	if err := json.Unmarshal(rawProbes, &inc.AffectedProbes); err != nil {
+		inc.AffectedProbes = []string{}
+	}
+	inc.TelegramMessageIDs = decodeTelegramMessageIDs(rawMsgIDs)
+	return inc, nil
+}
+
+func (s *Store) ClearIncidents(ctx context.Context, includeOpen bool) (int64, error) {
+	query := `DELETE FROM incidents WHERE status = 'resolved'`
+	if includeOpen {
+		query = `DELETE FROM incidents`
+	}
+	tag, err := s.pool.Exec(ctx, query)
+	if err != nil {
+		return 0, mapPGError(err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // --- Settings & Retention ---
 
 func (s *Store) GetSettings(ctx context.Context) (SystemSettings, error) {
 	var st SystemSettings
 	err := s.pool.QueryRow(ctx, `
-		SELECT raw_retention_days, agg_retention_days, default_quorum_min, COALESCE(brand_name, ''), updated_at
+		SELECT raw_retention_days, agg_retention_days, default_quorum_min, COALESCE(brand_name, ''), alerting_enabled, updated_at
 		FROM system_settings WHERE id = 1
-	`).Scan(&st.RawRetentionDays, &st.AggRetentionDays, &st.DefaultQuorumMin, &st.BrandName, &st.UpdatedAt)
+	`).Scan(&st.RawRetentionDays, &st.AggRetentionDays, &st.DefaultQuorumMin, &st.BrandName, &st.AlertingEnabled, &st.UpdatedAt)
 	return st, mapPGError(err)
 }
 
-func (s *Store) UpdateSettingsAndRetention(ctx context.Context, rawDays, aggDays, defaultQuorum int, brandName string) (SystemSettings, error) {
+func (s *Store) SetAlertingEnabled(ctx context.Context, enabled bool) (SystemSettings, error) {
 	var st SystemSettings
 	err := s.pool.QueryRow(ctx, `
 		UPDATE system_settings
-		SET raw_retention_days = $1, agg_retention_days = $2, default_quorum_min = $3, brand_name = $4, updated_at = NOW()
+		SET alerting_enabled = $1, updated_at = NOW()
 		WHERE id = 1
-		RETURNING raw_retention_days, agg_retention_days, default_quorum_min, COALESCE(brand_name, ''), updated_at
-	`, rawDays, aggDays, defaultQuorum, brandName).Scan(&st.RawRetentionDays, &st.AggRetentionDays, &st.DefaultQuorumMin, &st.BrandName, &st.UpdatedAt)
+		RETURNING raw_retention_days, agg_retention_days, default_quorum_min, COALESCE(brand_name, ''), alerting_enabled, updated_at
+	`, enabled).Scan(&st.RawRetentionDays, &st.AggRetentionDays, &st.DefaultQuorumMin, &st.BrandName, &st.AlertingEnabled, &st.UpdatedAt)
+	return st, mapPGError(err)
+}
+
+func (s *Store) UpdateSettingsAndRetention(ctx context.Context, rawDays, aggDays, defaultQuorum int, brandName string, alertingEnabled *bool) (SystemSettings, error) {
+	var st SystemSettings
+	err := s.pool.QueryRow(ctx, `
+		UPDATE system_settings
+		SET raw_retention_days = $1, agg_retention_days = $2, default_quorum_min = $3, brand_name = $4,
+		    alerting_enabled = COALESCE($5, alerting_enabled), updated_at = NOW()
+		WHERE id = 1
+		RETURNING raw_retention_days, agg_retention_days, default_quorum_min, COALESCE(brand_name, ''), alerting_enabled, updated_at
+	`, rawDays, aggDays, defaultQuorum, brandName, alertingEnabled).Scan(&st.RawRetentionDays, &st.AggRetentionDays, &st.DefaultQuorumMin, &st.BrandName, &st.AlertingEnabled, &st.UpdatedAt)
 	if err != nil {
 		return st, mapPGError(err)
 	}
@@ -1278,4 +1370,127 @@ func (s *Store) UpdateSettingsAndRetention(ctx context.Context, rawDays, aggDays
 	}
 
 	return st, nil
+}
+
+// --- TV Display Presets ---
+
+type TVPresetInput struct {
+	Slug      string
+	Name      string
+	Config    json.RawMessage
+	IsDefault bool
+}
+
+func (s *Store) ListTVPresets(ctx context.Context) ([]TVPreset, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, slug, name, COALESCE(config, '{}'::jsonb), is_default, created_at, updated_at
+		FROM tv_presets
+		ORDER BY is_default DESC, name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]TVPreset, 0)
+	for rows.Next() {
+		var p TVPreset
+		var rawCfg []byte
+		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &rawCfg, &p.IsDefault, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if len(rawCfg) == 0 {
+			rawCfg = []byte("{}")
+		}
+		p.Config = json.RawMessage(rawCfg)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CreateTVPreset(ctx context.Context, in TVPresetInput) (TVPreset, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return TVPreset{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if in.IsDefault {
+		if _, err := tx.Exec(ctx, `UPDATE tv_presets SET is_default = FALSE WHERE is_default = TRUE`); err != nil {
+			return TVPreset{}, mapPGError(err)
+		}
+	}
+	cfgBytes := in.Config
+	if len(cfgBytes) == 0 {
+		cfgBytes = json.RawMessage(`{}`)
+	}
+
+	var p TVPreset
+	var rawCfg []byte
+	id := newUUIDv7()
+	err = tx.QueryRow(ctx, `
+		INSERT INTO tv_presets (id, slug, name, config, is_default)
+		VALUES ($1, $2, $3, $4::jsonb, $5)
+		RETURNING id, slug, name, COALESCE(config, '{}'::jsonb), is_default, created_at, updated_at
+	`, id, in.Slug, in.Name, []byte(cfgBytes), in.IsDefault).Scan(
+		&p.ID, &p.Slug, &p.Name, &rawCfg, &p.IsDefault, &p.CreatedAt, &p.UpdatedAt,
+	)
+	if err != nil {
+		return TVPreset{}, mapPGError(err)
+	}
+	p.Config = json.RawMessage(rawCfg)
+
+	if err := tx.Commit(ctx); err != nil {
+		return TVPreset{}, err
+	}
+	return p, nil
+}
+
+func (s *Store) UpdateTVPreset(ctx context.Context, id uuid.UUID, in TVPresetInput) (TVPreset, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return TVPreset{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if in.IsDefault {
+		if _, err := tx.Exec(ctx, `UPDATE tv_presets SET is_default = FALSE WHERE is_default = TRUE AND id <> $1`, id); err != nil {
+			return TVPreset{}, mapPGError(err)
+		}
+	}
+	cfgBytes := in.Config
+	if len(cfgBytes) == 0 {
+		cfgBytes = json.RawMessage(`{}`)
+	}
+
+	var p TVPreset
+	var rawCfg []byte
+	err = tx.QueryRow(ctx, `
+		UPDATE tv_presets
+		SET slug = $2, name = $3, config = $4::jsonb, is_default = $5, updated_at = NOW()
+		WHERE id = $1
+		RETURNING id, slug, name, COALESCE(config, '{}'::jsonb), is_default, created_at, updated_at
+	`, id, in.Slug, in.Name, []byte(cfgBytes), in.IsDefault).Scan(
+		&p.ID, &p.Slug, &p.Name, &rawCfg, &p.IsDefault, &p.CreatedAt, &p.UpdatedAt,
+	)
+	if err != nil {
+		return TVPreset{}, mapPGError(err)
+	}
+	p.Config = json.RawMessage(rawCfg)
+
+	if err := tx.Commit(ctx); err != nil {
+		return TVPreset{}, err
+	}
+	return p, nil
+}
+
+func (s *Store) DeleteTVPreset(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM tv_presets WHERE id = $1`, id)
+	if err != nil {
+		return mapPGError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

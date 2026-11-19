@@ -84,6 +84,7 @@ export default function TargetsPage() {
   const [tInterval, setTInterval] = useState(5);
   const [tTimeout, setTTimeout] = useState(1000);
   const [tEnabled, setTEnabled] = useState(true);
+  const [tAlertsEnabled, setTAlertsEnabled] = useState(true);
   const [tAutoMtr, setTAutoMtr] = useState(true);
   const [tMtrThresh, setTMtrThresh] = useState(3);
   const [tPinnedOnTv, setTPinnedOnTv] = useState(false);
@@ -91,6 +92,7 @@ export default function TargetsPage() {
   const [tProbeOverrides, setTProbeOverrides] = useState<Record<string, number>>({});
   const [tAssignAll, setTAssignAll] = useState(true);
   const [tProbeIds, setTProbeIds] = useState<string[]>([]);
+  const [tSyncLossAlert, setTSyncLossAlert] = useState(false);
   const [tSyncRttAlert, setTSyncRttAlert] = useState(false);
   const [formErr, setFormErr] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -205,6 +207,25 @@ export default function TargetsPage() {
     );
   }, [editingTarget, alertRules]);
 
+  const existingTargetLossRule = useMemo(() => {
+    if (!editingTarget) return null;
+    return (
+      alertRules.find(
+        (r) => r.target_id === editingTarget.id && r.metric === "loss_pct"
+      ) ?? null
+    );
+  }, [editingTarget, alertRules]);
+
+  const matchingScopeRulesCount = useMemo(() => {
+    return alertRules.filter(
+      (r) =>
+        r.enabled &&
+        r.metric !== "probe_offline" &&
+        !r.target_id &&
+        (!r.group_id || (Boolean(tGroupId) && r.group_id === tGroupId))
+    ).length;
+  }, [alertRules, tGroupId]);
+
   const groupCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const t of targets) {
@@ -315,6 +336,7 @@ export default function TargetsPage() {
     setTInterval(t.interval_sec);
     setTTimeout(t.timeout_ms);
     setTEnabled(t.enabled);
+    setTAlertsEnabled(t.alerts_enabled ?? true);
     setTAutoMtr(t.auto_mtr_on_loss);
     setTMtrThresh(t.mtr_loss_threshold || 3);
     setTPinnedOnTv(Boolean(t.pinned_on_tv));
@@ -322,6 +344,7 @@ export default function TargetsPage() {
     setTProbeOverrides(t.probe_latency_overrides ?? {});
     setTAssignAll(t.assign_all_probes);
     setTProbeIds(t.probe_ids ?? []);
+    setTSyncLossAlert(false);
     setTSyncRttAlert(false);
     setShowTargetModal(true);
   }, []);
@@ -349,6 +372,7 @@ export default function TargetsPage() {
     setTInterval(5);
     setTTimeout(1000);
     setTEnabled(true);
+    setTAlertsEnabled(true);
     setTAutoMtr(true);
     setTMtrThresh(3);
     setTPinnedOnTv(false);
@@ -356,6 +380,7 @@ export default function TargetsPage() {
     setTProbeOverrides({});
     setTAssignAll(true);
     setTProbeIds([]);
+    setTSyncLossAlert(false);
     setTSyncRttAlert(false);
     setShowTargetModal(true);
   }
@@ -383,6 +408,7 @@ export default function TargetsPage() {
     interval_sec: number;
     timeout_ms: number;
     enabled: boolean;
+    alerts_enabled?: boolean;
     auto_mtr_on_loss: boolean;
     mtr_loss_threshold: number;
     pinned_on_tv?: boolean;
@@ -410,6 +436,7 @@ export default function TargetsPage() {
       interval_sec: Number(t.interval_sec),
       timeout_ms: Number(t.timeout_ms),
       enabled: t.enabled,
+      alerts_enabled: t.alerts_enabled ?? true,
       auto_mtr_on_loss: t.auto_mtr_on_loss,
       mtr_loss_threshold: Number(t.mtr_loss_threshold) || 3,
       pinned_on_tv: Boolean(t.pinned_on_tv),
@@ -443,6 +470,7 @@ export default function TargetsPage() {
       interval_sec: tInterval,
       timeout_ms: tTimeout,
       enabled: tEnabled,
+      alerts_enabled: tAlertsEnabled,
       auto_mtr_on_loss: tAutoMtr,
       mtr_loss_threshold: tMtrThresh,
       pinned_on_tv: tPinnedOnTv,
@@ -459,7 +487,49 @@ export default function TargetsPage() {
           body: JSON.stringify(payload),
         }
       );
-      if (tSyncRttAlert && savedTarget?.id) {
+      const syncedDescriptions: string[] = [];
+      if (tAlertsEnabled && tSyncLossAlert && savedTarget?.id) {
+        const lossRule = existingTargetLossRule;
+        if (lossRule) {
+          await apiRequest(`/api/alerts/rules/${lossRule.id}`, {
+            method: "PUT",
+            body: JSON.stringify({
+              name: lossRule.name,
+              target_id: savedTarget.id,
+              group_id: null,
+              metric: "loss_pct",
+              threshold_value: lossRule.threshold_value > 0 ? lossRule.threshold_value : 20,
+              duration_sec: lossRule.duration_sec,
+              quorum_min_probes: lossRule.quorum_min_probes,
+              cooldown_sec: lossRule.cooldown_sec,
+              confirm_sec: lossRule.confirm_sec ?? 0,
+              recover_sec: lossRule.recover_sec ?? 45,
+              channel_ids: lossRule.channel_ids ?? [],
+              enabled: true,
+            }),
+          });
+        } else {
+          await apiRequest("/api/alerts/rules", {
+            method: "POST",
+            body: JSON.stringify({
+              name: `${savedTarget.name} Packet Loss`,
+              target_id: savedTarget.id,
+              group_id: null,
+              metric: "loss_pct",
+              threshold_value: 20,
+              duration_sec: 30,
+              quorum_min_probes: 1,
+              cooldown_sec: 0,
+              confirm_sec: 0,
+              recover_sec: 45,
+              channel_ids: [],
+              enabled: true,
+            }),
+          });
+        }
+        syncedDescriptions.push("Packet Loss (>= 20%)");
+      }
+      if (tAlertsEnabled && tSyncRttAlert && savedTarget?.id) {
         const syncThreshold = Number(tLatencyWarnMs) || 0;
         const ruleToUpdate = existingTargetRttRule;
         if (ruleToUpdate) {
@@ -499,15 +569,19 @@ export default function TargetsPage() {
             }),
           });
         }
+        syncedDescriptions.push(
+          `High Latency P95 (${syncThreshold > 0 ? `>= ${syncThreshold} ms` : "Auto Best-Path"})`
+        );
+      }
+      if (syncedDescriptions.length > 0 && savedTarget?.name) {
         setSimNotice(
-          `Saved "${savedTarget.name}" and synced Telegram High-Latency (P95) rule (${
-            syncThreshold > 0 ? `>= ${syncThreshold} ms` : "Auto Best-Path"
-          }).`
+          `Saved "${savedTarget.name}" and synced alert rule(s): ${syncedDescriptions.join(" & ")}.`
         );
         setTimeout(() => setSimNotice(null), 6000);
       }
       setShowTargetModal(false);
       setEditingTarget(null);
+      setTSyncLossAlert(false);
       setTSyncRttAlert(false);
       setTName("");
       setTHost("");
@@ -1036,6 +1110,14 @@ export default function TargetsPage() {
                           {!t.enabled && (
                             <span className="rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-mono uppercase text-amber-300">
                               Paused
+                            </span>
+                          )}
+                          {t.alerts_enabled === false && (
+                            <span
+                              data-testid="target-monitor-only-badge"
+                              className="rounded border border-zinc-600/70 bg-zinc-800/80 px-1.5 py-0.5 text-[10px] font-mono uppercase text-zinc-300"
+                            >
+                              Monitor Only
                             </span>
                           )}
                           {isTargetMuted(t) && (
@@ -1686,54 +1768,124 @@ export default function TargetsPage() {
                   </div>
                 </div>
 
-                <div className="rounded border border-emerald-500/30 bg-emerald-500/5 p-3 space-y-2">
+                <div
+                  className={`rounded border p-3 space-y-2.5 ${
+                    tAlertsEnabled
+                      ? "border-emerald-500/30 bg-emerald-500/5"
+                      : "border-zinc-700 bg-canvas/60"
+                  }`}
+                >
                   <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                     <span className="font-semibold text-zinc-100">
-                      Telegram High-Latency Alert (RTT)
+                      Alerting &amp; Notifications
                     </span>
-                    <span className="rounded border border-border bg-canvas px-2 py-0.5 font-mono text-[10px] text-zinc-300">
-                      {existingTargetRttRule
-                        ? `Rule "${existingTargetRttRule.name}": ${
-                            existingTargetRttRule.threshold_value === 0
-                              ? "Auto Best-Path"
-                              : `>= ${existingTargetRttRule.threshold_value} ms`
-                          }`
-                        : "No Telegram RTT rule"}
+                    <span
+                      className={`rounded border px-2 py-0.5 font-mono text-[10px] ${
+                        tAlertsEnabled
+                          ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
+                          : "border-zinc-600 bg-zinc-800/80 text-zinc-300"
+                      }`}
+                    >
+                      {tAlertsEnabled ? "Alerts Enabled" : "Monitoring Only"}
                     </span>
                   </div>
-                  <label className="flex items-start gap-2 text-xs text-zinc-200 cursor-pointer">
+
+                  <label className="flex items-start gap-2 text-xs font-medium text-zinc-100 cursor-pointer">
                     <input
                       type="checkbox"
-                      aria-label="Sync Telegram RTT alert rule"
-                      checked={tSyncRttAlert}
-                      onChange={(e) => setTSyncRttAlert(e.target.checked)}
+                      aria-label="Include target in alerting"
+                      checked={tAlertsEnabled}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setTAlertsEnabled(checked);
+                        if (!checked) {
+                          setTSyncLossAlert(false);
+                          setTSyncRttAlert(false);
+                        }
+                      }}
                       className="mt-0.5 rounded border-border bg-canvas"
                     />
                     <span>
-                      Also {existingTargetRttRule ? "update" : "create"} Telegram High Latency (P95) rule using this Warn RTT (
-                      <span className="font-mono text-cyan-300">
-                        {Number(tLatencyWarnMs) > 0
-                          ? `>= ${tLatencyWarnMs} ms`
-                          : "0 = Auto Best-Path"}
-                      </span>
-                      )
+                      Include in Alerting (evaluate alert rules &amp; Telegram notifications)
                     </span>
                   </label>
-                  {editingTarget && (
-                    <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-400">
-                      <span>Adjust Confirm/Recover/Channels in Alerts:</span>
-                      <Link
-                        href={`/alerts?target_id=${encodeURIComponent(
-                          editingTarget.id
-                        )}&metric=latency_p95${
-                          Number(tLatencyWarnMs) > 0
-                            ? `&threshold=${encodeURIComponent(String(Number(tLatencyWarnMs)))}`
-                            : ""
-                        }`}
-                        className="font-mono font-semibold text-emerald-400 hover:underline"
-                      >
-                        Customize in /alerts &rarr;
-                      </Link>
+
+                  {!tAlertsEnabled ? (
+                    <p
+                      data-testid="target-monitor-only-info"
+                      className="rounded border border-zinc-700/70 bg-canvas/80 px-2.5 py-2 text-[11px] text-zinc-300"
+                    >
+                      <strong>Monitoring Only</strong> — polling, live graphs on Dashboard &amp; TV, and Auto-MTR stay active, but this target will not open incidents or send alert notifications.
+                    </p>
+                  ) : (
+                    <div className="space-y-2 border-t border-border/60 pt-2">
+                      <p className="text-[11px] text-zinc-400">
+                        {matchingScopeRulesCount > 0
+                          ? `Automatically covered by ${matchingScopeRulesCount} active Global/Group alert rule(s). Optional per-target rules:`
+                          : "Optional: quickly attach dedicated alert rule(s) for this target:"}
+                      </p>
+
+                      <label className="flex items-start gap-2 text-xs text-zinc-200 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          aria-label="Sync Telegram Loss alert rule"
+                          checked={tSyncLossAlert}
+                          onChange={(e) => setTSyncLossAlert(e.target.checked)}
+                          className="mt-0.5 rounded border-border bg-canvas"
+                        />
+                        <span>
+                          Also {existingTargetLossRule ? "update" : "create"} Packet Loss &amp; Down rule (
+                          <span className="font-mono text-amber-300">
+                            Loss &ge; 20% WARN · &ge; 50% DOWN
+                          </span>
+                          )
+                        </span>
+                      </label>
+
+                      <label className="flex items-start gap-2 text-xs text-zinc-200 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          aria-label="Sync Telegram RTT alert rule"
+                          checked={tSyncRttAlert}
+                          onChange={(e) => setTSyncRttAlert(e.target.checked)}
+                          className="mt-0.5 rounded border-border bg-canvas"
+                        />
+                        <span>
+                          Also {existingTargetRttRule ? "update" : "create"} Telegram High Latency (P95) rule using this Warn RTT (
+                          <span className="font-mono text-cyan-300">
+                            {Number(tLatencyWarnMs) > 0
+                              ? `>= ${tLatencyWarnMs} ms`
+                              : "0 = Auto Best-Path"}
+                          </span>
+                          )
+                        </span>
+                      </label>
+
+                      {editingTarget && (
+                        <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] text-zinc-400">
+                          <span className="font-mono text-[10px] text-zinc-300">
+                            {existingTargetRttRule
+                              ? `RTT Rule "${existingTargetRttRule.name}": ${
+                                  existingTargetRttRule.threshold_value === 0
+                                    ? "Auto Best-Path"
+                                    : `>= ${existingTargetRttRule.threshold_value} ms`
+                                }`
+                              : "Adjust Confirm/Recover/Channels in Alerts:"}
+                          </span>
+                          <Link
+                            href={`/alerts?target_id=${encodeURIComponent(
+                              editingTarget.id
+                            )}&metric=latency_p95${
+                              Number(tLatencyWarnMs) > 0
+                                ? `&threshold=${encodeURIComponent(String(Number(tLatencyWarnMs)))}`
+                                : ""
+                            }`}
+                            className="font-mono font-semibold text-emerald-400 hover:underline"
+                          >
+                            Customize in /alerts &rarr;
+                          </Link>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

@@ -41,6 +41,16 @@ type MTRSnapshotStore interface {
 	ListMTRSnapshots(ctx context.Context, targetID uuid.UUID, limit int) ([]db.MTRSnapshot, error)
 }
 
+// AlertSettingsStore is an optional extension implemented by db.Store to read the global alerting switch.
+type AlertSettingsStore interface {
+	GetSettings(ctx context.Context) (db.SystemSettings, error)
+}
+
+// GroupStore is an optional extension implemented by db.Store to enrich alerts with target group names.
+type GroupStore interface {
+	ListGroups(ctx context.Context) ([]db.TargetGroup, error)
+}
+
 // QuorumEvalResult is pure domain output used both in production and deterministic unit tests.
 type QuorumEvalResult struct {
 	BreachingProbes    []string
@@ -173,7 +183,9 @@ func evaluateTargetQuorumWithThresholds(
 			statByProbe[probeName] = ProbeAlertStat{
 				ProbeName:        probeName,
 				LossPct:          st.LossPct,
+				P50Ms:            st.P50Ms,
 				P95Ms:            st.P95Ms,
+				LastRTTMs:        st.LastRTTMs,
 				AvgJitterMs:      st.AvgJitterMs,
 				BaselineMs:       st.BaselineMs,
 				BaselineSpikePct: st.BaselineSpikePct,
@@ -213,13 +225,14 @@ func evaluateTargetQuorumWithThresholds(
 }
 
 type Evaluator struct {
-	store        AlertStore
-	cache        *ingest.RollingCache
-	hub          *wshub.Hub
-	notifier     *Notifier
-	aesKey       []byte
-	now          func() time.Time
-	syncDispatch bool
+	store         AlertStore
+	cache         *ingest.RollingCache
+	hub           *wshub.Hub
+	notifier      *Notifier
+	aesKey        []byte
+	now           func() time.Time
+	syncDispatch  bool
+	publicBaseURL string
 
 	mu     sync.Mutex
 	states map[alertStateKey]*holddownState
@@ -242,6 +255,10 @@ func NewEvaluator(store AlertStore, cache *ingest.RollingCache, hub *wshub.Hub, 
 
 func (e *Evaluator) SetSyncDispatch(sync bool) {
 	e.syncDispatch = sync
+}
+
+func (e *Evaluator) SetPublicBaseURL(baseURL string) {
+	e.publicBaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 }
 
 func (e *Evaluator) Run(ctx context.Context) {
@@ -314,6 +331,17 @@ func (e *Evaluator) pruneStates(active map[alertStateKey]bool) {
 }
 
 func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
+	if ss, ok := e.store.(AlertSettingsStore); ok {
+		st, err := ss.GetSettings(ctx)
+		if err != nil {
+			return err
+		}
+		if !st.AlertingEnabled {
+			e.pruneStates(nil)
+			return nil
+		}
+	}
+
 	rules, err := e.store.ListAlertRules(ctx)
 	if err != nil {
 		return err
@@ -334,6 +362,14 @@ func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
 	openList, err := e.store.ListOpenIncidents(ctx)
 	if err != nil {
 		return err
+	}
+	groupNames := make(map[uuid.UUID]string)
+	if gs, ok := e.store.(GroupStore); ok {
+		if groups, err := gs.ListGroups(ctx); err == nil {
+			for _, g := range groups {
+				groupNames[g.ID] = g.Name
+			}
+		}
 	}
 
 	openByKey := make(map[alertStateKey]db.Incident, len(openList))
@@ -362,7 +398,7 @@ func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
 		}
 
 		for _, target := range targets {
-			if !target.Enabled {
+			if !target.Enabled || !target.AlertsEnabled {
 				continue
 			}
 			if rule.TargetID != nil && *rule.TargetID != target.ID {
@@ -435,6 +471,30 @@ func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
 			}
 
 			res := evaluateTargetQuorumWithThresholds(effectiveRule, probeStats, minSamples, perProbeThresholds)
+			currentProbes := make([]ProbeAlertStat, 0, len(probeStats))
+			for pName, ws := range probeStats {
+				if ws.SampleCount == 0 {
+					continue
+				}
+				currentProbes = append(currentProbes, ProbeAlertStat{
+					ProbeName:        pName,
+					LossPct:          ws.LossPct,
+					P50Ms:            ws.P50Ms,
+					P95Ms:            ws.P95Ms,
+					LastRTTMs:        ws.LastRTTMs,
+					AvgJitterMs:      ws.AvgJitterMs,
+					BaselineMs:       ws.BaselineMs,
+					BaselineSpikePct: ws.BaselineSpikePct,
+				})
+			}
+			sort.Slice(currentProbes, func(i, j int) bool {
+				return currentProbes[i].ProbeName < currentProbes[j].ProbeName
+			})
+
+			groupName := ""
+			if target.GroupID != nil {
+				groupName = groupNames[*target.GroupID]
+			}
 			tid := target.ID
 			isMuted := target.MutedUntil != nil && now.Before(*target.MutedUntil)
 			e.reconcileIncidentState(ctx, incidentEvalInput{
@@ -442,6 +502,8 @@ func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
 				targetID:        &tid,
 				targetName:      target.Name,
 				targetHost:      target.Host,
+				targetProtocol:  formatTargetProtocol(target.ProbeType, target.PortOrPath),
+				groupName:       groupName,
 				muted:           isMuted,
 				key:             key,
 				existingOpen:    existingOpen,
@@ -449,10 +511,12 @@ func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
 				breached:        res.QuorumMet,
 				breachingProbes: res.BreachingProbes,
 				probeBreakdown:  res.ProbeBreakdown,
+				currentProbes:   currentProbes,
 				peakVal:         res.PeakValue,
 				effectiveThresh: res.EffectiveThreshold,
 				effectiveQuorum: effectiveRule.QuorumMinProbes,
 				totalProbes:     onlineCount,
+				onlineProbes:    onlineCount,
 				canResolve:      onlineCount > 0 && reportingCount > 0,
 				resolvedSummary: "Connection restored after ",
 				now:             now,
@@ -464,11 +528,44 @@ func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
 	return nil
 }
 
+func formatTargetProtocol(probeType, portOrPath string) string {
+	pt := strings.ToLower(strings.TrimSpace(probeType))
+	extra := strings.TrimSpace(portOrPath)
+	switch pt {
+	case "icmp":
+		return "ICMP"
+	case "icmp6":
+		return "ICMPv6"
+	case "tcp":
+		if extra != "" {
+			return "TCP :" + extra
+		}
+		return "TCP"
+	case "tcp6":
+		if extra != "" {
+			return "TCPv6 :" + extra
+		}
+		return "TCPv6"
+	case "http":
+		return "HTTP"
+	case "http6":
+		return "HTTPv6"
+	case "dns":
+		return "DNS"
+	case "dns6":
+		return "DNSv6"
+	default:
+		return strings.ToUpper(pt)
+	}
+}
+
 type incidentEvalInput struct {
 	rule            db.AlertRule
 	targetID        *uuid.UUID
 	targetName      string
 	targetHost      string
+	targetProtocol  string
+	groupName       string
 	muted           bool
 	key             alertStateKey
 	existingOpen    db.Incident
@@ -476,10 +573,12 @@ type incidentEvalInput struct {
 	breached        bool
 	breachingProbes []string
 	probeBreakdown  []ProbeAlertStat
+	currentProbes   []ProbeAlertStat
 	peakVal         float64
 	effectiveThresh float64
 	effectiveQuorum int
 	totalProbes     int
+	onlineProbes    int
 	canResolve      bool
 	resolvedSummary string
 	now             time.Time
@@ -613,8 +712,11 @@ func (e *Evaluator) reconcileIncidentState(ctx context.Context, in incidentEvalI
 			Status:           msgStatus,
 			Severity:         inc.Severity,
 			RuleName:         in.rule.Name,
+			TargetID:         in.targetID,
 			TargetName:       in.targetName,
 			TargetHost:       in.targetHost,
+			TargetProtocol:   in.targetProtocol,
+			GroupName:        in.groupName,
 			Metric:           in.rule.Metric,
 			Value:            currentVal,
 			PeakValue:        inc.PeakValue,
@@ -622,9 +724,13 @@ func (e *Evaluator) reconcileIncidentState(ctx context.Context, in incidentEvalI
 			QuorumCount:      len(in.breachingProbes),
 			QuorumRequired:   in.effectiveQuorum,
 			TotalProbes:      in.totalProbes,
+			OnlineProbes:     in.onlineProbes,
 			AffectedProbes:   in.breachingProbes,
 			ProbeBreakdown:   in.probeBreakdown,
+			CurrentProbes:    in.currentProbes,
 			MTRBottleneck:    mtrBottleneck,
+			IsReminder:       needsReminder,
+			DashboardBaseURL: e.publicBaseURL,
 			ReplyToByChannel: replyMap,
 			Summary:          summary,
 			StartedAt:        inc.StartedAt.Format(time.RFC3339),
@@ -686,6 +792,18 @@ func (e *Evaluator) reconcileIncidentState(ctx context.Context, in incidentEvalI
 		if durSec < 0 {
 			durSec = 0
 		}
+		var mtrBottleneck string
+		if in.targetID != nil {
+			if mtrStore, ok := e.store.(MTRSnapshotStore); ok {
+				if snaps, err := mtrStore.ListMTRSnapshots(ctx, *in.targetID, 5); err == nil && len(snaps) > 0 {
+					mtrBottleneck = SummarizeMTRBottleneck(snaps, resolved.StartedAt)
+				}
+			}
+		}
+		resolvedThresh := in.effectiveThresh
+		if resolvedThresh <= 0 {
+			resolvedThresh = in.rule.ThresholdValue
+		}
 		replyMap := make(map[string]int64, len(resolved.TelegramMessageIDs))
 		for k, v := range resolved.TelegramMessageIDs {
 			replyMap[k] = v
@@ -697,16 +815,23 @@ func (e *Evaluator) reconcileIncidentState(ctx context.Context, in incidentEvalI
 			Status:             "RESOLVED",
 			Severity:           "ok",
 			RuleName:           in.rule.Name,
+			TargetID:           in.targetID,
 			TargetName:         in.targetName,
 			TargetHost:         in.targetHost,
+			TargetProtocol:     in.targetProtocol,
+			GroupName:          in.groupName,
 			Metric:             in.rule.Metric,
 			Value:              in.peakVal,
 			PeakValue:          resolved.PeakValue,
-			Threshold:          in.rule.ThresholdValue,
+			Threshold:          resolvedThresh,
 			QuorumCount:        len(resolved.AffectedProbes),
 			QuorumRequired:     in.effectiveQuorum,
 			TotalProbes:        in.totalProbes,
+			OnlineProbes:       in.onlineProbes,
 			AffectedProbes:     resolved.AffectedProbes,
+			CurrentProbes:      in.currentProbes,
+			MTRBottleneck:      mtrBottleneck,
+			DashboardBaseURL:   e.publicBaseURL,
 			ReplyToByChannel:   replyMap,
 			Summary:            in.resolvedSummary + FormatDurationSLA(durSec),
 			StartedAt:          resolved.StartedAt.Format(time.RFC3339),
@@ -736,9 +861,11 @@ func (e *Evaluator) evalProbeOffline(
 ) {
 	var offlineNames []string
 	var maxOfflineSec float64
+	onlineCount := 0
 	statByProbe := make(map[string]ProbeAlertStat)
 	for _, p := range probes {
 		if p.Status != "offline" {
+			onlineCount++
 			continue
 		}
 		var sec float64
@@ -785,6 +912,7 @@ func (e *Evaluator) evalProbeOffline(
 		peakVal:         maxOfflineSec,
 		effectiveQuorum: effectiveQuorum,
 		totalProbes:     len(probes),
+		onlineProbes:    onlineCount,
 		canResolve:      true,
 		resolvedSummary: "Probes back online after ",
 		now:             now,

@@ -570,4 +570,169 @@ describe("AlertsPage quorum, routing, and Telegram channel controls", () => {
     await user.selectOptions(screen.getByLabelText("Alert metric"), "probe_offline");
     expect(threshInput.disabled).toBe(true);
   });
+
+  it("supports global Alerting ON/OFF toggle, manual incident Close, Clear History, and Monitor Only target indicator", async () => {
+    const reqLog: Array<{ method: string; url: string; body: unknown }> = [];
+    let alertingEnabled = true;
+    let incList: Incident[] = [
+      {
+        id: "inc-open",
+        rule_id: "r-1",
+        rule_name: "Core Loss Check",
+        target_id: "t-single",
+        target_name: "Single-Probe Target",
+        status: "open",
+        severity: "critical",
+        affected_probes: ["Local Central"],
+        peak_value: 100,
+        started_at: "2026-11-19T05:00:00Z",
+        resolved_at: null,
+        summary: "100% loss",
+      },
+      {
+        id: "inc-resolved",
+        rule_id: "r-1",
+        rule_name: "Core Loss Check",
+        target_id: "t-single",
+        target_name: "Single-Probe Target",
+        status: "resolved",
+        severity: "warn",
+        affected_probes: ["Local Central"],
+        peak_value: 25,
+        started_at: "2026-11-19T04:00:00Z",
+        resolved_at: "2026-11-19T04:05:00Z",
+        summary: "Recovered",
+      },
+    ];
+    const targetList: Target[] = [
+      TARGETS[0],
+      {
+        ...TARGETS[0],
+        id: "t-mon-only",
+        name: "Lab Monitor Node",
+        alerts_enabled: false,
+      },
+    ];
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (method !== "GET") {
+          const body = init?.body ? JSON.parse(String(init.body)) : null;
+          reqLog.push({ method, url, body });
+          if (method === "PUT" && url === "/api/alerts/status") {
+            alertingEnabled = Boolean(body?.alerting_enabled);
+            return new Response(
+              JSON.stringify({
+                raw_retention_days: 14,
+                agg_retention_days: 730,
+                default_quorum_min: 2,
+                brand_name: "",
+                alerting_enabled: alertingEnabled,
+                updated_at: "2026-11-19T05:00:00Z",
+              }),
+              { status: 200 }
+            );
+          }
+          if (method === "POST" && url === "/api/alerts/incidents/inc-open/close") {
+            incList = incList.map((i) =>
+              i.id === "inc-open"
+                ? { ...i, status: "resolved", resolved_at: "2026-11-19T05:10:00Z" }
+                : i
+            );
+            return new Response(JSON.stringify(incList[0]), { status: 200 });
+          }
+          if (method === "DELETE" && url.startsWith("/api/alerts/incidents")) {
+            const isAll = url.includes("scope=all");
+            const before = incList.length;
+            incList = isAll ? [] : incList.filter((i) => i.status === "open");
+            return new Response(
+              JSON.stringify({ deleted: before - incList.length, scope: isAll ? "all" : "resolved" }),
+              { status: 200 }
+            );
+          }
+        }
+        if (url === "/api/settings") {
+          return new Response(
+            JSON.stringify({
+              raw_retention_days: 14,
+              agg_retention_days: 730,
+              default_quorum_min: 2,
+              brand_name: "",
+              alerting_enabled: alertingEnabled,
+              updated_at: "2026-11-19T05:00:00Z",
+            }),
+            { status: 200 }
+          );
+        }
+        if (url === "/api/alerts/incidents") {
+          return new Response(JSON.stringify(incList), { status: 200 });
+        }
+        if (url === "/api/alerts/rules") {
+          return new Response(JSON.stringify(RULES), { status: 200 });
+        }
+        if (url === "/api/alerts/channels") {
+          return new Response(JSON.stringify(CHANNELS), { status: 200 });
+        }
+        if (url === "/api/targets") {
+          return new Response(JSON.stringify(targetList), { status: 200 });
+        }
+        if (url === "/api/groups") {
+          return new Response(JSON.stringify(GROUPS), { status: 200 });
+        }
+        if (url === "/api/probes") {
+          return new Response(JSON.stringify(PROBES), { status: 200 });
+        }
+        return new Response(JSON.stringify({ username: "admin" }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<AlertsPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("alerting-master-toggle")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("alerting-master-toggle")).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByTestId("alerting-paused-banner")).not.toBeInTheDocument();
+
+    // 1. Toggle master Alerting switch OFF
+    await user.click(screen.getByTestId("alerting-master-toggle"));
+    await waitFor(() => {
+      expect(screen.getByTestId("alerting-paused-banner")).toBeInTheDocument();
+    });
+    expect(reqLog[0]).toEqual({
+      method: "PUT",
+      url: "/api/alerts/status",
+      body: { alerting_enabled: false },
+    });
+
+    // 2. Close open incident manually
+    await user.click(screen.getByRole("button", { name: "Close incident inc-open" }));
+    await waitFor(() => {
+      expect(reqLog).toContainEqual({
+        method: "POST",
+        url: "/api/alerts/incidents/inc-open/close",
+        body: null,
+      });
+    });
+
+    // 3. Clear resolved incidents
+    await user.click(screen.getByRole("button", { name: "Clear resolved incident history" }));
+    await waitFor(() => {
+      expect(reqLog).toContainEqual({
+        method: "DELETE",
+        url: "/api/alerts/incidents?scope=resolved",
+        body: null,
+      });
+    });
+
+    // 4. Selecting a Monitoring Only target displays warning banner
+    await user.selectOptions(screen.getByLabelText("Target"), "t-mon-only");
+    expect(screen.getByTestId("alert-target-monitor-only-warning")).toHaveTextContent(
+      /Lab Monitor Node.*Monitoring Only/
+    );
+  });
 });

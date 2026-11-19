@@ -93,6 +93,68 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BatchSeriesResponse'
+  /api/tv/presets:
+    get:
+      operationId: listTVPresets
+      responses:
+        '200':
+          description: Saved TV display presets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TVPreset'
+    post:
+      operationId: createTVPreset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TVPresetInput'
+      responses:
+        '201':
+          description: Created TV preset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TVPreset'
+  /api/tv/presets/{id}:
+    put:
+      operationId: updateTVPreset
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TVPresetInput'
+      responses:
+        '200':
+          description: Updated TV preset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TVPreset'
+    delete:
+      operationId: deleteTVPreset
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Deleted
   /api/probes:
     get:
       operationId: listProbes
@@ -616,6 +678,26 @@ paths:
                     type: boolean
                   message:
                     type: string
+  /api/alerts/status:
+    put:
+      operationId: setAlertingStatus
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [alerting_enabled]
+              properties:
+                alerting_enabled:
+                  type: boolean
+      responses:
+        '200':
+          description: Updated alerting status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemSettings'
   /api/alerts/incidents:
     get:
       operationId: listIncidents
@@ -628,6 +710,29 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Incident'
+    delete:
+      operationId: clearIncidents
+      parameters:
+        - name: scope
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [resolved, all]
+      responses:
+        '200':
+          description: Cleared incidents count
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted, scope]
+                properties:
+                  deleted:
+                    type: integer
+                  scope:
+                    type: string
+                    enum: [resolved, all]
   /api/alerts/incidents/{id}/ack:
     post:
       operationId: acknowledgeIncident
@@ -641,6 +746,23 @@ paths:
       responses:
         '200':
           description: Incident acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+  /api/alerts/incidents/{id}/close:
+    post:
+      operationId: closeIncident
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Incident manually closed
           content:
             application/json:
               schema:
@@ -757,6 +879,7 @@ components:
         interval_sec: { type: integer }
         timeout_ms: { type: integer }
         enabled: { type: boolean }
+        alerts_enabled: { type: boolean }
         auto_mtr_on_loss: { type: boolean }
         mtr_loss_threshold: { type: integer }
         pinned_on_tv: { type: boolean }
@@ -783,6 +906,7 @@ components:
         interval_sec: { type: integer }
         timeout_ms: { type: integer }
         enabled: { type: boolean }
+        alerts_enabled: { type: boolean }
         auto_mtr_on_loss: { type: boolean }
         mtr_loss_threshold: { type: integer }
         pinned_on_tv: { type: boolean }
@@ -839,7 +963,31 @@ components:
           items: { $ref: '#/components/schemas/MatrixCell' }
         active_incidents: { type: integer }
         brand_name: { type: string }
+        is_admin: { type: boolean }
         generated_at: { type: string, format: date-time }
+    TVPreset:
+      type: object
+      required: [id, slug, name, config, is_default, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        config:
+          type: object
+          additionalProperties: true
+        is_default: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    TVPresetInput:
+      type: object
+      required: [name, config]
+      properties:
+        slug: { type: string }
+        name: { type: string }
+        config:
+          type: object
+          additionalProperties: true
+        is_default: { type: boolean }
     ProbeSeries:
       type: object
       required: [probe_id, probe_name, location_label, timestamps, min_ms, p25_ms, p50_ms, p75_ms, p95_ms, max_ms, jitter_ms, loss_pct]
@@ -1023,6 +1171,7 @@ components:
         agg_retention_days: { type: integer }
         default_quorum_min: { type: integer }
         brand_name: { type: string }
+        alerting_enabled: { type: boolean }
         updated_at: { type: string, format: date-time }
     SystemSettingsInput:
       type: object
@@ -1032,6 +1181,7 @@ components:
         agg_retention_days: { type: integer }
         default_quorum_min: { type: integer }
         brand_name: { type: string }
+        alerting_enabled: { type: boolean }
     SeedResult:
       type: object
       required: [groups_created, targets_created]
