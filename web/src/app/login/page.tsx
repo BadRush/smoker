@@ -7,7 +7,7 @@ import { ApiError, apiRequest } from "@/lib/api";
 
 export default function LoginPage() {
   const router = useRouter();
-  const [username, setUsername] = useState("admin");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -54,10 +54,10 @@ export default function LoginPage() {
           </span>
           <div>
             <h1 className="text-lg font-bold tracking-wide text-zinc-100 uppercase">
-              Smoker NOC
+              Smoker
             </h1>
             <p className="text-xs text-zinc-400">
-              Distributed Latency &amp; Path Observability
+              Latency Monitoring
             </p>
           </div>
         </div>
@@ -68,12 +68,13 @@ export default function LoginPage() {
               htmlFor="login-username"
               className="mb-1.5 block text-xs font-medium text-zinc-300"
             >
-              Operator Username
+              Username
             </label>
             <input
               id="login-username"
               type="text"
               autoComplete="username"
+              placeholder="Enter username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               className="w-full rounded-md border border-border bg-canvas px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
@@ -91,6 +92,7 @@ export default function LoginPage() {
               id="login-password"
               type="password"
               autoComplete="current-password"
+              placeholder="Enter password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               aria-invalid={error ? "true" : "false"}
@@ -117,7 +119,7 @@ export default function LoginPage() {
             className="w-full inline-flex items-center justify-center gap-2 rounded-md bg-emerald-500 px-4 py-2 text-sm font-semibold text-zinc-950 hover:bg-emerald-400 disabled:opacity-60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
           >
             <Lock className="h-4 w-4" aria-hidden="true" />
-            <span>{submitting ? "Signing in..." : "Sign in to NOC"}</span>
+            <span>{submitting ? "Signing in..." : "Sign in"}</span>
           </button>
         </form>
       </div>

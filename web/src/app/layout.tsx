@@ -3,7 +3,7 @@ import "./globals.css";
 import "uplot/dist/uPlot.min.css";
 
 export const metadata: Metadata = {
-  title: "Smoker — Distributed Latency & NOC Observability",
+  title: "Smoker",
   description:
     "Real-time distributed SmokePing, zero-gap Metro store-and-forward probing, and multi-probe quorum alerting.",
   icons: {

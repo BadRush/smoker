@@ -94,9 +94,6 @@ export function NocShell({
               <span className="text-sm font-bold tracking-wider uppercase">
                 Smoker
               </span>
-              <span className="hidden sm:inline-block rounded border border-border bg-elevated px-1.5 py-0.5 text-[10px] font-mono text-zinc-400">
-                NOC
-              </span>
             </Link>
 
             <nav aria-label="Main navigation" className="hidden md:flex items-center gap-1">

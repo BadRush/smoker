@@ -17,11 +17,23 @@ describe("LoginPage", () => {
     window.history.replaceState(null, "", "/login");
   });
 
-  it("shows validation error when password is missing", async () => {
+  it("renders clean Smoker branding, empty inputs with placeholders, and shows validation error when missing", async () => {
     const user = userEvent.setup();
     render(<LoginPage />);
 
-    await user.click(screen.getByRole("button", { name: /sign in to noc/i }));
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(/^Smoker$/);
+    expect(screen.getByText("Latency Monitoring")).toBeInTheDocument();
+    expect(screen.queryByText(/NOC/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Operator/i)).not.toBeInTheDocument();
+
+    const usernameInput = screen.getByLabelText(/^username$/i);
+    const passwordInput = screen.getByLabelText(/^password$/i);
+    expect(usernameInput).toHaveValue("");
+    expect(usernameInput).toHaveAttribute("placeholder", "Enter username");
+    expect(passwordInput).toHaveValue("");
+    expect(passwordInput).toHaveAttribute("placeholder", "Enter password");
+
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       /username and password are required/i
     );
@@ -37,8 +49,9 @@ describe("LoginPage", () => {
     const user = userEvent.setup();
     render(<LoginPage />);
 
-    await user.type(screen.getByLabelText(/password/i), "secret123");
-    await user.click(screen.getByRole("button", { name: /sign in to noc/i }));
+    await user.type(screen.getByLabelText(/^username$/i), "admin");
+    await user.type(screen.getByLabelText(/^password$/i), "secret123");
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     await waitFor(() => {
       expect(replaceMock).toHaveBeenCalledWith("/?zoom=t-1");
