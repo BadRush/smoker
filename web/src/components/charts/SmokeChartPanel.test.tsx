@@ -19,6 +19,15 @@ if (typeof globalThis.ResizeObserver === "undefined") {
 const setScaleSpy = vi.fn();
 const setDataSpy = vi.fn();
 const capturedOpts: Array<{
+  cursor?: {
+    drag?: { x?: boolean; y?: boolean; dist?: number };
+    sync?: {
+      key?: string;
+      scales?: [string | null, string | null];
+      filters?: { pub?: (t: string) => boolean; sub?: (t: string) => boolean };
+    };
+    bind?: { dblclick?: () => unknown };
+  };
   scales?: Record<string, { auto?: boolean; range?: (...args: unknown[]) => [number, number] }>;
   axes?: Array<{
     side?: number;
@@ -344,5 +353,116 @@ describe("SmokeChartPanel", () => {
     expect(compactLossAxis?.side).toBe(1);
     expect(compactLossAxis?.scale).toBe("loss");
     expect(compactLossAxis?.splits?.()).toEqual([0, 50, 100]);
+  });
+
+  it("honors horizontal drag-to-zoom X range, rescales Y to visible slice, preserves zoom across live ticks, and respects fixedBounds", async () => {
+    const user = userEvent.setup();
+    capturedOpts.length = 0;
+    mockPlotInstances.length = 0;
+    setScaleSpy.mockClear();
+    setDataSpy.mockClear();
+
+    const t0 = 1_794_800_000;
+    const baseSeries = {
+      probe_id: "p1",
+      probe_name: "probe-local",
+      location_label: "Jakarta",
+      timestamps: [t0, t0 + 60, t0 + 120, t0 + 180, t0 + 240],
+      min_ms: [180, 10, 11, 10, 12],
+      p25_ms: [190, 11, 12, 11, 13],
+      p50_ms: [200, 12, 13, 12, 14],
+      p75_ms: [210, 13, 14, 13, 15],
+      p95_ms: [250, 15, 16, 15, 17],
+      max_ms: [260, 16, 17, 16, 18],
+      jitter_ms: [5, 0.5, 0.5, 0.5, 0.5],
+      loss_pct: [0, 0, 20, 0, 0],
+    };
+
+    const { rerender } = render(
+      <SmokeChartPanel
+        syncKey="drag-zoom-regression"
+        targetName="Core Router"
+        targetHost="10.0.0.1"
+        rangeLabel="3h"
+        series={baseSeries}
+      />
+    );
+
+    await vi.waitFor(() => {
+      expect(capturedOpts.length).toBeGreaterThanOrEqual(1);
+    });
+
+    const opts = capturedOpts.at(-1)!;
+    const inst = mockPlotInstances.at(-1)!;
+
+    // cursor.drag has dist=6 and non-compact syncs X scale across probes
+    expect(opts.cursor?.drag).toEqual({ x: true, y: false, dist: 6 });
+    expect(opts.cursor?.sync?.scales).toEqual(["x", null]);
+
+    // Primary bug fix: scales.x.range MUST honor dragged [min, max] instead of overwriting with full 3h bounds
+    const dragMin = t0 + 60;
+    const dragMax = t0 + 180;
+    expect(opts.scales?.x?.auto).toBe(false);
+    expect(opts.scales?.x?.range?.(inst, dragMin, dragMax)).toEqual([dragMin, dragMax]);
+
+    // When zoomed to [t0+60, t0+180] (calm ~16ms slice), Y-axis rescales down ignoring the 250ms spike at t0
+    inst.scales.x = { min: dragMin, max: dragMax };
+    const yRangeZoomed = opts.scales?.y?.range?.(inst, 0, 250);
+    expect(yRangeZoomed?.[1]).toBeLessThan(40);
+
+    // Fire uPlot setScale hook -> activates zoomed state and Reset Zoom button
+    inst.opts.hooks?.setScale?.[0]?.(inst, "x");
+    expect(await screen.findByTestId("reset-zoom-btn")).toBeInTheDocument();
+
+    // Live tick update while zoomed MUST preserve [dragMin, dragMax] and pass resetScales=false
+    setScaleSpy.mockClear();
+    setDataSpy.mockClear();
+    rerender(
+      <SmokeChartPanel
+        syncKey="drag-zoom-regression"
+        targetName="Core Router"
+        targetHost="10.0.0.1"
+        rangeLabel="3h"
+        series={{
+          ...baseSeries,
+          timestamps: [...baseSeries.timestamps, t0 + 300],
+          min_ms: [...baseSeries.min_ms, 11],
+          p25_ms: [...baseSeries.p25_ms, 12],
+          p50_ms: [...baseSeries.p50_ms, 13],
+          p75_ms: [...baseSeries.p75_ms, 14],
+          p95_ms: [...baseSeries.p95_ms, 16],
+          max_ms: [...baseSeries.max_ms, 17],
+          jitter_ms: [...baseSeries.jitter_ms, 0.5],
+          loss_pct: [...baseSeries.loss_pct, 0],
+        }}
+      />
+    );
+    expect(setDataSpy).toHaveBeenCalledWith(expect.any(Array), false);
+    expect(setScaleSpy).toHaveBeenCalledWith("x", { min: dragMin, max: dragMax });
+
+    // Switching to fixedBounds (custom historical range) resets zoom and locks X bounds to [from, to]
+    setScaleSpy.mockClear();
+    const customFrom = t0 - 3600;
+    const customTo = t0 + 3600;
+    rerender(
+      <SmokeChartPanel
+        syncKey="drag-zoom-regression"
+        targetName="Core Router"
+        targetHost="10.0.0.1"
+        rangeLabel="CUSTOM"
+        fixedBounds={[customFrom, customTo]}
+        series={baseSeries}
+      />
+    );
+    expect(screen.queryByTestId("reset-zoom-btn")).not.toBeInTheDocument();
+    expect(setScaleSpy).toHaveBeenCalledWith("x", { min: customFrom, max: customTo });
+
+    // Zoom inside fixedBounds then click Reset Zoom -> restores exact fixedBounds
+    inst.scales.x = { min: t0, max: t0 + 180 };
+    inst.opts.hooks?.setScale?.[0]?.(inst, "x");
+    const resetBtn = await screen.findByTestId("reset-zoom-btn");
+    setScaleSpy.mockClear();
+    await user.click(resetBtn);
+    expect(setScaleSpy).toHaveBeenCalledWith("x", { min: customFrom, max: customTo });
   });
 });

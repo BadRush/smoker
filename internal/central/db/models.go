@@ -179,11 +179,15 @@ type TargetSeriesResponse struct {
 	Target    Target        `json:"target"`
 	Range     string        `json:"range"`
 	BucketSec int           `json:"bucket_sec"`
+	FromUnix  *int64        `json:"from_unix,omitempty"`
+	ToUnix    *int64        `json:"to_unix,omitempty"`
 	Series    []ProbeSeries `json:"series"`
 }
 
 type BatchSeriesResponse struct {
 	Range     string                   `json:"range"`
 	BucketSec int                      `json:"bucket_sec"`
+	FromUnix  *int64                   `json:"from_unix,omitempty"`
+	ToUnix    *int64                   `json:"to_unix,omitempty"`
 	Targets   map[string][]ProbeSeries `json:"targets"`
 }

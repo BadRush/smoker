@@ -1,6 +1,6 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import NocTvWallboardPage from "./page";
 import type { MatrixSnapshot } from "@/lib/api";
@@ -710,5 +710,81 @@ describe("NocTvWallboardPage layout controls", () => {
     expect(
       screen.queryByTestId("keyboard-shortcuts-modal")
     ).not.toBeInTheDocument();
+  });
+
+  it("supports 3d, 30d, and Custom Date Range via clean TimeRangePicker without persisting custom dates to localStorage", async () => {
+    const requestedUrls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        requestedUrls.push(url);
+        if (url.startsWith("/api/tv/matrix")) {
+          return new Response(JSON.stringify(TV_SNAPSHOT), { status: 200 });
+        }
+        if (url.startsWith("/api/tv/series")) {
+          return new Response(JSON.stringify({ range: "custom", targets: {} }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<NocTvWallboardPage />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("tv-target-card").length).toBeGreaterThan(0);
+    });
+
+    // Open More popover on /tv -> choose 3d (3 days)
+    await user.click(screen.getByTestId("tv-range-selector-more-btn"));
+    expect(screen.getByTestId("tv-range-selector-popover").textContent).not.toMatch(
+      /Auto resolution|agg_5m/i
+    );
+    await user.click(screen.getByTestId("tv-range-selector-preset-3d"));
+    expect(screen.getByTestId("tv-range-selector-more-btn")).toHaveTextContent("3d");
+    await waitFor(() => {
+      expect(requestedUrls.some((u) => u.includes("/api/tv/series?range=3d"))).toBe(true);
+    });
+
+    // Keyboard shortcut '9' switches directly to 30d (1 Month)
+    await user.keyboard("9");
+    expect(screen.getByTestId("tv-range-selector-more-btn")).toHaveTextContent("30d");
+    await waitFor(() => {
+      expect(requestedUrls.some((u) => u.includes("/api/tv/series?range=30d"))).toBe(true);
+    });
+
+    // Apply Custom Date Range -> switches badge to HISTORICAL, syncs URL, and does NOT store custom dates in localStorage
+    await user.click(screen.getByTestId("tv-range-selector-more-btn"));
+    fireEvent.change(screen.getByTestId("tv-range-selector-from-input"), {
+      target: { value: "2026-11-18T08:00" },
+    });
+    fireEvent.change(screen.getByTestId("tv-range-selector-to-input"), {
+      target: { value: "2026-11-19T14:00" },
+    });
+    await user.click(screen.getByTestId("tv-range-selector-apply-btn"));
+
+    const histBadge = await screen.findByTestId("tv-historical-badge");
+    expect(histBadge).toHaveTextContent("HISTORICAL");
+    expect(window.location.search).toMatch(/from=\d+&to=\d+/);
+    const storedObj = JSON.parse(
+      window.localStorage.getItem("smoker.tv.config.v1") ?? "{}"
+    );
+    expect(storedObj.range).toBe("30d");
+    expect(storedObj.fromSec).toBeUndefined();
+    expect(storedObj.toSec).toBeUndefined();
+    expect(storedObj.customWindow).toBeUndefined();
+    await waitFor(() => {
+      expect(
+        requestedUrls.some((u) => u.includes("/api/tv/series?from=") && u.includes("&to="))
+      ).toBe(true);
+    });
+
+    // Clicking HISTORICAL badge returns cleanly to Live rolling mode
+    await user.click(histBadge);
+    expect(screen.queryByTestId("tv-historical-badge")).not.toBeInTheDocument();
+    expect(window.location.search).not.toContain("from=");
   });
 });

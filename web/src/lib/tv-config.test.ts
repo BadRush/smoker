@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   computeBestFitGrid,
+  formatCustomWindowShort,
   loadTvConfigFromStorage,
+  parseCustomWindowFromSearch,
   parseTvConfig,
   partitionTargetsForTv,
   resolveTvFlowMode,
@@ -560,5 +562,24 @@ describe("tv-config helpers", () => {
     expect(filteredProbe.allSummaries.map((s) => `${s.target.name}@${s.focalProbeName}`)).toEqual([
       "e1-vhp.com@Probe-JKT",
     ]);
+  });
+
+  it("supports 3d and 30d ranges and parses/formats custom historical date windows without persisting them", () => {
+    expect(parseTvConfig("?range=3d").range).toBe("3d");
+    expect(parseTvConfig("?range=30d").range).toBe("30d");
+
+    const from = 1794902400;
+    const to = 1794988800;
+    expect(parseCustomWindowFromSearch(`?from=${from}&to=${to}`)).toEqual({
+      fromSec: from,
+      toSec: to,
+    });
+    // Rejects invalid reversed or too-short windows
+    expect(parseCustomWindowFromSearch(`?from=${to}&to=${from}`)).toBeNull();
+    expect(parseCustomWindowFromSearch(`?from=${from}&to=${from + 10}`)).toBeNull();
+    expect(parseCustomWindowFromSearch("?range=3h")).toBeNull();
+
+    const formatted = formatCustomWindowShort(from, to);
+    expect(formatted).toMatch(/\d{2}\s+[A-Z][a-z]{2}\s+\d{2}:\d{2}\s+–\s+\d{2}\s+[A-Z][a-z]{2}\s+\d{2}:\d{2}/);
   });
 });

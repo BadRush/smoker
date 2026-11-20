@@ -80,7 +80,17 @@ paths:
           in: query
           schema:
             type: string
-            enum: [15m, 1h, 3h, 6h, 12h, 24h, 7d]
+            enum: [15m, 1h, 3h, 6h, 12h, 24h, 3d, 7d, 30d]
+        - name: from
+          in: query
+          description: Custom window start (Unix seconds or RFC3339; requires 'to')
+          schema:
+            type: string
+        - name: to
+          in: query
+          description: Custom window end (Unix seconds or RFC3339; requires 'from')
+          schema:
+            type: string
         - name: ids
           in: query
           description: Comma-separated enabled target UUIDs (max 24)
@@ -429,7 +439,17 @@ paths:
           in: query
           schema:
             type: string
-            enum: [5m, 15m, 1h, 3h, 6h, 12h, 24h, 7d, 30d, 1y]
+            enum: [5m, 15m, 1h, 3h, 6h, 12h, 24h, 3d, 7d, 30d, 1y]
+        - name: from
+          in: query
+          description: Custom window start (Unix seconds or RFC3339; requires 'to')
+          schema:
+            type: string
+        - name: to
+          in: query
+          description: Custom window end (Unix seconds or RFC3339; requires 'from')
+          schema:
+            type: string
       responses:
         '200':
           description: Multi-probe quantile series
@@ -1031,6 +1051,8 @@ components:
         target: { $ref: '#/components/schemas/Target' }
         range: { type: string }
         bucket_sec: { type: integer }
+        from_unix: { type: integer, format: int64 }
+        to_unix: { type: integer, format: int64 }
         series:
           type: array
           items: { $ref: '#/components/schemas/ProbeSeries' }
@@ -1040,6 +1062,8 @@ components:
       properties:
         range: { type: string }
         bucket_sec: { type: integer }
+        from_unix: { type: integer, format: int64 }
+        to_unix: { type: integer, format: int64 }
         targets:
           type: object
           additionalProperties:

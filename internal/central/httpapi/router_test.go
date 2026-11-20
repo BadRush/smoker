@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -187,7 +188,22 @@ func (f *fakeStore) DeleteTarget(context.Context, uuid.UUID) error { return nil 
 func (f *fakeStore) SeedPublicMonitors(context.Context, bool) (db.SeedResult, error) {
 	return db.SeedResult{GroupsCreated: 2, TargetsCreated: 18}, nil
 }
-func (f *fakeStore) QueryTargetSeries(_ context.Context, id uuid.UUID, rangeKey string) (db.TargetSeriesResponse, error) {
+func (f *fakeStore) QueryTargetSeries(ctx context.Context, id uuid.UUID, rangeKey string) (db.TargetSeriesResponse, error) {
+	return f.QueryTargetSeriesWindow(ctx, id, db.SeriesWindow{RangeKey: rangeKey})
+}
+func (f *fakeStore) QueryTargetSeriesWindow(_ context.Context, id uuid.UUID, win db.SeriesWindow) (db.TargetSeriesResponse, error) {
+	rangeKey := win.RangeKey
+	if rangeKey == "" {
+		rangeKey = "5m"
+	}
+	var fromUnix, toUnix *int64
+	if win.IsCustom() {
+		rangeKey = "custom"
+		fSec := win.From.Unix()
+		tSec := win.To.Unix()
+		fromUnix = &fSec
+		toUnix = &tSec
+	}
 	for _, tgt := range f.targets {
 		if tgt.ID == id {
 			series := make([]db.ProbeSeries, 0, len(f.probes))
@@ -202,15 +218,29 @@ func (f *fakeStore) QueryTargetSeries(_ context.Context, id uuid.UUID, rangeKey 
 				Target:    tgt,
 				Range:     rangeKey,
 				BucketSec: 1,
+				FromUnix:  fromUnix,
+				ToUnix:    toUnix,
 				Series:    series,
 			}, nil
 		}
 	}
 	return db.TargetSeriesResponse{}, nil
 }
-func (f *fakeStore) QueryBatchTargetSeries(_ context.Context, ids []uuid.UUID, rangeKey string) (db.BatchSeriesResponse, error) {
+func (f *fakeStore) QueryBatchTargetSeries(ctx context.Context, ids []uuid.UUID, rangeKey string) (db.BatchSeriesResponse, error) {
+	return f.QueryBatchTargetSeriesWindow(ctx, ids, db.SeriesWindow{RangeKey: rangeKey})
+}
+func (f *fakeStore) QueryBatchTargetSeriesWindow(_ context.Context, ids []uuid.UUID, win db.SeriesWindow) (db.BatchSeriesResponse, error) {
+	rangeKey := win.RangeKey
 	if rangeKey == "" {
 		rangeKey = "3h"
+	}
+	var fromUnix, toUnix *int64
+	if win.IsCustom() {
+		rangeKey = "custom"
+		fSec := win.From.Unix()
+		tSec := win.To.Unix()
+		fromUnix = &fSec
+		toUnix = &tSec
 	}
 	want := make(map[uuid.UUID]bool, len(ids))
 	for _, id := range ids {
@@ -229,6 +259,8 @@ func (f *fakeStore) QueryBatchTargetSeries(_ context.Context, ids []uuid.UUID, r
 	return db.BatchSeriesResponse{
 		Range:     rangeKey,
 		BucketSec: 30,
+		FromUnix:  fromUnix,
+		ToUnix:    toUnix,
 		Targets:   out,
 	}, nil
 }
@@ -1496,5 +1528,95 @@ func TestTVSecurityHardeningKioskTokenAndPresets(t *testing.T) {
 	kioskRouter.ServeHTTP(cookieAdminRec, cookieAdminReq)
 	if cookieAdminRec.Code != http.StatusUnauthorized {
 		t.Fatalf("kiosk cookie MUST NOT access Admin /api/targets, got %d want 401", cookieAdminRec.Code)
+	}
+}
+
+func TestSeriesEndpointsSupport3d30dAndCustomDateRange(t *testing.T) {
+	t.Parallel()
+	pwHash, _ := auth.HashPassword("supersecret123")
+	cfg := config.CentralConfig{
+		JWTSecret:        "test-jwt-secret-at-least-32-chars!!",
+		AppEncryptionKey: "test-aes-secret-at-least-32-chars!!",
+		CookieSecure:     "false",
+		NocTVAllowUnauth: true,
+	}
+	tgtID := uuid.New()
+	store := &fakeStore{
+		adminHash: pwHash,
+		probes:    []db.Probe{{ID: uuid.New(), Name: "Local", Status: "online"}},
+		targets:   []db.Target{{ID: tgtID, Name: "Core GW", Host: "10.0.0.1", Enabled: true}},
+	}
+	router := NewRouter(Dependencies{
+		Config: cfg,
+		Store:  store,
+		Cache:  ingest.NewRollingCache(time.Minute),
+		Hub:    &fakeHub{},
+		AESKey: auth.DeriveAESKey(cfg.AppEncryptionKey),
+	})
+
+	// 1. /api/tv/series accepts 3d and 30d presets
+	for _, rk := range []string{"3d", "30d"} {
+		req := httptest.NewRequest(http.MethodGet, "/api/tv/series?range="+rk+"&ids="+tgtID.String(), nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /api/tv/series?range=%s got %d (%s), want 200", rk, rec.Code, rec.Body.String())
+		}
+		var out db.BatchSeriesResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.Range != rk {
+			t.Fatalf("expected range=%s, got %+v", rk, out)
+		}
+	}
+
+	// 2. /api/tv/series accepts custom Unix from/to window
+	now := time.Now().UTC().Truncate(time.Second)
+	fromSec := now.Add(-48 * time.Hour).Unix()
+	toSec := now.Add(-24 * time.Hour).Unix()
+	customReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/tv/series?from=%d&to=%d&ids=%s", fromSec, toSec, tgtID.String()), nil)
+	customRec := httptest.NewRecorder()
+	router.ServeHTTP(customRec, customReq)
+	if customRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/tv/series custom range got %d (%s), want 200", customRec.Code, customRec.Body.String())
+	}
+	var customOut db.BatchSeriesResponse
+	_ = json.Unmarshal(customRec.Body.Bytes(), &customOut)
+	if customOut.Range != "custom" || customOut.FromUnix == nil || *customOut.FromUnix != fromSec || customOut.ToUnix == nil || *customOut.ToUnix != toSec {
+		t.Fatalf("expected custom range with from=%d to=%d, got %+v", fromSec, toSec, customOut)
+	}
+
+	// 3. Invalid custom range (from >= to or missing 'to') -> 400
+	for _, badQS := range []string{
+		fmt.Sprintf("from=%d&to=%d", toSec, fromSec),
+		fmt.Sprintf("from=%d", fromSec),
+		"range=99d",
+	} {
+		badReq := httptest.NewRequest(http.MethodGet, "/api/tv/series?"+badQS, nil)
+		badRec := httptest.NewRecorder()
+		router.ServeHTTP(badRec, badReq)
+		if badRec.Code != http.StatusBadRequest {
+			t.Fatalf("GET /api/tv/series?%s got %d, want 400", badQS, badRec.Code)
+		}
+	}
+
+	// 4. Authenticated /api/targets/{id}/series accepts 3d and RFC3339 custom window
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"username":"admin","password":"supersecret123"}`))
+	loginRec := httptest.NewRecorder()
+	router.ServeHTTP(loginRec, loginReq)
+	sessionCookie := loginRec.Result().Cookies()[0]
+
+	fromRFC := now.Add(-6 * time.Hour).Format(time.RFC3339)
+	toRFC := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	tgtCustomReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/targets/%s/series?from=%s&to=%s", tgtID.String(), fromRFC, toRFC), nil)
+	tgtCustomReq.AddCookie(sessionCookie)
+	tgtCustomRec := httptest.NewRecorder()
+	router.ServeHTTP(tgtCustomRec, tgtCustomReq)
+	if tgtCustomRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/targets/{id}/series custom RFC3339 got %d (%s), want 200", tgtCustomRec.Code, tgtCustomRec.Body.String())
+	}
+	var tgtOut db.TargetSeriesResponse
+	_ = json.Unmarshal(tgtCustomRec.Body.Bytes(), &tgtOut)
+	if tgtOut.Range != "custom" || tgtOut.FromUnix == nil || tgtOut.ToUnix == nil {
+		t.Fatalf("expected custom TargetSeriesResponse with from_unix/to_unix, got %+v", tgtOut)
 	}
 }

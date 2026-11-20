@@ -22,9 +22,17 @@ export const UNGROUPED_GROUP_TOKEN = "ungrouped";
 export const TV_CONFIG_STORAGE_KEY = "smoker.tv.config.v1";
 
 export type TvOrientation = "landscape" | "portrait";
-export type TvRange = "15m" | "1h" | "3h" | "6h" | "12h" | "24h" | "7d";
+export type TvRange = "15m" | "1h" | "3h" | "6h" | "12h" | "24h" | "3d" | "7d" | "30d";
 export type TvProbeDisplayMode = "per-probe" | "per-target";
 export type TvSpotlightMode = "off" | "vip" | "all";
+
+export interface CustomTimeWindow {
+  fromSec: number;
+  toSec: number;
+}
+
+export const MIN_CUSTOM_WINDOW_SPAN_SEC = 60;
+export const MAX_CUSTOM_WINDOW_SPAN_SEC = 730 * 86400;
 
 export const TV_RANGES: readonly TvRange[] = [
   "15m",
@@ -33,8 +41,68 @@ export const TV_RANGES: readonly TvRange[] = [
   "6h",
   "12h",
   "24h",
+  "3d",
   "7d",
+  "30d",
 ] as const;
+
+const SHORT_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+/** Parses ?from=<unix>&to=<unix> (seconds or milliseconds) from a URL search string. */
+export function parseCustomWindowFromSearch(
+  search: string
+): CustomTimeWindow | null {
+  const raw = search.startsWith("?") ? search.slice(1) : search;
+  const params = new URLSearchParams(raw);
+  const fromRaw = params.get("from");
+  const toRaw = params.get("to");
+  if (!fromRaw || !toRaw) return null;
+  const fromNum = Number(fromRaw);
+  const toNum = Number(toRaw);
+  if (!Number.isFinite(fromNum) || !Number.isFinite(toNum)) return null;
+  const fromSec = Math.floor(fromNum > 1e12 ? fromNum / 1000 : fromNum);
+  const toSec = Math.floor(toNum > 1e12 ? toNum / 1000 : toNum);
+  const span = toSec - fromSec;
+  if (span < MIN_CUSTOM_WINDOW_SPAN_SEC || span > MAX_CUSTOM_WINDOW_SPAN_SEC) {
+    return null;
+  }
+  return { fromSec, toSec };
+}
+
+/** Formats a custom Unix window concisely in 24h local time, e.g. "18 Nov 08:00 – 19 Nov 14:00". */
+export function formatCustomWindowShort(fromSec: number, toSec: number): string {
+  const f = new Date(fromSec * 1000);
+  const t = new Date(toSec * 1000);
+  const sameDay =
+    f.getFullYear() === t.getFullYear() &&
+    f.getMonth() === t.getMonth() &&
+    f.getDate() === t.getDate();
+  const fDate = `${pad2(f.getDate())} ${SHORT_MONTHS[f.getMonth()]}`;
+  const fTime = `${pad2(f.getHours())}:${pad2(f.getMinutes())}`;
+  const tDate = `${pad2(t.getDate())} ${SHORT_MONTHS[t.getMonth()]}`;
+  const tTime = `${pad2(t.getHours())}:${pad2(t.getMinutes())}`;
+  if (sameDay) {
+    return `${fDate} ${fTime} – ${tTime}`;
+  }
+  return `${fDate} ${fTime} – ${tDate} ${tTime}`;
+}
 
 export interface TvWallConfig {
   orientation: TvOrientation;

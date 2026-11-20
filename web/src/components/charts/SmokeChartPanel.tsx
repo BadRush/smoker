@@ -55,6 +55,8 @@ async function getUPlot(): Promise<UPlotCtor> {
 
 export type ExportButtonState = "idle" | "copied" | "downloaded" | "error";
 
+const resetZoomSyncListeners = new Map<string, Set<() => void>>();
+
 export interface SmokeChartPanelHandle {
   exportPng: () => Promise<void>;
   resetZoom: () => void;
@@ -70,6 +72,7 @@ interface SmokeChartPanelProps {
   targetHost?: string;
   rangeLabel?: string;
   windowSec?: number | null;
+  fixedBounds?: readonly [number, number] | null;
   intervalSec?: number | null;
   baselineMs?: number | null;
   warnMs?: number | null;
@@ -105,6 +108,7 @@ export const SmokeChartPanel = forwardRef<
     targetHost,
     rangeLabel,
     windowSec,
+    fixedBounds,
     intervalSec,
     baselineMs,
     warnMs,
@@ -123,7 +127,9 @@ export const SmokeChartPanel = forwardRef<
   const shouldShowMeta = showThresholdMeta ?? !compact;
   const effectiveWarnMs = warnMs ?? series.warn_ms ?? null;
   const effectiveBaselineMs = baselineMs ?? series.baseline_ms ?? null;
-  const effectiveWindowSec = windowSec ?? rangeKeyToSeconds(rangeLabel);
+  const effectiveWindowSec = fixedBounds ? null : windowSec ?? rangeKeyToSeconds(rangeLabel);
+  const fixedFromSec = fixedBounds ? fixedBounds[0] : null;
+  const fixedToSec = fixedBounds ? fixedBounds[1] : null;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
   const sizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
@@ -133,6 +139,11 @@ export const SmokeChartPanel = forwardRef<
   warnMsRef.current = effectiveWarnMs;
   const windowSecRef = useRef<number | null>(effectiveWindowSec);
   windowSecRef.current = effectiveWindowSec;
+  const fixedBoundsRef = useRef<readonly [number, number] | null>(
+    fixedFromSec !== null && fixedToSec !== null ? [fixedFromSec, fixedToSec] : null
+  );
+  fixedBoundsRef.current =
+    fixedFromSec !== null && fixedToSec !== null ? [fixedFromSec, fixedToSec] : null;
   const onZoomStateChangeRef = useRef(onZoomStateChange);
   onZoomStateChangeRef.current = onZoomStateChange;
   const onExportStateChangeRef = useRef(onExportStateChange);
@@ -141,9 +152,12 @@ export const SmokeChartPanel = forwardRef<
   const [isZoomed, setIsZoomed] = useState(false);
   const [zoomedXRange, setZoomedXRange] = useState<[number, number] | null>(null);
   const isZoomedRef = useRef(false);
+  const zoomedXRangeRef = useRef<[number, number] | null>(null);
   const programmaticScaleRef = useRef(false);
   const prevWindowKeyRef = useRef<string | number | null>(
-    effectiveWindowSec ?? rangeLabel ?? null
+    fixedFromSec !== null && fixedToSec !== null
+      ? `fixed:${fixedFromSec}:${fixedToSec}`
+      : effectiveWindowSec ?? rangeLabel ?? null
   );
   const pointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
   const suppressNextClickRef = useRef(false);
@@ -158,8 +172,17 @@ export const SmokeChartPanel = forwardRef<
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [exportState, setExportState] = useState<ExportButtonState>("idle");
 
+  const getCanonicalBounds = () =>
+    computeChartXBounds(
+      seriesRef.current.timestamps,
+      windowSecRef.current,
+      Math.floor(Date.now() / 1000),
+      fixedBoundsRef.current
+    );
+
   const updateZoomState = (zoomed: boolean, bounds?: [number, number] | null) => {
     isZoomedRef.current = zoomed;
+    zoomedXRangeRef.current = zoomed && bounds ? bounds : null;
     setIsZoomed(zoomed);
     setZoomedXRange(zoomed && bounds ? bounds : null);
     onZoomStateChangeRef.current?.(zoomed);
@@ -187,12 +210,9 @@ export const SmokeChartPanel = forwardRef<
 
   const hasData = series.timestamps.length > 0;
 
-  function handleResetZoom() {
+  function resetThisChartZoom() {
     const plot = plotRef.current;
-    const bounds = computeChartXBounds(
-      seriesRef.current.timestamps,
-      windowSecRef.current
-    );
+    const bounds = getCanonicalBounds();
     if (!plot || !bounds) return;
     updateZoomState(false);
     programmaticScaleRef.current = true;
@@ -202,6 +222,37 @@ export const SmokeChartPanel = forwardRef<
       programmaticScaleRef.current = false;
     }
   }
+
+  function handleResetZoom() {
+    if (!compact) {
+      const listeners = resetZoomSyncListeners.get(syncKey);
+      if (listeners && listeners.size > 0) {
+        listeners.forEach((fn) => fn());
+        return;
+      }
+    }
+    resetThisChartZoom();
+  }
+
+  const resetThisChartZoomRef = useRef(resetThisChartZoom);
+  resetThisChartZoomRef.current = resetThisChartZoom;
+
+  useEffect(() => {
+    if (compact) return;
+    const listener = () => resetThisChartZoomRef.current();
+    let set = resetZoomSyncListeners.get(syncKey);
+    if (!set) {
+      set = new Set();
+      resetZoomSyncListeners.set(syncKey, set);
+    }
+    set.add(listener);
+    return () => {
+      set?.delete(listener);
+      if (set && set.size === 0) {
+        resetZoomSyncListeners.delete(syncKey);
+      }
+    };
+  }, [compact, syncKey]);
 
   async function handleExportPng() {
     if (!containerRef.current && series.timestamps.length === 0) return;
@@ -263,32 +314,80 @@ export const SmokeChartPanel = forwardRef<
         padding: [10, compact ? 4 : 6, 0, 6],
         legend: { show: false },
         cursor: {
-          sync: {
-            key: sync.key,
-            setSeries: true,
+          sync: compact
+            ? {
+                key: sync.key,
+                setSeries: true,
+                scales: ["x", null],
+                filters: {
+                  pub: (type) =>
+                    type === "mousemove" ||
+                    type === "mouseleave" ||
+                    type === "mouseenter",
+                  sub: (type) =>
+                    type === "mousemove" ||
+                    type === "mouseleave" ||
+                    type === "mouseenter",
+                },
+              }
+            : {
+                key: sync.key,
+                setSeries: true,
+                scales: ["x", null],
+              },
+          drag: { x: true, y: false, dist: 6 },
+          bind: {
+            dblclick: () => null,
           },
-          drag: { x: true, y: false },
         },
         scales: {
           x: {
             time: true,
-            range: (_u, dataMin, dataMax) => {
-              const bounds = computeChartXBounds(
-                seriesRef.current.timestamps,
-                windowSecRef.current
-              );
+            auto: false,
+            range: (_u, min, max) => {
+              if (
+                min != null &&
+                max != null &&
+                Number.isFinite(min) &&
+                Number.isFinite(max) &&
+                max > min
+              ) {
+                return [min, max];
+              }
+              const bounds = getCanonicalBounds();
               if (bounds) return bounds;
-              return [dataMin, dataMax];
+              return [min, max];
             },
           },
           y: {
             auto: true,
-            range: (_u, _min, dataMax) => {
+            range: (u, _min, dataMax) => {
               const s = seriesRef.current;
-              let top = dataMax || 10;
-              for (let i = 0; i < s.p95_ms.length; i++) {
+              const xMin = u.scales.x?.min;
+              const xMax = u.scales.x?.max;
+              const hasXWindow =
+                xMin !== undefined &&
+                xMax !== undefined &&
+                Number.isFinite(xMin) &&
+                Number.isFinite(xMax) &&
+                xMax > xMin;
+              let top = 0;
+              let matched = 0;
+              for (let i = 0; i < s.timestamps.length; i++) {
+                const ts = s.timestamps[i];
+                if (hasXWindow && (ts < xMin || ts > xMax)) continue;
                 const candidate = s.p95_ms[i] ?? s.max_ms[i] ?? s.p50_ms[i] ?? 0;
-                if (candidate > top) top = candidate;
+                if (candidate > 0) {
+                  matched++;
+                  if (candidate > top) top = candidate;
+                }
+              }
+              if (matched === 0) {
+                top = dataMax || 10;
+                for (let i = 0; i < s.p95_ms.length; i++) {
+                  const candidate = s.p95_ms[i] ?? s.max_ms[i] ?? s.p50_ms[i] ?? 0;
+                  if (candidate > top) top = candidate;
+                }
               }
               const upper = computeChartYUpper(top, warnMsRef.current);
               return [0, Math.max(5, upper * 1.15)];
@@ -362,10 +461,7 @@ export const SmokeChartPanel = forwardRef<
             (u, key) => {
               if (key !== "x") return;
               if (programmaticScaleRef.current) return;
-              const bounds = computeChartXBounds(
-                seriesRef.current.timestamps,
-                windowSecRef.current
-              );
+              const bounds = getCanonicalBounds();
               if (!bounds) return;
               const min = u.scales.x?.min;
               const max = u.scales.x?.max;
@@ -386,10 +482,7 @@ export const SmokeChartPanel = forwardRef<
           targetEl
         );
         plotRef.current = plot;
-        const initBounds = computeChartXBounds(
-          seriesRef.current.timestamps,
-          windowSecRef.current
-        );
+        const initBounds = getCanonicalBounds();
         if (initBounds) {
           plot.setScale?.("x", { min: initBounds[0], max: initBounds[1] });
         }
@@ -424,6 +517,7 @@ export const SmokeChartPanel = forwardRef<
       }
       plotRef.current = null;
       isZoomedRef.current = false;
+      zoomedXRangeRef.current = null;
       setIsZoomed(false);
       setZoomedXRange(null);
     };
@@ -443,7 +537,11 @@ export const SmokeChartPanel = forwardRef<
   }, [fixedHeight, compact]);
 
   useEffect(() => {
-    const nextRangeKey = effectiveWindowSec ?? rangeLabel ?? null;
+    const fixedKey =
+      fixedFromSec !== null && fixedToSec !== null
+        ? `fixed:${fixedFromSec}:${fixedToSec}`
+        : null;
+    const nextRangeKey = fixedKey ?? effectiveWindowSec ?? rangeLabel ?? null;
     const rangeChanged = prevWindowKeyRef.current !== nextRangeKey;
     prevWindowKeyRef.current = nextRangeKey;
 
@@ -463,23 +561,25 @@ export const SmokeChartPanel = forwardRef<
           shouldResetScale
         );
         if (shouldResetScale) {
-          const bounds = computeChartXBounds(
-            series.timestamps,
-            effectiveWindowSec
-          );
+          const bounds = getCanonicalBounds();
           if (bounds) {
             plotRef.current.setScale?.("x", {
               min: bounds[0],
               max: bounds[1],
             });
           }
+        } else if (zoomedXRangeRef.current) {
+          plotRef.current.setScale?.("x", {
+            min: zoomedXRangeRef.current[0],
+            max: zoomedXRangeRef.current[1],
+          });
         }
         plotRef.current.redraw?.();
       } finally {
         programmaticScaleRef.current = false;
       }
     }
-  }, [series, effectiveWarnMs, effectiveWindowSec, rangeLabel]);
+  }, [series, effectiveWarnMs, effectiveWindowSec, rangeLabel, fixedFromSec, fixedToSec]);
 
   const zoomWindowLoss = useMemo(() => {
     if (compact || !zoomedXRange) return null;
@@ -671,7 +771,7 @@ export const SmokeChartPanel = forwardRef<
               if (!start) return;
               const dx = Math.abs((e.clientX ?? 0) - start.x);
               const dy = Math.abs((e.clientY ?? 0) - start.y);
-              if (dx >= 8 || dy >= 8) {
+              if (dx >= 6 || dy >= 6) {
                 suppressNextClickRef.current = true;
               }
             }}
@@ -681,7 +781,7 @@ export const SmokeChartPanel = forwardRef<
               pointerDownPosRef.current = null;
               const dx = Math.abs(e.clientX - start.x);
               const dy = Math.abs(e.clientY - start.y);
-              if (dx >= 8 || dy >= 8) {
+              if (dx >= 6 || dy >= 6) {
                 suppressNextClickRef.current = true;
               }
             }}
@@ -695,7 +795,7 @@ export const SmokeChartPanel = forwardRef<
             style={effectiveFillHeight ? undefined : { minHeight: defaultHeight }}
             className={`${
               effectiveFillHeight ? "flex-1 min-h-[72px] w-full overflow-hidden" : "w-full"
-            } ${onZoomClick ? "cursor-zoom-in" : ""}`}
+            } ${onZoomClick ? "cursor-zoom-in" : "cursor-crosshair"}`}
           />
         )}
       </div>

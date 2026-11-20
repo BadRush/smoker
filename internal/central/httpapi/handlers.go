@@ -275,19 +275,83 @@ func (s *Server) handleGetTVMatrix(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+var (
+	tvSeriesAllowedRanges     = []string{"15m", "1h", "3h", "6h", "12h", "24h", "3d", "7d", "30d"}
+	targetSeriesAllowedRanges = []string{"5m", "15m", "1h", "3h", "6h", "12h", "24h", "3d", "7d", "30d", "1y"}
+)
+
+func parseSeriesTimestamp(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if sec, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		// Accept Unix seconds (or Unix milliseconds if >= 1e11)
+		if sec >= 100000000000 {
+			return time.UnixMilli(sec).UTC(), nil
+		}
+		if sec <= 0 {
+			return time.Time{}, fmt.Errorf("timestamp must be positive")
+		}
+		return time.Unix(sec, 0).UTC(), nil
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t.UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("invalid timestamp %q; expected unix seconds or RFC3339", raw)
+}
+
+func parseSeriesWindowParams(r *http.Request, allowed []string, defaultRange string) (db.SeriesWindow, error) {
+	q := r.URL.Query()
+	rawFrom := strings.TrimSpace(q.Get("from"))
+	rawTo := strings.TrimSpace(q.Get("to"))
+
+	if rawFrom != "" || rawTo != "" {
+		if rawFrom == "" || rawTo == "" {
+			return db.SeriesWindow{}, fmt.Errorf("both 'from' and 'to' query parameters are required for custom range")
+		}
+		fromT, err := parseSeriesTimestamp(rawFrom)
+		if err != nil {
+			return db.SeriesWindow{}, fmt.Errorf("invalid 'from': %w", err)
+		}
+		toT, err := parseSeriesTimestamp(rawTo)
+		if err != nil {
+			return db.SeriesWindow{}, fmt.Errorf("invalid 'to': %w", err)
+		}
+		now := time.Now().UTC()
+		if toT.After(now.Add(60 * time.Second)) {
+			toT = now
+		}
+		if !fromT.Before(toT) {
+			return db.SeriesWindow{}, fmt.Errorf("'from' must be earlier than 'to'")
+		}
+		span := toT.Sub(fromT)
+		if span < time.Minute {
+			return db.SeriesWindow{}, fmt.Errorf("custom range must be at least 1 minute")
+		}
+		if span > 730*24*time.Hour {
+			return db.SeriesWindow{}, fmt.Errorf("custom range cannot exceed 730 days")
+		}
+		return db.SeriesWindow{RangeKey: "custom", From: &fromT, To: &toT}, nil
+	}
+
+	rangeKey := strings.TrimSpace(q.Get("range"))
+	if rangeKey == "" {
+		rangeKey = defaultRange
+	}
+	for _, okRange := range allowed {
+		if rangeKey == okRange {
+			return db.SeriesWindow{RangeKey: rangeKey}, nil
+		}
+	}
+	return db.SeriesWindow{}, fmt.Errorf("unsupported range %q; expected one of %s", rangeKey, strings.Join(allowed, ","))
+}
+
 func (s *Server) handleGetTVSeries(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeTVRequest(w, r) {
 		return
 	}
 
-	rangeKey := strings.TrimSpace(r.URL.Query().Get("range"))
-	if rangeKey == "" {
-		rangeKey = "3h"
-	}
-	switch rangeKey {
-	case "15m", "1h", "3h", "6h", "12h", "24h", "7d":
-	default:
-		writeProblem(w, r, http.StatusBadRequest, "validation_error", "Unsupported TV range; expected one of 15m,1h,3h,6h,12h,24h,7d")
+	win, err := parseSeriesWindowParams(r, tvSeriesAllowedRanges, "3h")
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", err.Error())
 		return
 	}
 
@@ -310,7 +374,7 @@ func (s *Server) handleGetTVSeries(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	res, err := s.store.QueryBatchTargetSeries(r.Context(), targetIDs, rangeKey)
+	res, err := s.store.QueryBatchTargetSeriesWindow(r.Context(), targetIDs, win)
 	if err != nil {
 		handleStoreErr(w, r, err)
 		return
@@ -843,11 +907,12 @@ func (s *Server) handleGetTargetSeries(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rangeKey := r.URL.Query().Get("range")
-	if rangeKey == "" {
-		rangeKey = "5m"
+	win, err := parseSeriesWindowParams(r, targetSeriesAllowedRanges, "5m")
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "validation_error", err.Error())
+		return
 	}
-	res, err := s.store.QueryTargetSeries(r.Context(), id, rangeKey)
+	res, err := s.store.QueryTargetSeriesWindow(r.Context(), id, win)
 	if err != nil {
 		handleStoreErr(w, r, err)
 		return

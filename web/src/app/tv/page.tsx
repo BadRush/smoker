@@ -30,6 +30,7 @@ import {
   type SmokeChartPanelHandle,
 } from "@/components/charts/SmokeChartPanel";
 import { TargetZoomModal } from "@/components/charts/TargetZoomModal";
+import { TimeRangePicker } from "@/components/charts/TimeRangePicker";
 import {
   DisplaySizeControls,
   LayoutPresetPills,
@@ -75,9 +76,11 @@ import {
 import {
   computeBestFitGrid,
   DEFAULT_TV_CONFIG,
+  formatCustomWindowShort,
   groupSummariesByProbe,
   loadTvConfigFromStorage,
   MANUAL_CARD_OPTIONS,
+  parseCustomWindowFromSearch,
   parseTvConfig,
   partitionTargetsForTv,
   resolveTvFlowMode,
@@ -87,6 +90,7 @@ import {
   serializeTvConfig,
   TV_RANGES,
   UNGROUPED_GROUP_TOKEN,
+  type CustomTimeWindow,
   type TargetHealthSummary,
   type TvGridLayout,
   type TvOrientation,
@@ -126,6 +130,7 @@ interface FocalTargetCardProps {
   item: TargetHealthSummary;
   layout: TvGridLayout;
   range: TvRange;
+  customWindow?: CustomTimeWindow | null;
   probeMap: Map<string, string>;
   groupMap: Map<string, string>;
   seriesByTarget: Record<string, ProbeSeries[]>;
@@ -139,6 +144,7 @@ function FocalTargetCard({
   item,
   layout,
   range,
+  customWindow = null,
   probeMap,
   groupMap,
   seriesByTarget,
@@ -166,7 +172,8 @@ function FocalTargetCard({
         seriesMap.get(focalCell.probe_id),
         focalCell,
         focalProbeLabel,
-        range
+        range,
+        Boolean(customWindow)
       )
     : null;
   const focalSeries = rawFocalSeries
@@ -400,8 +407,13 @@ function FocalTargetCard({
             series={focalSeries}
             targetName={target.name}
             targetHost={target.host}
-            rangeLabel={range}
-            windowSec={rangeKeyToSeconds(range)}
+            rangeLabel={customWindow ? "CUSTOM" : range}
+            windowSec={customWindow ? null : rangeKeyToSeconds(range)}
+            fixedBounds={
+              customWindow
+                ? [customWindow.fromSec, customWindow.toSec]
+                : null
+            }
             intervalSec={target.interval_sec}
             probeBadgeTestId={isPerProbeCard ? "tv-card-probe-badge" : undefined}
             baselineMs={focalCell.baseline_ms ?? focalSeries.baseline_ms ?? null}
@@ -425,14 +437,20 @@ function FocalTargetCard({
 
 export default function NocTvWallboardPage() {
   const [cfg, setCfg] = useState<TvWallConfig>(DEFAULT_TV_CONFIG);
+  const [customWindow, setCustomWindow] = useState<CustomTimeWindow | null>(null);
+  const customWindowRef = useRef<CustomTimeWindow | null>(null);
+  customWindowRef.current = customWindow;
   const [urlHydrated, setUrlHydrated] = useState(false);
   const [data, setData] = useState<MatrixSnapshot | null>(null);
   const [seriesByRange, setSeriesByRange] = useState<
     Record<string, Record<string, ProbeSeries[]>>
   >({});
+  const activeSeriesKey = customWindow
+    ? `custom:${customWindow.fromSec}:${customWindow.toSec}`
+    : cfg.range;
   const seriesByTarget = useMemo(
-    () => seriesByRange[cfg.range] ?? {},
-    [seriesByRange, cfg.range]
+    () => seriesByRange[activeSeriesKey] ?? {},
+    [seriesByRange, activeSeriesKey]
   );
   const [error, setError] = useState<string | null>(null);
   const [pageIdx, setPageIdx] = useState(0);
@@ -553,9 +571,16 @@ export default function NocTvWallboardPage() {
       requestedPresetSlugRef.current = presetParam;
       initialConfigSourceRef.current = "preset-query";
     }
+    const parsedCustom = parseCustomWindowFromSearch(window.location.search);
+    if (parsedCustom) {
+      customWindowRef.current = parsedCustom;
+      setCustomWindow(parsedCustom);
+    }
     params.delete("zoom");
     params.delete("preset");
     params.delete("key");
+    params.delete("from");
+    params.delete("to");
     const hasConfigSearch = params.toString().length > 0;
     const stored = loadTvConfigFromStorage();
     if (!presetParam) {
@@ -584,15 +609,21 @@ export default function NocTvWallboardPage() {
     }
   }, [data]);
 
-  // Sync config updates to URL query parameters and localStorage without triggering router navigation
+  // Sync config updates to URL query parameters and localStorage without triggering router navigation.
+  // Custom historical date windows are synced only to URL (?from=&to=), NEVER persisted to localStorage.
   const updateConfig = useCallback(
     (updater: (prev: TvWallConfig) => TvWallConfig, resetPage = true) => {
       setActivePresetSlug(null);
       setCfg((prev) => {
         const next = updater(prev);
         if (typeof window !== "undefined") {
-          const qs = serializeTvConfig(next);
-          const nextUrl = `${window.location.pathname}?${qs}`;
+          const params = new URLSearchParams(serializeTvConfig(next));
+          const activeCustom = customWindowRef.current;
+          if (activeCustom) {
+            params.set("from", String(activeCustom.fromSec));
+            params.set("to", String(activeCustom.toSec));
+          }
+          const nextUrl = `${window.location.pathname}?${params.toString()}`;
           window.history.replaceState(null, "", nextUrl);
           saveTvConfigToStorage(next);
         }
@@ -605,7 +636,33 @@ export default function NocTvWallboardPage() {
     []
   );
 
+  const handleSelectPresetRange = useCallback(
+    (nextRange: TvRange) => {
+      customWindowRef.current = null;
+      setCustomWindow(null);
+      updateConfig((prev) => ({ ...prev, range: nextRange }), false);
+    },
+    [updateConfig]
+  );
+
+  const handleApplyCustomWindow = useCallback((win: CustomTimeWindow) => {
+    customWindowRef.current = win;
+    setCustomWindow(win);
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      params.set("from", String(win.fromSec));
+      params.set("to", String(win.toSec));
+      window.history.replaceState(
+        null,
+        "",
+        `${window.location.pathname}?${params.toString()}`
+      );
+    }
+  }, []);
+
   const applyTvPreset = useCallback((preset: TVPreset, syncUrl = true) => {
+    customWindowRef.current = null;
+    setCustomWindow(null);
     const nextCfg = sanitizeTvConfig(preset.config);
     setCfg(nextCfg);
     setCountdown(nextCfg.rotateSec);
@@ -1061,34 +1118,47 @@ export default function NocTvWallboardPage() {
 
   const loadVisibleSeries = useCallback(async () => {
     if (!urlHydrated || !visibleIdsKey) return;
-    const requestedRange = cfg.range;
+    const requestedKey = customWindow
+      ? `custom:${customWindow.fromSec}:${customWindow.toSec}`
+      : cfg.range;
+    const rangeQuery = customWindow
+      ? `from=${customWindow.fromSec}&to=${customWindow.toSec}`
+      : `range=${cfg.range}`;
     try {
       const res = await apiRequest<BatchSeriesResponse>(
-        `/api/tv/series?range=${requestedRange}&ids=${encodeURIComponent(visibleIdsKey)}`
+        `/api/tv/series?${rangeQuery}&ids=${encodeURIComponent(visibleIdsKey)}`
       );
       setSeriesByRange((prev) => ({
         ...prev,
-        [requestedRange]: {
-          ...(prev[requestedRange] ?? {}),
+        [requestedKey]: {
+          ...(prev[requestedKey] ?? {}),
           ...res.targets,
         },
       }));
     } catch {
       // Fall back gracefully to live rolling cache if batch series fetch temporarily fails
     }
-  }, [urlHydrated, visibleIdsKey, cfg.range]);
+  }, [urlHydrated, visibleIdsKey, cfg.range, customWindow]);
 
   useEffect(() => {
     if (!urlHydrated || !visibleIdsKey) return;
     void loadVisibleSeries();
+    if (customWindow) {
+      // Historical custom windows are frozen; skip background rolling series polling
+      return;
+    }
     const isLongRange =
-      cfg.range === "12h" || cfg.range === "24h" || cfg.range === "7d";
+      cfg.range === "12h" ||
+      cfg.range === "24h" ||
+      cfg.range === "3d" ||
+      cfg.range === "7d" ||
+      cfg.range === "30d";
     const intervalMs = isLongRange ? 60_000 : 15_000;
     const poll = setInterval(() => {
       void loadVisibleSeries();
     }, intervalMs);
     return () => clearInterval(poll);
-  }, [urlHydrated, visibleIdsKey, cfg.range, loadVisibleSeries]);
+  }, [urlHydrated, visibleIdsKey, cfg.range, customWindow, loadVisibleSeries]);
 
   async function handleSimulateAnomaly(
     mode: "high_latency" | "intermittent_loss" | "down" | "clear"
@@ -1265,7 +1335,7 @@ export default function NocTvWallboardPage() {
         const range = TV_RANGES[Number(e.key) - 1];
         if (range) {
           e.preventDefault();
-          updateConfig((prev) => ({ ...prev, range }), false);
+          handleSelectPresetRange(range);
         }
       }
     };
@@ -1283,6 +1353,7 @@ export default function NocTvWallboardPage() {
     partitioned.pinnedAlerts.length,
     impairedOnly,
     updateConfig,
+    handleSelectPresetRange,
     handleToggleFullscreen,
   ]);
 
@@ -1487,20 +1558,33 @@ export default function NocTvWallboardPage() {
             </h1>
           </div>
 
-          <span
-            className={`inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] xl:text-[11px] font-mono uppercase whitespace-nowrap ${
-              wsState === "connected"
-                ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
-                : "border-amber-500/40 bg-amber-500/15 text-amber-300"
-            }`}
-          >
+          {customWindow ? (
+            <button
+              type="button"
+              data-testid="tv-historical-badge"
+              onClick={() => handleSelectPresetRange(cfg.range)}
+              title="Viewing historical custom range — click to return to Live"
+              className="inline-flex shrink-0 items-center gap-1 rounded border border-cyan-500/45 bg-cyan-500/15 px-1.5 py-0.5 text-[10px] xl:text-[11px] font-mono uppercase text-cyan-200 hover:bg-cyan-500/25 whitespace-nowrap transition-colors"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
+              HISTORICAL
+            </button>
+          ) : (
             <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                wsState === "connected" ? "bg-emerald-400" : "bg-amber-400"
+              className={`inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] xl:text-[11px] font-mono uppercase whitespace-nowrap ${
+                wsState === "connected"
+                  ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
+                  : "border-amber-500/40 bg-amber-500/15 text-amber-300"
               }`}
-            />
-            {wsState === "connected" ? "LIVE" : "SYNC"}
-          </span>
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  wsState === "connected" ? "bg-emerald-400" : "bg-amber-400"
+                }`}
+              />
+              {wsState === "connected" ? "LIVE" : "SYNC"}
+            </span>
+          )}
 
           <span className="hidden xl:block h-4 w-px bg-border shrink-0" aria-hidden="true" />
 
@@ -1599,28 +1683,16 @@ export default function NocTvWallboardPage() {
 
         {/* Zone 2 (Center): Graph Time Range + Saved Preset Switcher */}
         <div className="flex items-center gap-2 min-w-0 shrink">
-          <div
-            role="group"
-            aria-label="TV Graph time range"
-            data-testid="tv-range-selector"
-            className="hidden lg:inline-flex items-center rounded-md border border-border bg-canvas/80 p-0.5 shrink-0"
-          >
-            {TV_RANGES.map((r) => (
-              <button
-                key={r}
-                type="button"
-                aria-pressed={cfg.range === r}
-                onClick={() => updateConfig((prev) => ({ ...prev, range: r }), false)}
-                className={`rounded px-1.5 xl:px-2 py-0.5 text-[10px] xl:text-[11px] font-mono font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
-                  cfg.range === r
-                    ? "bg-emerald-500 text-zinc-950 font-semibold"
-                    : "text-zinc-400 hover:text-zinc-100"
-                }`}
-              >
-                {r}
-              </button>
-            ))}
-          </div>
+          <TimeRangePicker
+            compact
+            value={cfg.range}
+            customWindow={customWindow}
+            onSelectPreset={(r) => handleSelectPresetRange(r as TvRange)}
+            onApplyCustom={handleApplyCustomWindow}
+            ariaLabel="TV Graph time range"
+            testId="tv-range-selector"
+            className="hidden lg:inline-flex"
+          />
 
           {presets.length > 0 && (
             <div className="hidden md:inline-flex items-center gap-1.5 rounded-md border border-border bg-canvas/80 px-2 h-7 max-w-[175px] shrink-0 focus-within:border-emerald-500">
@@ -1963,7 +2035,11 @@ export default function NocTvWallboardPage() {
               <div className="flex items-center gap-2 font-bold uppercase tracking-wide text-amber-300 min-w-0">
                 <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" aria-hidden="true" />
                 <span className="truncate">
-                  Multi-Probe Highlight &amp; Alert / Warn Spotlight ({activeSlide.items.length} Hosts · {cfg.range})
+                  Multi-Probe Highlight &amp; Alert / Warn Spotlight ({activeSlide.items.length} Hosts ·{" "}
+                  {customWindow
+                    ? formatCustomWindowShort(customWindow.fromSec, customWindow.toSec)
+                    : cfg.range}
+                  )
                 </span>
               </div>
               <span className="hidden xl:inline shrink-0 font-mono text-[11px] text-zinc-200">
@@ -1993,6 +2069,7 @@ export default function NocTvWallboardPage() {
                   item={item}
                   layout={spotlightLayout}
                   range={cfg.range}
+                  customWindow={customWindow}
                   probeMap={probeMap}
                   groupMap={groupMap}
                   seriesByTarget={seriesByTarget}
@@ -2095,6 +2172,7 @@ export default function NocTvWallboardPage() {
                           item={item}
                           layout={gridLayout}
                           range={cfg.range}
+                          customWindow={customWindow}
                           probeMap={probeMap}
                           groupMap={groupMap}
                           seriesByTarget={seriesByTarget}
@@ -2145,6 +2223,7 @@ export default function NocTvWallboardPage() {
                           item={item}
                           layout={gridLayout}
                           range={cfg.range}
+                          customWindow={customWindow}
                           probeMap={probeMap}
                           groupMap={groupMap}
                           seriesByTarget={seriesByTarget}
@@ -2188,6 +2267,7 @@ export default function NocTvWallboardPage() {
                   item={item}
                   layout={gridLayout}
                   range={cfg.range}
+                  customWindow={customWindow}
                   probeMap={probeMap}
                   groupMap={groupMap}
                   seriesByTarget={seriesByTarget}
@@ -2229,7 +2309,11 @@ export default function NocTvWallboardPage() {
             ? `${cfg.layoutMode === "auto" ? "Auto" : cfg.layoutMode} ${activeLayout.cols}×${activeLayout.rows} (${activeLayout.aspectRatio}:1)`
             : `Fixed ${activeLayout.cols}×${activeLayout.rows} (${activeLayout.aspectRatio}:1)`}{" "}
           · {effectiveFlow}
-          {cfg.widthSpec !== "full" ? ` · ${cfg.widthSpec}` : ""} · {cfg.range} ·{" "}
+          {cfg.widthSpec !== "full" ? ` · ${cfg.widthSpec}` : ""} ·{" "}
+          {customWindow
+            ? formatCustomWindowShort(customWindow.fromSec, customWindow.toSec)
+            : cfg.range}{" "}
+          ·{" "}
           {partitionSummary(kpis.probesOnline, kpis.totalProbes, data?.active_incidents ?? 0)}
         </span>
       </footer>
@@ -2246,6 +2330,7 @@ export default function NocTvWallboardPage() {
             cells={data.cells}
             probeMap={probeMap}
             initialRange={cfg.range}
+            initialCustomWindow={customWindow}
             fallbackSeries={seriesByTarget[zTarget.id] ?? []}
             onClose={handleCloseZoomTarget}
           />
@@ -2436,22 +2521,20 @@ export default function NocTvWallboardPage() {
                 <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-300">
                   Graph History Window
                 </p>
-                <div className="grid grid-cols-4 gap-1.5">
+                <div className="grid grid-cols-3 gap-1.5">
                   {TV_RANGES.map((r) => (
                     <button
                       key={r}
                       type="button"
-                      aria-pressed={cfg.range === r}
-                      onClick={() =>
-                        updateConfig((prev) => ({ ...prev, range: r }), false)
-                      }
+                      aria-pressed={!customWindow && cfg.range === r}
+                      onClick={() => handleSelectPresetRange(r)}
                       className={`rounded border px-2 py-1.5 text-xs font-mono ${
-                        cfg.range === r
+                        !customWindow && cfg.range === r
                           ? "border-emerald-500 bg-emerald-500 font-semibold text-zinc-950"
                           : "border-border bg-elevated text-zinc-200"
                       }`}
                     >
-                      {r}
+                      {r === "30d" ? "30d (1m)" : r}
                     </button>
                   ))}
                 </div>

@@ -6,6 +6,7 @@ import { useParams, useRouter } from "next/navigation";
 import { ArrowLeft, Pencil, RefreshCw, ServerCrash } from "lucide-react";
 import { NocShell } from "@/components/layout/NocShell";
 import { SmokeChartPanel } from "@/components/charts/SmokeChartPanel";
+import { TimeRangePicker } from "@/components/charts/TimeRangePicker";
 import { MtrSnapshotsPanel } from "@/components/mtr/MtrSnapshotsPanel";
 import {
   ApiError,
@@ -18,9 +19,27 @@ import {
   rangeKeyToSeconds,
   resolveEffectiveWarnMs,
 } from "@/lib/smoke-math";
+import {
+  parseCustomWindowFromSearch,
+  type CustomTimeWindow,
+} from "@/lib/tv-config";
 import { useLiveSocket, type LiveEventMessage } from "@/lib/useLiveSocket";
 
-const RANGES = ["5m", "15m", "1h", "3h", "6h", "12h", "24h", "7d", "30d", "1y"] as const;
+const RANGES = [
+  "5m",
+  "15m",
+  "1h",
+  "3h",
+  "6h",
+  "12h",
+  "24h",
+  "3d",
+  "7d",
+  "30d",
+  "1y",
+] as const;
+
+const VALID_DETAIL_RANGES = new Set<string>(RANGES);
 
 export default function TargetDetailPage() {
   const params = useParams<{ id: string }>();
@@ -28,6 +47,8 @@ export default function TargetDetailPage() {
   const router = useRouter();
 
   const [rangeKey, setRangeKey] = useState<string>("5m");
+  const [customWindow, setCustomWindow] = useState<CustomTimeWindow | null>(null);
+  const [urlHydrated, setUrlHydrated] = useState(false);
   const [data, setData] = useState<TargetSeriesResponse | null>(null);
   const [mtrSnaps, setMtrSnaps] = useState<MTRSnapshot[]>([]);
   const [loading, setLoading] = useState(true);
@@ -36,6 +57,65 @@ export default function TargetDetailPage() {
   const [mtrError, setMtrError] = useState<string | null>(null);
 
   const mtrTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const qs = new URLSearchParams(window.location.search);
+    const parsedCustom = parseCustomWindowFromSearch(window.location.search);
+    if (parsedCustom) {
+      setCustomWindow(parsedCustom);
+    } else {
+      const r = qs.get("range") ?? "";
+      if (VALID_DETAIL_RANGES.has(r)) {
+        setRangeKey(r);
+      }
+    }
+    setUrlHydrated(true);
+  }, []);
+
+  const syncUrlParams = useCallback(
+    (nextRange: string, nextCustom: CustomTimeWindow | null) => {
+      if (typeof window === "undefined") return;
+      const qs = new URLSearchParams(window.location.search);
+      if (nextCustom) {
+        qs.delete("range");
+        qs.set("from", String(nextCustom.fromSec));
+        qs.set("to", String(nextCustom.toSec));
+      } else {
+        qs.delete("from");
+        qs.delete("to");
+        if (nextRange && nextRange !== "5m") {
+          qs.set("range", nextRange);
+        } else {
+          qs.delete("range");
+        }
+      }
+      const next = qs.toString();
+      window.history.replaceState(
+        null,
+        "",
+        next ? `${window.location.pathname}?${next}` : window.location.pathname
+      );
+    },
+    []
+  );
+
+  const handleSelectPreset = useCallback(
+    (nextRange: string) => {
+      setCustomWindow(null);
+      setRangeKey(nextRange);
+      syncUrlParams(nextRange, null);
+    },
+    [syncUrlParams]
+  );
+
+  const handleApplyCustom = useCallback(
+    (win: CustomTimeWindow) => {
+      setCustomWindow(win);
+      syncUrlParams(rangeKey, win);
+    },
+    [rangeKey, syncUrlParams]
+  );
 
   const clearMtrTimers = useCallback(() => {
     for (const timer of mtrTimersRef.current) {
@@ -49,11 +129,15 @@ export default function TargetDetailPage() {
   }, [clearMtrTimers]);
 
   const loadDetail = useCallback(async () => {
+    if (!urlHydrated) return;
     try {
       setError(null);
+      const query = customWindow
+        ? `from=${customWindow.fromSec}&to=${customWindow.toSec}`
+        : `range=${rangeKey}`;
       const [seriesRes, mtrRes] = await Promise.all([
         apiRequest<TargetSeriesResponse>(
-          `/api/targets/${targetId}/series?range=${rangeKey}`
+          `/api/targets/${targetId}/series?${query}`
         ),
         apiRequest<MTRSnapshot[]>(`/api/targets/${targetId}/mtr?limit=10`),
       ]);
@@ -70,12 +154,13 @@ export default function TargetDetailPage() {
     } finally {
       setLoading(false);
     }
-  }, [targetId, rangeKey, router]);
+  }, [targetId, rangeKey, customWindow, urlHydrated, router]);
 
   useEffect(() => {
+    if (!urlHydrated) return;
     setLoading(true);
     void loadDetail();
-  }, [loadDetail]);
+  }, [urlHydrated, loadDetail]);
 
   const handleLive = useCallback(
     (ev: LiveEventMessage) => {
@@ -101,7 +186,7 @@ export default function TargetDetailPage() {
         return;
       }
 
-      if (ev.type === "sample_tick" && rangeKey === "5m") {
+      if (ev.type === "sample_tick" && !customWindow && rangeKey === "5m") {
         const payload = ev.data as {
           probe_id?: string;
           samples?: Array<{
@@ -143,7 +228,7 @@ export default function TargetDetailPage() {
         });
       }
     },
-    [rangeKey, targetId, clearMtrTimers]
+    [rangeKey, customWindow, targetId, clearMtrTimers]
   );
 
   const wsState = useLiveSocket([`target:${targetId}`], handleLive);
@@ -221,6 +306,17 @@ export default function TargetDetailPage() {
                     {data.target.probe_type} · {data.target.interval_sec}s
                   </span>
                 )}
+                {customWindow && (
+                  <button
+                    type="button"
+                    onClick={() => handleSelectPreset(rangeKey)}
+                    title="Viewing historical custom range — click to return to Live"
+                    className="inline-flex items-center gap-1 rounded border border-cyan-500/45 bg-cyan-500/15 px-2 py-0.5 text-[11px] font-mono uppercase text-cyan-200 hover:bg-cyan-500/25"
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
+                    Historical
+                  </button>
+                )}
               </div>
               <p className="truncate text-xs font-mono text-zinc-400">
                 {data?.target.host}
@@ -230,26 +326,15 @@ export default function TargetDetailPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <div
-              role="group"
-              aria-label="Time range selector"
-              className="inline-flex flex-wrap rounded-md border border-border bg-surface p-1"
-            >
-              {RANGES.map((r) => (
-                <button
-                  key={r}
-                  type="button"
-                  onClick={() => setRangeKey(r)}
-                  className={`rounded px-2.5 py-1 text-xs font-mono font-medium transition-colors ${
-                    rangeKey === r
-                      ? "bg-emerald-500 text-zinc-950 font-semibold"
-                      : "text-zinc-400 hover:text-zinc-100"
-                  }`}
-                >
-                  {r === "5m" ? "Live 5m" : r}
-                </button>
-              ))}
-            </div>
+            <TimeRangePicker
+              value={rangeKey}
+              customWindow={customWindow}
+              allPresets={RANGES}
+              onSelectPreset={handleSelectPreset}
+              onApplyCustom={handleApplyCustom}
+              ariaLabel="Time range selector"
+              testId="target-detail-range-selector"
+            />
 
             <Link
               href={`/targets?edit=${targetId}`}
@@ -303,8 +388,19 @@ export default function TargetDetailPage() {
                 syncKey="smoker-target-sync"
                 targetName={data.target.name}
                 targetHost={data.target.host}
-                rangeLabel={rangeKey === "5m" ? "Live 5m" : rangeKey}
-                windowSec={rangeKeyToSeconds(rangeKey)}
+                rangeLabel={
+                  customWindow
+                    ? "CUSTOM"
+                    : rangeKey === "5m"
+                    ? "Live 5m"
+                    : rangeKey
+                }
+                windowSec={customWindow ? null : rangeKeyToSeconds(rangeKey)}
+                fixedBounds={
+                  customWindow
+                    ? [customWindow.fromSec, customWindow.toSec]
+                    : null
+                }
                 baselineMs={s.baseline_ms ?? null}
                 warnMs={resolveEffectiveWarnMs({
                   seriesWarnMs: s.warn_ms,

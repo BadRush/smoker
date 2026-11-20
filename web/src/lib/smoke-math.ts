@@ -341,7 +341,7 @@ export function sparklineToProbeSeries(
 export function rangeKeyToSeconds(rangeKey?: string | null): number | null {
   if (!rangeKey) return null;
   const clean = rangeKey.trim().toLowerCase();
-  const match = clean.match(/(?:^|\s)(5m|15m|1h|3h|6h|12h|24h|7d|30d|1y)(?:\s|$)/);
+  const match = clean.match(/(?:^|\s)(5m|15m|1h|3h|6h|12h|24h|3d|7d|30d|1y)(?:\s|$)/);
   const token = match ? match[1] : clean;
   switch (token) {
     case "5m":
@@ -358,6 +358,8 @@ export function rangeKeyToSeconds(rangeKey?: string | null): number | null {
       return 12 * 3600;
     case "24h":
       return 24 * 3600;
+    case "3d":
+      return 3 * 86400;
     case "7d":
       return 7 * 86400;
     case "30d":
@@ -372,12 +374,22 @@ export function rangeKeyToSeconds(rangeKey?: string | null): number | null {
 /**
  * Computes canonical X-axis [minSec, maxSec] bounds aligned to the active time window
  * so new targets or partially populated histories preserve the selected horizon.
+ * When fixedBounds is provided (e.g. a custom historical date range), it takes precedence.
  */
 export function computeChartXBounds(
   timestamps: readonly number[],
   windowSec?: number | null,
-  nowSec = Math.floor(Date.now() / 1000)
+  nowSec = Math.floor(Date.now() / 1000),
+  fixedBounds?: readonly [number, number] | null
 ): [number, number] | null {
+  if (
+    fixedBounds &&
+    Number.isFinite(fixedBounds[0]) &&
+    Number.isFinite(fixedBounds[1]) &&
+    fixedBounds[1] > fixedBounds[0]
+  ) {
+    return [fixedBounds[0], fixedBounds[1]];
+  }
   if (timestamps.length === 0 && (!windowSec || windowSec <= 0)) {
     return null;
   }
@@ -394,13 +406,35 @@ export function computeChartXBounds(
 /**
  * Merges historical DB quantile series with the ultra-recent rolling cache sparkline
  * so the trailing live edge advances smoothly on every active time range.
+ * Set skipLiveMerge=true for historical custom windows so live samples are not appended.
  */
 export function mergeProbeSeriesWithCell(
   dbSeries: ProbeSeries | undefined,
   cell: MatrixCell,
   probeName: string,
-  range: string
+  range: string,
+  skipLiveMerge = false
 ): ProbeSeriesInput {
+  const warnMs = cell.warn_ms ?? dbSeries?.warn_ms ?? null;
+  const baselineMs = cell.baseline_ms ?? dbSeries?.baseline_ms ?? null;
+  if (skipLiveMerge) {
+    if (dbSeries) {
+      return {
+        ...dbSeries,
+        warn_ms: warnMs,
+        baseline_ms: baselineMs,
+      };
+    }
+    return sparklineToProbeSeries(
+      cell.probe_id,
+      probeName,
+      "",
+      [],
+      cell.jitter_ms,
+      warnMs,
+      baselineMs
+    );
+  }
   const wSec = rangeKeyToSeconds(range);
   const rawSpark = cell.sparkline ?? [];
   const latestSparkTs =
@@ -409,8 +443,6 @@ export function mergeProbeSeriesWithCell(
     wSec && latestSparkTs > 0
       ? rawSpark.filter((pt) => pt.ts >= latestSparkTs - wSec)
       : rawSpark;
-  const warnMs = cell.warn_ms ?? dbSeries?.warn_ms ?? null;
-  const baselineMs = cell.baseline_ms ?? dbSeries?.baseline_ms ?? null;
   if (!dbSeries || dbSeries.timestamps.length === 0) {
     return sparklineToProbeSeries(
       cell.probe_id,

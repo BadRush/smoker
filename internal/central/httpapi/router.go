@@ -45,7 +45,9 @@ type Store interface {
 	SeedPublicMonitors(ctx context.Context, onlyIfEmpty bool) (db.SeedResult, error)
 
 	QueryTargetSeries(ctx context.Context, targetID uuid.UUID, rangeKey string) (db.TargetSeriesResponse, error)
+	QueryTargetSeriesWindow(ctx context.Context, targetID uuid.UUID, win db.SeriesWindow) (db.TargetSeriesResponse, error)
 	QueryBatchTargetSeries(ctx context.Context, targetIDs []uuid.UUID, rangeKey string) (db.BatchSeriesResponse, error)
+	QueryBatchTargetSeriesWindow(ctx context.Context, targetIDs []uuid.UUID, win db.SeriesWindow) (db.BatchSeriesResponse, error)
 	ListMTRSnapshots(ctx context.Context, targetID uuid.UUID, limit int) ([]db.MTRSnapshot, error)
 
 	ListAlertRules(ctx context.Context) ([]db.AlertRule, error)

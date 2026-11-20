@@ -713,11 +713,19 @@ export interface components {
             target: components["schemas"]["Target"];
             range: string;
             bucket_sec: number;
+            /** Format: int64 */
+            from_unix?: number;
+            /** Format: int64 */
+            to_unix?: number;
             series: components["schemas"]["ProbeSeries"][];
         };
         BatchSeriesResponse: {
             range: string;
             bucket_sec: number;
+            /** Format: int64 */
+            from_unix?: number;
+            /** Format: int64 */
+            to_unix?: number;
             targets: {
                 [key: string]: components["schemas"]["ProbeSeries"][];
             };
@@ -1003,7 +1011,11 @@ export interface operations {
     getTvSeries: {
         parameters: {
             query?: {
-                range?: "15m" | "1h" | "3h" | "6h" | "12h" | "24h" | "7d";
+                range?: "15m" | "1h" | "3h" | "6h" | "12h" | "24h" | "3d" | "7d" | "30d";
+                /** @description Custom window start (Unix seconds or RFC3339; requires 'to') */
+                from?: string;
+                /** @description Custom window end (Unix seconds or RFC3339; requires 'from') */
+                to?: string;
                 /** @description Comma-separated enabled target UUIDs (max 24) */
                 ids?: string;
             };
@@ -1482,7 +1494,11 @@ export interface operations {
     getTargetSeries: {
         parameters: {
             query?: {
-                range?: "5m" | "15m" | "1h" | "3h" | "6h" | "12h" | "24h" | "7d" | "30d" | "1y";
+                range?: "5m" | "15m" | "1h" | "3h" | "6h" | "12h" | "24h" | "3d" | "7d" | "30d" | "1y";
+                /** @description Custom window start (Unix seconds or RFC3339; requires 'to') */
+                from?: string;
+                /** @description Custom window end (Unix seconds or RFC3339; requires 'from') */
+                to?: string;
             };
             header?: never;
             path: {

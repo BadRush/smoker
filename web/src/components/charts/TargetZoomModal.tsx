@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Link from "next/link";
 import { ArrowUpRight, Play, Route, X } from "lucide-react";
 import { SmokeChartPanel } from "@/components/charts/SmokeChartPanel";
+import { TimeRangePicker } from "@/components/charts/TimeRangePicker";
 import { MtrSnapshotsPanel } from "@/components/mtr/MtrSnapshotsPanel";
 import {
   apiRequest,
@@ -23,7 +24,7 @@ import {
   type CellStatus,
   type ProbeSeriesInput,
 } from "@/lib/smoke-math";
-import { TV_RANGES, type TvRange } from "@/lib/tv-config";
+import { type CustomTimeWindow, type TvRange } from "@/lib/tv-config";
 import { useLiveSocket, type LiveEventMessage } from "@/lib/useLiveSocket";
 
 interface TargetZoomModalProps {
@@ -33,6 +34,7 @@ interface TargetZoomModalProps {
   cells: MatrixCell[];
   probeMap: Map<string, string>;
   initialRange?: TvRange;
+  initialCustomWindow?: CustomTimeWindow | null;
   fallbackSeries?: ProbeSeries[];
   onClose: () => void;
 }
@@ -47,10 +49,14 @@ export function TargetZoomModal({
   cells,
   probeMap,
   initialRange = "3h",
+  initialCustomWindow = null,
   fallbackSeries = [],
   onClose,
 }: TargetZoomModalProps) {
   const [zoomRange, setZoomRange] = useState<TvRange>(initialRange);
+  const [customWindow, setCustomWindow] = useState<CustomTimeWindow | null>(
+    initialCustomWindow
+  );
   const [zoomProbeFilter, setZoomProbeFilter] = useState<string>("");
   const [zoomSeries, setZoomSeries] = useState<ProbeSeries[]>([]);
   const [zoomMtrSnaps, setZoomMtrSnaps] = useState<MTRSnapshot[]>([]);
@@ -65,15 +71,18 @@ export function TargetZoomModal({
   useEffect(() => {
     let cancelled = false;
     setZoomLoading(true);
+    const rangeQuery = customWindow
+      ? `from=${customWindow.fromSec}&to=${customWindow.toSec}`
+      : `range=${zoomRange}`;
     const seriesPromise =
       mode === "tv"
         ? apiRequest<BatchSeriesResponse>(
-            `/api/tv/series?range=${zoomRange}&ids=${encodeURIComponent(target.id)}`
+            `/api/tv/series?${rangeQuery}&ids=${encodeURIComponent(target.id)}`
           )
             .then((res) => res.targets[target.id] ?? [])
             .catch(() => [])
         : apiRequest<TargetSeriesResponse>(
-            `/api/targets/${encodeURIComponent(target.id)}/series?range=${zoomRange}`
+            `/api/targets/${encodeURIComponent(target.id)}/series?${rangeQuery}`
           )
             .then((res) => res.series ?? [])
             .catch(() => []);
@@ -95,7 +104,7 @@ export function TargetZoomModal({
     return () => {
       cancelled = true;
     };
-  }, [mode, target.id, zoomRange]);
+  }, [mode, target.id, zoomRange, customWindow]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -115,7 +124,9 @@ export function TargetZoomModal({
   );
 
   const mergedList = useMemo(() => {
-    const rawList = zoomSeries.length > 0 ? zoomSeries : fallbackSeries;
+    const isHistorical = Boolean(customWindow);
+    const rawList =
+      zoomSeries.length > 0 || isHistorical ? zoomSeries : fallbackSeries;
     const rawByProbe = new Map(rawList.map((s) => [s.probe_id, s]));
     const items: Array<{ cell: MatrixCell; series: ProbeSeriesInput }> = targetCells.map(
       (cell) => ({
@@ -124,7 +135,8 @@ export function TargetZoomModal({
           rawByProbe.get(cell.probe_id),
           cell,
           probeMap.get(cell.probe_id) ?? "Probe",
-          zoomRange
+          zoomRange,
+          isHistorical
         ),
       })
     );
@@ -151,7 +163,7 @@ export function TargetZoomModal({
       });
     }
     return items;
-  }, [zoomSeries, fallbackSeries, targetCells, probeMap, zoomRange, target.id]);
+  }, [zoomSeries, fallbackSeries, targetCells, probeMap, zoomRange, customWindow, target.id]);
 
   const visibleProbes = useMemo(
     () =>
@@ -315,28 +327,17 @@ export function TargetZoomModal({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <div
-              role="group"
-              aria-label="Zoom modal time range"
-              data-testid="tv-zoom-range-selector"
-              className="inline-flex items-center rounded border border-border bg-canvas p-0.5"
-            >
-              {TV_RANGES.map((r) => (
-                <button
-                  key={r}
-                  type="button"
-                  aria-pressed={zoomRange === r}
-                  onClick={() => setZoomRange(r)}
-                  className={`rounded px-2 py-1 text-xs font-mono font-medium transition-colors ${
-                    zoomRange === r
-                      ? "bg-emerald-500 text-zinc-950 font-semibold"
-                      : "text-zinc-400 hover:text-zinc-100"
-                  }`}
-                >
-                  {r}
-                </button>
-              ))}
-            </div>
+            <TimeRangePicker
+              value={zoomRange}
+              customWindow={customWindow}
+              onSelectPreset={(r) => {
+                setCustomWindow(null);
+                setZoomRange(r as TvRange);
+              }}
+              onApplyCustom={(win) => setCustomWindow(win)}
+              ariaLabel="Zoom modal time range"
+              testId="tv-zoom-range-selector"
+            />
 
             <button
               type="button"
@@ -354,7 +355,11 @@ export function TargetZoomModal({
 
             {mode === "dashboard" && (
               <Link
-                href={`/targets/${target.id}`}
+                href={
+                  customWindow
+                    ? `/targets/${target.id}?from=${customWindow.fromSec}&to=${customWindow.toSec}`
+                    : `/targets/${target.id}?range=${zoomRange}`
+                }
                 className="inline-flex items-center gap-1 rounded-md border border-border bg-canvas px-2.5 py-1.5 text-xs font-mono text-emerald-400 hover:border-emerald-500/60"
               >
                 <span>Full Detail</span>
@@ -433,8 +438,13 @@ export function TargetZoomModal({
                 syncKey={`zoom-modal-${target.id}`}
                 targetName={target.name}
                 targetHost={target.host}
-                rangeLabel={zoomRange}
-                windowSec={rangeKeyToSeconds(zoomRange)}
+                rangeLabel={customWindow ? "CUSTOM" : zoomRange}
+                windowSec={customWindow ? null : rangeKeyToSeconds(zoomRange)}
+                fixedBounds={
+                  customWindow
+                    ? [customWindow.fromSec, customWindow.toSec]
+                    : null
+                }
                 intervalSec={target.interval_sec}
                 baselineMs={cell.baseline_ms ?? series.baseline_ms ?? null}
                 warnMs={resolveEffectiveWarnMs({

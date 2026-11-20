@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"smoker/internal/central/config"
 	"smoker/internal/central/db"
 	"smoker/internal/central/ingest"
@@ -95,13 +96,52 @@ func TestTimescaleMigrationsAndIdempotentIngest(t *testing.T) {
 		t.Fatalf("expected 2 idempotent rows, got %d", count)
 	}
 
-	for _, r := range []string{"5m", "15m", "24h", "7d", "30d", "1y"} {
+	for _, r := range []string{"5m", "15m", "24h", "3d", "7d", "30d", "1y"} {
 		res, err := store.QueryTargetSeries(ctx, target.ID, r)
 		if err != nil {
 			t.Fatalf("QueryTargetSeries(%s) failed: %v", r, err)
 		}
 		if r == "5m" && (len(res.Series) == 0 || len(res.Series[0].Timestamps) != 2) {
 			t.Fatalf("expected 2 points in 5m series, got %+v", res.Series)
+		}
+	}
+
+	// Verify bounded custom windows across raw (1s & 30s), agg_1m, agg_5m, agg_1h, and agg_6h paths
+	customWindows := []struct {
+		name string
+		from time.Time
+		to   time.Time
+	}{
+		{"raw_recent_5m", ts.Add(-5 * time.Minute), ts},
+		{"raw_recent_2h", ts.Add(-2 * time.Hour), ts},
+		{"agg1m_12h", ts.Add(-12 * time.Hour), ts},
+		{"agg5m_3d", ts.Add(-72 * time.Hour), ts.Add(-24 * time.Hour)},
+		{"agg1h_30d", ts.Add(-30 * 24 * time.Hour), ts.Add(-10 * 24 * time.Hour)},
+		{"agg6h_120d", ts.Add(-120 * 24 * time.Hour), ts.Add(-10 * 24 * time.Hour)},
+	}
+	for _, cw := range customWindows {
+		fromT := cw.from
+		toT := cw.to
+		w := db.SeriesWindow{RangeKey: "custom", From: &fromT, To: &toT}
+		res, err := store.QueryTargetSeriesWindow(ctx, target.ID, w)
+		if err != nil {
+			t.Fatalf("QueryTargetSeriesWindow(%s) failed: %v", cw.name, err)
+		}
+		if res.Range != "custom" || res.FromUnix == nil || res.ToUnix == nil {
+			t.Fatalf("QueryTargetSeriesWindow(%s) missing custom metadata: %+v", cw.name, res)
+		}
+		if cw.name == "raw_recent_5m" && (len(res.Series) == 0 || len(res.Series[0].Timestamps) != 2) {
+			t.Fatalf("expected 2 points in raw_recent_5m custom series, got %+v", res.Series)
+		}
+		if cw.name == "raw_recent_2h" && (len(res.Series) == 0 || len(res.Series[0].Timestamps) < 1) {
+			t.Fatalf("expected >=1 bucket in raw_recent_2h custom series, got %+v", res.Series)
+		}
+		batchRes, err := store.QueryBatchTargetSeriesWindow(ctx, []uuid.UUID{target.ID}, w)
+		if err != nil {
+			t.Fatalf("QueryBatchTargetSeriesWindow(%s) failed: %v", cw.name, err)
+		}
+		if batchRes.Range != "custom" || batchRes.FromUnix == nil || batchRes.ToUnix == nil {
+			t.Fatalf("QueryBatchTargetSeriesWindow(%s) missing custom metadata: %+v", cw.name, batchRes)
 		}
 	}
 

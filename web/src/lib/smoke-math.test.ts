@@ -124,7 +124,9 @@ describe("smoke-math helpers", () => {
     expect(rangeKeyToSeconds("Live 5m")).toBe(300);
     expect(rangeKeyToSeconds("15m Live")).toBe(900);
     expect(rangeKeyToSeconds("3h")).toBe(10800);
+    expect(rangeKeyToSeconds("3d")).toBe(3 * 86400);
     expect(rangeKeyToSeconds("7d")).toBe(604800);
+    expect(rangeKeyToSeconds("30d")).toBe(30 * 86400);
     expect(rangeKeyToSeconds("custom")).toBeNull();
 
     // New target with only 4m of live samples on a 3h window still spans full 3h axis
@@ -138,6 +140,10 @@ describe("smoke-math helpers", () => {
       now - 900,
       now,
     ]);
+    // Explicit fixedBounds lock X-axis for custom historical windows
+    expect(
+      computeChartXBounds(partialLive, null, now, [now - 86400, now - 43200])
+    ).toEqual([now - 86400, now - 43200]);
   });
 
   it("provides right-axis loss splits and computes zoomed window avg/peak loss", () => {

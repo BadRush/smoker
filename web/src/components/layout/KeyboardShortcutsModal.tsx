@@ -53,7 +53,10 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
       { keys: ["Space"], description: "Play / Pause auto-rotation (Slides mode)" },
       { keys: ["f"], description: "Toggle Fullscreen" },
       { keys: ["a"], description: "Toggle impaired targets filter (Warn / Alert)" },
-      { keys: ["1", "–", "7"], description: "Switch graph window (15m, 1h, 3h, 6h, 12h, 24h, 7d)" },
+      {
+        keys: ["1", "–", "9"],
+        description: "Switch graph window (15m, 1h, 3h, 6h, 12h, 24h, 3d, 7d, 30d)",
+      },
     ],
   },
 ];
