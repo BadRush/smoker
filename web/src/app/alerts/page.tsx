@@ -335,7 +335,7 @@ export default function AlertsPage() {
     void loadAlerts();
   }, [loadAlerts]);
 
-  function resetRuleForm() {
+  const resetRuleForm = useCallback(() => {
     setEditingRuleId(null);
     setRName("");
     setRScope("target");
@@ -350,7 +350,7 @@ export default function AlertsPage() {
     setRRecoverSec(45);
     setRChannelIds([]);
     setREnabled(true);
-  }
+  }, [defaultFleetQuorum]);
 
   function startEditRule(rule: AlertRule) {
     setEditingRuleId(rule.id);
@@ -456,7 +456,7 @@ export default function AlertsPage() {
     }
   }
 
-  function resetChannelForm() {
+  const resetChannelForm = useCallback(() => {
     setEditingChannelId(null);
     setCType("telegram");
     setCName("");
@@ -466,7 +466,23 @@ export default function AlertsPage() {
     setCWebhookUrl("");
     setCSeverityFilter("all");
     setCEnabled(true);
-  }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (editingRuleId) {
+        e.preventDefault();
+        resetRuleForm();
+      } else if (editingChannelId) {
+        e.preventDefault();
+        resetChannelForm();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [editingRuleId, editingChannelId, resetRuleForm, resetChannelForm]);
 
   function startEditChannel(ch: AlertChannel) {
     setEditingChannelId(ch.id);

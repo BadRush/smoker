@@ -8,6 +8,7 @@ import {
   Bell,
   Crosshair,
   Grid3X3,
+  Keyboard,
   LogOut,
   Menu,
   Radio,
@@ -15,6 +16,10 @@ import {
   Tv,
   X,
 } from "lucide-react";
+import {
+  isEditableTarget,
+  KeyboardShortcutsModal,
+} from "@/components/layout/KeyboardShortcutsModal";
 import { apiRequest } from "@/lib/api";
 import type { WsState } from "@/lib/useLiveSocket";
 
@@ -43,10 +48,24 @@ export function NocShell({
   const pathname = usePathname();
   const router = useRouter();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [showShortcuts, setShowShortcuts] = useState(false);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setMobileOpen(false);
+      if (e.key === "Escape") {
+        setMobileOpen(false);
+        return;
+      }
+      if (
+        e.key === "?" &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !isEditableTarget(e.target)
+      ) {
+        e.preventDefault();
+        setShowShortcuts((prev) => !prev);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -138,6 +157,17 @@ export function NocShell({
 
             <button
               type="button"
+              data-testid="noc-shortcuts-btn"
+              onClick={() => setShowShortcuts(true)}
+              title="Keyboard shortcuts (?)"
+              aria-label="Keyboard shortcuts"
+              className="hidden md:inline-flex h-8 w-8 items-center justify-center rounded-md border border-border bg-elevated text-zinc-400 hover:text-zinc-100 hover:border-zinc-600 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+            >
+              <Keyboard className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+
+            <button
+              type="button"
               onClick={handleLogout}
               className="hidden md:inline-flex items-center gap-1.5 rounded-md border border-border bg-elevated px-2.5 py-1.5 text-xs font-medium text-zinc-300 hover:text-white hover:border-zinc-600 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
               aria-label="Sign out"
@@ -209,6 +239,11 @@ export function NocShell({
       >
         {children}
       </main>
+
+      <KeyboardShortcutsModal
+        open={showShortcuts}
+        onClose={() => setShowShortcuts(false)}
+      />
     </div>
   );
 }

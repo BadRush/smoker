@@ -23,6 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { NocShell } from "@/components/layout/NocShell";
+import { isEditableTarget } from "@/components/layout/KeyboardShortcutsModal";
 import { ProtocolFilterChips } from "@/components/targets/ProtocolFilterChips";
 import {
   ApiError,
@@ -107,6 +108,7 @@ export default function TargetsPage() {
   const [gName, setGName] = useState("");
   const [gDesc, setGDesc] = useState("");
   const handledQueryEditRef = useRef(false);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -361,7 +363,7 @@ export default function TargetsPage() {
     }
   }, [loading, targets, populateTargetForm]);
 
-  function openCreateTarget() {
+  const openCreateTarget = useCallback(() => {
     setFormErr(null);
     setEditingTarget(null);
     setTName("");
@@ -383,7 +385,63 @@ export default function TargetsPage() {
     setTSyncLossAlert(false);
     setTSyncRttAlert(false);
     setShowTargetModal(true);
-  }
+  }, []);
+
+  // Keyboard shortcuts: Ctrl+F or "/" focuses search (yields when modal open),
+  // Smart 2-step Esc (clear search -> blur, or close open modal), "n" opens Add Target.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (showTargetModal) {
+          e.preventDefault();
+          setShowTargetModal(false);
+          return;
+        }
+        if (showGroupModal) {
+          e.preventDefault();
+          setShowGroupModal(false);
+          return;
+        }
+        if (document.activeElement === searchInputRef.current) {
+          if (filters.q) {
+            e.preventDefault();
+            updateFilters((prev) => ({ ...prev, q: "" }));
+          } else {
+            searchInputRef.current?.blur();
+          }
+        }
+        return;
+      }
+
+      // Yield Ctrl+F & single-key shortcuts while any modal is open
+      if (showTargetModal || showGroupModal) return;
+
+      const inInput = isEditableTarget(e.target);
+      const isCtrlF = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f";
+      if (isCtrlF || (e.key === "/" && !inInput && !e.ctrlKey && !e.metaKey && !e.altKey)) {
+        if (searchInputRef.current) {
+          e.preventDefault();
+          searchInputRef.current.focus();
+          searchInputRef.current.select();
+        }
+        return;
+      }
+
+      if (
+        !inInput &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        e.key.toLowerCase() === "n"
+      ) {
+        e.preventDefault();
+        openCreateTarget();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [showTargetModal, showGroupModal, filters.q, updateFilters, openCreateTarget]);
 
   function openCreateGroup() {
     setEditingGroup(null);
@@ -858,6 +916,7 @@ export default function TargetsPage() {
                   aria-hidden="true"
                 />
                 <input
+                  ref={searchInputRef}
                   type="search"
                   data-testid="targets-search-input"
                   aria-label="Search configured targets"
@@ -866,8 +925,16 @@ export default function TargetsPage() {
                   onChange={(e) =>
                     updateFilters((prev) => ({ ...prev, q: e.target.value }))
                   }
-                  className="w-full rounded-md border border-border bg-canvas pl-8 pr-7 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
+                  className="w-full rounded-md border border-border bg-canvas pl-8 pr-16 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
                 />
+                {!filters.q && (
+                  <kbd
+                    aria-hidden="true"
+                    className="pointer-events-none hidden sm:inline-flex items-center rounded border border-border bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-zinc-400 absolute right-2 top-1"
+                  >
+                    Ctrl+F
+                  </kbd>
+                )}
                 {filters.q && (
                   <button
                     type="button"

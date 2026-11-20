@@ -480,4 +480,46 @@ describe("TargetsPage search, filters, and pagination", () => {
       }),
     });
   });
+
+  it("supports Ctrl+F / '/' search focus, Smart 2-step Esc, 'n' Add Target modal, and '?' shortcuts cheatsheet", async () => {
+    const user = userEvent.setup();
+    render(<TargetsPage />);
+
+    const searchInput = await screen.findByTestId("targets-search-input");
+    expect(searchInput).not.toHaveFocus();
+
+    // Ctrl+F focuses targets search input
+    await user.keyboard("{Control>}f{/Control}");
+    expect(searchInput).toHaveFocus();
+
+    // Type query -> 1st Esc clears query (keeps focus), 2nd Esc blurs
+    await user.type(searchInput, "Cloudflare");
+    expect(searchInput).toHaveValue("Cloudflare");
+    await user.keyboard("{Escape}");
+    expect(searchInput).toHaveValue("");
+    expect(searchInput).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(searchInput).not.toHaveFocus();
+
+    // 'n' opens Add Target modal; Ctrl+F yields while modal is open; Esc closes modal
+    await user.keyboard("n");
+    const nameInput = await screen.findByLabelText("Target Name *");
+    expect(nameInput).toBeInTheDocument();
+
+    await user.keyboard("{Control>}f{/Control}");
+    expect(searchInput).not.toHaveFocus();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByLabelText("Target Name *")).not.toBeInTheDocument();
+
+    // '?' opens Keyboard Shortcuts cheatsheet and Esc closes it
+    await user.keyboard("?");
+    expect(
+      await screen.findByTestId("keyboard-shortcuts-modal")
+    ).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(
+      screen.queryByTestId("keyboard-shortcuts-modal")
+    ).not.toBeInTheDocument();
+  });
 });

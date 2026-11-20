@@ -34,6 +34,10 @@ import {
   DisplaySizeControls,
   LayoutPresetPills,
 } from "@/components/layout/DisplaySizeControls";
+import {
+  isEditableTarget,
+  KeyboardShortcutsModal,
+} from "@/components/layout/KeyboardShortcutsModal";
 import { ProtocolFilterChips } from "@/components/targets/ProtocolFilterChips";
 import {
   ApiError,
@@ -435,6 +439,7 @@ export default function NocTvWallboardPage() {
   const [countdown, setCountdown] = useState(DEFAULT_TV_CONFIG.rotateSec);
   const [paused, setPaused] = useState(false);
   const [showDrawer, setShowDrawer] = useState(false);
+  const [showShortcuts, setShowShortcuts] = useState(false);
   const [copied, setCopied] = useState(false);
   const [clockText, setClockText] = useState<string>("");
   const [simTargetId, setSimTargetId] = useState<string>("");
@@ -1145,34 +1150,141 @@ export default function NocTvWallboardPage() {
     return () => clearInterval(timer);
   }, [cfg.rotateSec, paused, zoomTargetId, totalSlides]);
 
-  // Keyboard shortcuts: Ctrl+F or "/" opens Search & Protocol Filter bar, "Escape" closes bar or drawer
+  const handleToggleFullscreen = useCallback(() => {
+    if (typeof document === "undefined") return;
+    if (!document.fullscreenElement) {
+      void document.documentElement.requestFullscreen?.();
+    } else {
+      void document.exitFullscreen?.();
+    }
+  }, []);
+
+  // NOC TV keyboard shortcuts:
+  // Ctrl+F / "/" -> search, Smart 2-step Esc, "?" -> cheatsheet,
+  // ←/→ -> prev/next slide, Space -> play/pause (slides mode), f -> fullscreen,
+  // a -> toggle impaired filter, 1-7 -> switch graph time range.
   useEffect(() => {
     if (typeof window === "undefined") return;
     const onKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      const inInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+      const inInput = isEditableTarget(e.target);
+      const hasModifier = e.ctrlKey || e.metaKey || e.altKey;
       const isCtrlF = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f";
+
       if (e.key === "Escape") {
-        if (zoomTargetId !== null) return;
+        if (zoomTargetId !== null || showShortcuts) return;
         if (showSearch) {
-          setShowSearch(false);
+          if (document.activeElement === searchInputRef.current && searchQuery) {
+            e.preventDefault();
+            setSearchQuery("");
+            setPageIdx(0);
+          } else {
+            setShowSearch(false);
+          }
           return;
         }
         if (showDrawer) {
           setShowDrawer(false);
         }
-      } else if ((isCtrlF || (e.key === "/" && !inInput)) && !showDrawer && zoomTargetId === null) {
+        return;
+      }
+
+      if (
+        e.key === "?" &&
+        !inInput &&
+        !hasModifier &&
+        !showDrawer &&
+        zoomTargetId === null
+      ) {
         e.preventDefault();
-        setShowSearch(true);
-        setTimeout(() => {
-          searchInputRef.current?.focus();
-          searchInputRef.current?.select();
-        }, 30);
+        setShowShortcuts((prev) => !prev);
+        return;
+      }
+
+      if (showDrawer || showShortcuts || zoomTargetId !== null) return;
+
+      if (isCtrlF || (e.key === "/" && !inInput && !hasModifier)) {
+        e.preventDefault();
+        if (showSearch && searchInputRef.current) {
+          searchInputRef.current.focus();
+          searchInputRef.current.select();
+        } else {
+          setShowSearch(true);
+          requestAnimationFrame(() => {
+            const el = searchInputRef.current;
+            if (el && document.activeElement !== el) {
+              el.focus();
+              el.select();
+            }
+          });
+        }
+        return;
+      }
+
+      if (inInput || hasModifier) return;
+
+      if (e.key === "ArrowRight" && totalSlides > 1) {
+        e.preventDefault();
+        setPageIdx((p) => (p + 1) % totalSlides);
+        setCountdown(cfg.rotateSec);
+        return;
+      }
+
+      if (e.key === "ArrowLeft" && totalSlides > 1) {
+        e.preventDefault();
+        setPageIdx((p) => (p - 1 + totalSlides) % totalSlides);
+        setCountdown(cfg.rotateSec);
+        return;
+      }
+
+      if (e.key === " " && effectiveFlow === "slides" && totalSlides > 1) {
+        e.preventDefault();
+        if (cfg.rotateSec === 0) {
+          setPaused(false);
+          updateConfig((prev) => ({ ...prev, rotateSec: 15 }), false);
+        } else {
+          setPaused((p) => !p);
+        }
+        return;
+      }
+
+      const lower = e.key.toLowerCase();
+      if (lower === "f") {
+        e.preventDefault();
+        handleToggleFullscreen();
+        return;
+      }
+
+      if (lower === "a" && (partitioned.pinnedAlerts.length > 0 || impairedOnly)) {
+        e.preventDefault();
+        setImpairedOnly((prev) => !prev);
+        setPageIdx(0);
+        return;
+      }
+
+      if (e.key >= "1" && e.key <= String(TV_RANGES.length)) {
+        const range = TV_RANGES[Number(e.key) - 1];
+        if (range) {
+          e.preventDefault();
+          updateConfig((prev) => ({ ...prev, range }), false);
+        }
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [zoomTargetId, showSearch, showDrawer]);
+  }, [
+    zoomTargetId,
+    showSearch,
+    searchQuery,
+    showDrawer,
+    showShortcuts,
+    totalSlides,
+    effectiveFlow,
+    cfg.rotateSec,
+    partitioned.pinnedAlerts.length,
+    impairedOnly,
+    updateConfig,
+    handleToggleFullscreen,
+  ]);
 
   const kpis = useMemo(() => {
     if (!data) return { probesOnline: 0, totalProbes: 0, healthyTargets: 0 };
@@ -1286,15 +1398,6 @@ export default function NocTvWallboardPage() {
       setTimeout(() => setCopied(false), 2000);
     } catch {
       setCopied(false);
-    }
-  }
-
-  function handleToggleFullscreen() {
-    if (typeof document === "undefined") return;
-    if (!document.fullscreenElement) {
-      void document.documentElement.requestFullscreen?.();
-    } else {
-      void document.exitFullscreen?.();
     }
   }
 
@@ -2991,6 +3094,11 @@ export default function NocTvWallboardPage() {
           </div>
         </div>
       )}
+
+      <KeyboardShortcutsModal
+        open={showShortcuts}
+        onClose={() => setShowShortcuts(false)}
+      />
     </div>
   );
 }

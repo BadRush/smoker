@@ -614,4 +614,101 @@ describe("NocTvWallboardPage layout controls", () => {
     expect(warnBtn.className).toContain("bg-transparent");
     expect(warnBtn.className).toContain("text-amber-400");
   });
+
+  it("supports /tv NOC keyboard shortcuts (arrows, Space pause, 1-7 range, 'a' impaired filter, Smart 2-step Esc, and '?' modal)", async () => {
+    const eightSnapWithWarn: MatrixSnapshot = {
+      ...TV_SNAPSHOT,
+      targets: [1, 2, 3, 4, 5, 6, 7, 8].map((i) => ({
+        ...TV_SNAPSHOT.targets[0],
+        id: `t-${i}`,
+        name: `Host ${i}`,
+        host: `10.0.0.${i}`,
+      })),
+      cells: [1, 2, 3, 4, 5, 6, 7, 8].map((i) => ({
+        ...TV_SNAPSHOT.cells[0],
+        target_id: `t-${i}`,
+        status: i === 1 ? "degraded" : "healthy",
+        p50_ms: i === 1 ? 180 : 12,
+      })),
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/api/tv/matrix")) {
+          return new Response(JSON.stringify(eightSnapWithWarn), { status: 200 });
+        }
+        if (url.startsWith("/api/tv/series")) {
+          return new Response(JSON.stringify({ range: "3h", targets: {} }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      })
+    );
+
+    window.history.replaceState(null, "", "/tv?cards=4&rotate=15");
+    const user = userEvent.setup();
+    render(<NocTvWallboardPage />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("tv-slide-control")).toHaveTextContent("1/2");
+    });
+
+    // ArrowRight / ArrowLeft switch slides
+    await user.keyboard("{ArrowRight}");
+    expect(screen.getByTestId("tv-slide-control")).toHaveTextContent("2/2");
+    await user.keyboard("{ArrowLeft}");
+    expect(screen.getByTestId("tv-slide-control")).toHaveTextContent("1/2");
+
+    // Space toggles rotation pause/resume in slides mode
+    expect(
+      screen.getByRole("button", { name: "Pause rotation" })
+    ).toBeInTheDocument();
+    await user.keyboard(" ");
+    expect(
+      screen.getByRole("button", { name: "Resume rotation" })
+    ).toBeInTheDocument();
+
+    // 1-7 switches time range (1 -> 15m, 6 -> 24h)
+    await user.keyboard("1");
+    expect(screen.getByRole("button", { name: "15m" })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    await user.keyboard("6");
+    expect(screen.getByRole("button", { name: "24h" })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+
+    // 'a' toggles impaired filter
+    await user.keyboard("a");
+    expect(screen.getByTestId("tv-anomalies-btn")).toHaveTextContent(/Filtered/);
+    await user.keyboard("a");
+    expect(screen.getByTestId("tv-anomalies-btn")).not.toHaveTextContent(/Filtered/);
+
+    // Smart 2-step Esc in TV search bar: 1st Esc clears text, 2nd Esc closes bar
+    await user.keyboard("/");
+    const tvSearch = await screen.findByTestId("tv-search-input");
+    tvSearch.focus();
+    await user.type(tvSearch, "Host 1");
+    expect(tvSearch).toHaveValue("Host 1");
+    await user.keyboard("{Escape}");
+    expect(tvSearch).toHaveValue("");
+    expect(screen.getByTestId("tv-search-bar")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("tv-search-bar")).not.toBeInTheDocument();
+
+    // '?' opens shortcuts cheatsheet on /tv without adding a topbar button
+    expect(screen.queryByTestId("noc-shortcuts-btn")).not.toBeInTheDocument();
+    await user.keyboard("?");
+    expect(
+      await screen.findByTestId("keyboard-shortcuts-modal")
+    ).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(
+      screen.queryByTestId("keyboard-shortcuts-modal")
+    ).not.toBeInTheDocument();
+  });
 });

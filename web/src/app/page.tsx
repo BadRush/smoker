@@ -314,20 +314,30 @@ export default function MatrixWallPage() {
     if (typeof window === "undefined") return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (zoomTargetId !== null) return;
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      const inInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+      const el = e.target as HTMLElement | null;
+      const tag = el?.tagName;
+      const inInput =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        Boolean(el?.isContentEditable);
       const isCtrlF = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f";
       if (isCtrlF || (e.key === "/" && !inInput)) {
         e.preventDefault();
         searchInputRef.current?.focus();
         searchInputRef.current?.select();
       } else if (e.key === "Escape" && document.activeElement === searchInputRef.current) {
-        searchInputRef.current?.blur();
+        if (search) {
+          e.preventDefault();
+          setSearch("");
+        } else {
+          searchInputRef.current?.blur();
+        }
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [zoomTargetId]);
+  }, [zoomTargetId, search]);
 
   const updateDashboardLayout = useCallback(
     (updater: (prev: DashboardLayoutConfig) => DashboardLayoutConfig) => {
@@ -751,12 +761,20 @@ export default function MatrixWallPage() {
               <input
                 ref={searchInputRef}
                 type="search"
-                placeholder="Search target name, protocol, or IP/host... (Ctrl+F)"
+                placeholder="Search target name, protocol, or IP/host..."
                 aria-label="Search targets"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                className="w-full rounded-md border border-border bg-canvas pl-9 pr-3 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
+                className="w-full rounded-md border border-border bg-canvas pl-9 pr-16 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
               />
+              {!search && (
+                <kbd
+                  aria-hidden="true"
+                  className="pointer-events-none hidden sm:inline-flex items-center rounded border border-border bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-zinc-400 absolute right-2 top-1.5"
+                >
+                  Ctrl+F
+                </kbd>
+              )}
             </div>
 
             <select

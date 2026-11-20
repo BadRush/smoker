@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { NocShell } from "@/components/layout/NocShell";
+import { isEditableTarget } from "@/components/layout/KeyboardShortcutsModal";
 import { formatDateTime24 } from "@/lib/date-format";
 import {
   ApiError,
@@ -66,14 +67,14 @@ export default function ProbesPage() {
     return () => clearInterval(t);
   }, [loadProbes]);
 
-  function openCreateModal() {
+  const openCreateModal = useCallback(() => {
     setEditingProbe(null);
     setName("");
     setLocation("");
     setIspAsn("");
     setFormErr(null);
     setShowModal(true);
-  }
+  }, []);
 
   function openEditModal(probe: Probe) {
     setEditingProbe(probe);
@@ -84,11 +85,35 @@ export default function ProbesPage() {
     setShowModal(true);
   }
 
-  function closeModal() {
+  const closeModal = useCallback(() => {
     setShowModal(false);
     setEditingProbe(null);
     setFormErr(null);
-  }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && showModal) {
+        e.preventDefault();
+        closeModal();
+        return;
+      }
+      if (
+        !showModal &&
+        !isEditableTarget(e.target) &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        e.key.toLowerCase() === "n"
+      ) {
+        e.preventDefault();
+        openCreateModal();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [showModal, closeModal, openCreateModal]);
 
   async function handleSubmitProbe(e: React.FormEvent) {
     e.preventDefault();

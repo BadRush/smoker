@@ -128,11 +128,36 @@ export default function SettingsPage() {
               id="brand-name"
               type="text"
               maxLength={80}
-              placeholder={`${DEFAULT_EVIDENCE_BRAND_NAME} (e.g. Varnion Technology Semesta)`}
+              placeholder={DEFAULT_EVIDENCE_BRAND_NAME}
               value={brandName}
               onChange={(e) => setBrandName(e.target.value)}
-              className="w-full rounded border border-border bg-canvas px-3 py-2 text-sm font-mono text-zinc-100 placeholder-zinc-500"
+              className="w-full rounded border border-border bg-canvas px-3 py-2 text-sm font-mono text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
             />
+            <div
+              data-testid="watermark-live-preview"
+              className="mt-2 flex items-center justify-between gap-2 rounded border border-border/70 bg-canvas/80 px-3 py-1.5 text-[11px]"
+            >
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="shrink-0 text-zinc-500 uppercase tracking-wider text-[10px]">
+                  PNG Preview
+                </span>
+                <span
+                  data-testid="watermark-live-preview-text"
+                  className="truncate font-mono font-semibold text-zinc-200"
+                >
+                  {brandName.trim() || DEFAULT_EVIDENCE_BRAND_NAME}
+                </span>
+              </div>
+              <span
+                className={`shrink-0 rounded border px-1.5 py-0.5 font-mono text-[10px] ${
+                  brandName.trim()
+                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                    : "border-border bg-elevated text-zinc-400"
+                }`}
+              >
+                {brandName.trim() ? "Custom" : "Default"}
+              </span>
+            </div>
             <p className="mt-1 text-[11px] text-zinc-400">
               Leave blank to automatically fallback to{" "}
               <span className="font-mono text-zinc-200">{DEFAULT_EVIDENCE_BRAND_NAME}</span>.
