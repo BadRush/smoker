@@ -11,7 +11,6 @@ import {
   Copy,
   Download,
   Flame,
-  LayoutGrid,
   Maximize2,
   Pause,
   Pin,
@@ -23,8 +22,6 @@ import {
   Settings2,
   Star,
   Trash2,
-  Volume2,
-  VolumeX,
   X,
 } from "lucide-react";
 import {
@@ -438,7 +435,6 @@ export default function NocTvWallboardPage() {
   const [countdown, setCountdown] = useState(DEFAULT_TV_CONFIG.rotateSec);
   const [paused, setPaused] = useState(false);
   const [showDrawer, setShowDrawer] = useState(false);
-  const [showLayoutBar, setShowLayoutBar] = useState(false);
   const [copied, setCopied] = useState(false);
   const [clockText, setClockText] = useState<string>("");
   const [simTargetId, setSimTargetId] = useState<string>("");
@@ -693,10 +689,12 @@ export default function NocTvWallboardPage() {
     return () => clearInterval(poll);
   }, [urlHydrated, loadTvMatrix, loadTvPresets]);
 
-  // Live 24h + date clock ticker
+  // Live 24h + short date clock ticker (single-line NOC format: "19 Nov · 16:57:57")
   useEffect(() => {
     const updateClock = () => {
-      setClockText(formatDateTime24(new Date()));
+      setClockText(
+        formatDateTime24(new Date(), { includeYear: false, includeSeconds: true })
+      );
     };
     updateClock();
     const timer = setInterval(updateClock, 1000);
@@ -1160,10 +1158,6 @@ export default function NocTvWallboardPage() {
           setShowSearch(false);
           return;
         }
-        if (showLayoutBar) {
-          setShowLayoutBar(false);
-          return;
-        }
         if (showDrawer) {
           setShowDrawer(false);
         }
@@ -1178,7 +1172,7 @@ export default function NocTvWallboardPage() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [zoomTargetId, showSearch, showLayoutBar, showDrawer]);
+  }, [zoomTargetId, showSearch, showDrawer]);
 
   const kpis = useMemo(() => {
     if (!data) return { probesOnline: 0, totalProbes: 0, healthyTargets: 0 };
@@ -1340,20 +1334,31 @@ export default function NocTvWallboardPage() {
   const activeLayout =
     activeSlide.kind === "highlight" ? spotlightLayout : gridLayout;
 
-  const isCustomLayoutActive =
-    cfg.layoutMode !== DEFAULT_TV_CONFIG.layoutMode ||
-    cfg.customCols !== DEFAULT_TV_CONFIG.customCols ||
-    cfg.flowMode !== DEFAULT_TV_CONFIG.flowMode ||
-    cfg.widthSpec !== DEFAULT_TV_CONFIG.widthSpec ||
-    cfg.rowCardWidth !== DEFAULT_TV_CONFIG.rowCardWidth ||
-    cfg.chartHeight !== DEFAULT_TV_CONFIG.chartHeight;
+  const hasCriticalImpaired = useMemo(
+    () =>
+      partitioned.pinnedAlerts.some(
+        (a) => a.worstStatus === "down" || a.worstStatus === "loss"
+      ),
+    [partitioned.pinnedAlerts]
+  );
 
-  const layoutBadgeText = useMemo(() => {
-    if (cfg.layoutMode === "single-col") return "1-Col";
-    if (cfg.layoutMode === "single-row") return "1-Row";
-    if (cfg.layoutMode === "cols" && cfg.customCols > 0) return `${cfg.customCols}-Col`;
-    return `${gridLayout.cols}-Col`;
-  }, [cfg.layoutMode, cfg.customCols, gridLayout.cols]);
+  const slidePillLabel = useMemo(() => {
+    if (activeSlide.label.startsWith("GRID ")) {
+      return `${safeSlideIdx + 1}/${totalSlides}`;
+    }
+    return activeSlide.label;
+  }, [activeSlide.label, safeSlideIdx, totalSlides]);
+
+  const showSlideControl =
+    (effectiveFlow === "slides" && totalSlides > 1) ||
+    activeSlide.kind === "highlight";
+
+  const hasActiveSearchFilter =
+    Boolean(searchQuery) ||
+    impairedOnly ||
+    cfg.protocols.length > 0 ||
+    cfg.ipVersion !== "all" ||
+    cfg.splitByProtocol;
 
   return (
     <div
@@ -1363,25 +1368,24 @@ export default function NocTvWallboardPage() {
       data-layout={cfg.layoutMode}
       className="flex h-screen w-screen flex-col overflow-hidden bg-canvas text-zinc-100 select-none"
     >
-      {/* Top TV Display Bar */}
-      <header className="flex h-12 shrink-0 items-center justify-between gap-1.5 xl:gap-2 border-b border-border bg-surface px-2.5 sm:px-3 xl:px-4 overflow-hidden">
-        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+      {/* Clean 3-Zone NOC TV Topbar (Option A + Variant A1 quiet inline alerts) */}
+      <header className="flex h-12 shrink-0 items-center justify-between gap-2 xl:gap-3 border-b border-border bg-surface px-3 xl:px-4 overflow-hidden">
+        {/* Zone 1 (Left): Brand + Live Stream + Core KPIs + Quiet Inline Alert Indicator */}
+        <div className="flex items-center gap-2 xl:gap-2.5 shrink-0">
+          <div className="flex items-center gap-2 shrink-0">
             <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-emerald-500/15 border border-emerald-500/40 text-emerald-400">
               <Activity className="h-3.5 w-3.5" aria-hidden="true" />
             </span>
             <h1
-              aria-label="Smoker TV Display"
+              aria-label="Smoker"
               className="whitespace-nowrap text-xs xl:text-sm font-bold tracking-wider uppercase text-zinc-100"
             >
-              <span className="hidden 2xl:inline">Smoker </span>
-              <span>TV</span>
-              <span className="hidden md:inline"> Display</span>
+              SMOKER
             </h1>
           </div>
 
           <span
-            className={`inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] xl:text-[11px] font-mono uppercase ${
+            className={`inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] xl:text-[11px] font-mono uppercase whitespace-nowrap ${
               wsState === "connected"
                 ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
                 : "border-amber-500/40 bg-amber-500/15 text-amber-300"
@@ -1395,46 +1399,108 @@ export default function NocTvWallboardPage() {
             {wsState === "connected" ? "LIVE" : "SYNC"}
           </span>
 
-          <span className="hidden 2xl:inline-block rounded border border-border bg-elevated px-2 py-0.5 text-[11px] font-mono uppercase text-zinc-300">
-            {cfg.orientation === "portrait" ? "Portrait 9:16" : "Landscape 16:9"}
-          </span>
-        </div>
+          <span className="hidden xl:block h-4 w-px bg-border shrink-0" aria-hidden="true" />
 
-        {/* Center KPIs & Graph Range Selector */}
-        <div className="flex items-center gap-2 xl:gap-4 min-w-0 shrink">
-          <div className="hidden 2xl:flex items-center gap-4 text-xs font-mono tabular-nums">
-            <div>
-              <span className="text-zinc-400 mr-1.5">PROBES</span>
-              <span className="font-bold text-emerald-400">
+          <div
+            data-testid="tv-header-kpis"
+            className="hidden xl:flex items-center gap-3 text-xs font-mono tabular-nums whitespace-nowrap"
+          >
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11px] text-zinc-400">PROBES</span>
+              <span
+                className={`font-bold ${
+                  kpis.totalProbes > 0 && kpis.probesOnline === kpis.totalProbes
+                    ? "text-emerald-400"
+                    : kpis.probesOnline === 0 && kpis.totalProbes > 0
+                    ? "text-rose-400"
+                    : "text-amber-300"
+                }`}
+              >
                 {kpis.probesOnline}/{kpis.totalProbes}
               </span>
             </div>
-            <div>
-              <span className="text-zinc-400 mr-1.5">HEALTHY</span>
-              <span className="font-bold text-zinc-100">
-                {kpis.healthyTargets}/{partitioned.totalFiltered}
-              </span>
-            </div>
-            <div>
-              <span className="text-zinc-400 mr-1.5">INCIDENTS</span>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11px] text-zinc-400">OK</span>
               <span
                 className={`font-bold ${
-                  (data?.active_incidents ?? 0) > 0
-                    ? "text-rose-400"
-                    : "text-emerald-400"
+                  partitioned.totalFiltered > 0 &&
+                  kpis.healthyTargets === partitioned.totalFiltered
+                    ? "text-emerald-400"
+                    : "text-zinc-100"
                 }`}
               >
-                {data?.active_incidents ?? 0}
+                {kpis.healthyTargets}/{partitioned.totalFiltered}
               </span>
             </div>
           </div>
 
-          {/* TV Time Range Menu */}
+          {/* Variant A1: Non-intrusive inline severity-aware counter beside KPIs */}
+          {cfg.spotlightMode !== "off" && partitioned.highlightItems.length > 0 ? (
+            <button
+              type="button"
+              data-testid="tv-spotlight-btn"
+              title="Jump to Spotlight slide"
+              onClick={() => {
+                if (partitioned.highlightSlideIdx !== null) {
+                  setPageIdx(partitioned.highlightSlideIdx);
+                  setCountdown(cfg.rotateSec);
+                }
+              }}
+              className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-mono font-semibold whitespace-nowrap transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 ${
+                activeSlide.kind === "highlight"
+                  ? "border-amber-500/45 bg-amber-500/15 text-amber-300"
+                  : "border-transparent bg-transparent text-amber-400 hover:bg-white/5"
+              }`}
+            >
+              <Flame className="h-3 w-3 shrink-0" aria-hidden="true" />
+              <span>
+                <span className="hidden lg:inline">SPOTLIGHT </span>(
+                {partitioned.highlightItems.length})
+              </span>
+            </button>
+          ) : partitioned.pinnedAlerts.length > 0 || impairedOnly ? (
+            <button
+              type="button"
+              data-testid="tv-anomalies-btn"
+              data-severity={hasCriticalImpaired ? "alert" : "warn"}
+              aria-pressed={impairedOnly}
+              title="Click to filter grid to impaired targets (down, loss, high latency)"
+              onClick={() => {
+                setImpairedOnly((prev) => !prev);
+                setPageIdx(0);
+              }}
+              className={`inline-flex items-center gap-1.5 rounded border px-1.5 py-0.5 text-[11px] font-mono font-semibold tabular-nums whitespace-nowrap transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 ${
+                impairedOnly
+                  ? hasCriticalImpaired
+                    ? "border-rose-500/45 bg-rose-500/15 text-rose-300 focus-visible:ring-rose-400"
+                    : "border-amber-500/45 bg-amber-500/15 text-amber-300 focus-visible:ring-amber-400"
+                  : hasCriticalImpaired
+                  ? "border-transparent bg-transparent text-rose-400 hover:bg-white/5 focus-visible:ring-rose-400"
+                  : "border-transparent bg-transparent text-amber-400 hover:bg-white/5 focus-visible:ring-amber-400"
+              }`}
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                  hasCriticalImpaired ? "bg-rose-400" : "bg-amber-400"
+                }`}
+                aria-hidden="true"
+              />
+              <span>
+                {partitioned.pinnedAlerts.length}{" "}
+                {hasCriticalImpaired ? "ALERT" : "WARN"}
+                {impairedOnly ? " · Filtered" : ""}
+              </span>
+            </button>
+          ) : null}
+        </div>
+
+        {/* Zone 2 (Center): Graph Time Range + Saved Preset Switcher */}
+        <div className="flex items-center gap-2 min-w-0 shrink">
           <div
             role="group"
             aria-label="TV Graph time range"
             data-testid="tv-range-selector"
-            className="hidden lg:inline-flex items-center rounded border border-border bg-canvas/80 p-0.5"
+            className="hidden lg:inline-flex items-center rounded-md border border-border bg-canvas/80 p-0.5 shrink-0"
           >
             {TV_RANGES.map((r) => (
               <button
@@ -1442,7 +1508,7 @@ export default function NocTvWallboardPage() {
                 type="button"
                 aria-pressed={cfg.range === r}
                 onClick={() => updateConfig((prev) => ({ ...prev, range: r }), false)}
-                className={`rounded px-1.5 xl:px-2 py-0.5 text-[10px] xl:text-[11px] font-mono font-medium transition-colors ${
+                className={`rounded px-1.5 xl:px-2 py-0.5 text-[10px] xl:text-[11px] font-mono font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
                   cfg.range === r
                     ? "bg-emerald-500 text-zinc-950 font-semibold"
                     : "text-zinc-400 hover:text-zinc-100"
@@ -1454,7 +1520,7 @@ export default function NocTvWallboardPage() {
           </div>
 
           {presets.length > 0 && (
-            <div className="hidden md:flex items-center gap-1">
+            <div className="hidden md:inline-flex items-center gap-1.5 rounded-md border border-border bg-canvas/80 px-2 h-7 max-w-[175px] shrink-0 focus-within:border-emerald-500">
               <Bookmark className="h-3.5 w-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
               <select
                 aria-label="Switch TV preset"
@@ -1464,265 +1530,161 @@ export default function NocTvWallboardPage() {
                   const chosen = presets.find((p) => p.slug === e.target.value);
                   if (chosen) applyTvPreset(chosen);
                 }}
-                className="rounded border border-border bg-canvas/80 px-2 py-0.5 text-[11px] font-mono text-zinc-200 focus:border-emerald-500 focus:outline-none"
+                className="min-w-0 flex-1 bg-transparent text-[11px] font-mono text-zinc-200 focus:outline-none truncate cursor-pointer"
               >
-                <option value="" disabled>
+                <option value="" disabled className="bg-surface text-zinc-400">
                   Presets...
                 </option>
                 {presets.map((p) => (
-                  <option key={p.id} value={p.slug}>
+                  <option key={p.id} value={p.slug} className="bg-surface text-zinc-100">
                     {p.is_default ? `★ ${p.name}` : p.name}
                   </option>
                 ))}
               </select>
             </div>
           )}
-
-          {clockText && (
-            <div className="hidden 2xl:block border-l border-border pl-3 text-xs font-mono tabular-nums text-zinc-300">
-              {clockText}
-            </div>
-          )}
         </div>
 
-        {/* Right Controls */}
-        <div className="flex items-center gap-1 xl:gap-1.5 shrink-0">
-          {cfg.spotlightMode !== "off" && partitioned.highlightItems.length > 0 ? (
-            <button
-              type="button"
-              data-testid="tv-spotlight-btn"
-              onClick={() => {
-                if (partitioned.highlightSlideIdx !== null) {
-                  setPageIdx(partitioned.highlightSlideIdx);
+        {/* Zone 3 (Right — Static): Unified Slide/Play + 3-Icon Bar [Search | Fullscreen | Configure] + Dashboard + Clock */}
+        <div className="flex items-center gap-1.5 xl:gap-2 shrink-0">
+          {showSlideControl && (
+            <div
+              data-testid="tv-slide-control"
+              className="inline-flex h-7 items-center rounded-md border border-border bg-elevated overflow-hidden shrink-0"
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setPageIdx((p) => (p + 1) % totalSlides);
                   setCountdown(cfg.rotateSec);
-                }
-              }}
-              className={`inline-flex items-center gap-1 rounded border px-1.5 xl:px-2 py-1 text-[11px] xl:text-xs font-mono font-semibold ${
-                activeSlide.kind === "highlight"
-                  ? "border-amber-400 bg-amber-400 text-zinc-950"
-                  : "border-amber-500/40 bg-amber-500/15 text-amber-300"
-              }`}
-            >
-              <Flame className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-              <span>
-                <span className="hidden xl:inline">SPOTLIGHT </span>(
-                {partitioned.highlightItems.length})
-              </span>
-            </button>
-          ) : partitioned.pinnedAlerts.length > 0 || impairedOnly ? (
+                }}
+                aria-label="Next TV Display slide"
+                title="Next slide"
+                className="flex h-full items-center gap-1 px-2 text-[11px] font-mono tabular-nums text-zinc-200 hover:bg-white/5 hover:text-white whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-400"
+              >
+                <span>{slidePillLabel}</span>
+                {cfg.rotateSec > 0 &&
+                  totalSlides > 1 &&
+                  !paused &&
+                  effectiveFlow === "slides" && (
+                    <span className="hidden sm:inline text-[10px] text-zinc-400">
+                      · {countdown}s
+                    </span>
+                  )}
+              </button>
+
+              {totalSlides > 1 && effectiveFlow === "slides" && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (cfg.rotateSec === 0) {
+                      setPaused(false);
+                      updateConfig((prev) => ({ ...prev, rotateSec: 15 }), false);
+                    } else {
+                      setPaused((p) => !p);
+                    }
+                  }}
+                  title={
+                    cfg.rotateSec === 0
+                      ? "Start auto page rotation (15s)"
+                      : paused
+                      ? "Resume rotation"
+                      : "Pause rotation"
+                  }
+                  aria-label={
+                    cfg.rotateSec === 0
+                      ? "Start rotation"
+                      : paused
+                      ? "Resume rotation"
+                      : "Pause rotation"
+                  }
+                  className="hidden sm:inline-flex h-full items-center justify-center border-l border-border px-2 text-zinc-300 hover:bg-white/5 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-400"
+                >
+                  {cfg.rotateSec === 0 || paused ? (
+                    <Play className="h-3 w-3" aria-hidden="true" />
+                  ) : (
+                    <Pause className="h-3 w-3" aria-hidden="true" />
+                  )}
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Compact 3-Icon Action Group (Option A: Search + Fullscreen + Configure TV) */}
+          <div className="inline-flex h-7 items-center rounded-md border border-border bg-elevated overflow-hidden shrink-0">
             <button
               type="button"
-              data-testid="tv-anomalies-btn"
-              aria-pressed={impairedOnly}
-              title="Click to filter grid to impaired targets (down, loss, high latency)"
+              data-testid="tv-search-toggle-btn"
+              aria-label="Search and filter by protocol or host"
+              aria-pressed={showSearch || hasActiveSearchFilter}
+              title="Search & Filter (Ctrl+F or /)"
               onClick={() => {
-                setImpairedOnly((prev) => !prev);
-                setPageIdx(0);
+                setShowSearch((prev) => {
+                  const next = !prev;
+                  if (next) {
+                    setTimeout(() => searchInputRef.current?.focus(), 30);
+                  }
+                  return next;
+                });
               }}
-              className={`inline-flex items-center gap-1 rounded border px-1.5 xl:px-2 py-1 text-[11px] xl:text-xs font-mono font-semibold ${
-                impairedOnly
-                  ? "border-rose-400 bg-rose-500 text-zinc-950"
-                  : "border-rose-500/40 bg-rose-500/15 text-rose-300 hover:bg-rose-500/25"
+              className={`inline-flex h-full items-center justify-center gap-1 px-2 text-[11px] font-mono transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-400 ${
+                showSearch || hasActiveSearchFilter
+                  ? "bg-emerald-500/15 text-emerald-300"
+                  : "text-zinc-300 hover:bg-white/5 hover:text-white"
               }`}
             >
-              <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-              <span>
-                <span className="hidden xl:inline">Alert / Warn </span>(
-                {partitioned.pinnedAlerts.length})
-              </span>
+              <Search className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              {(cfg.protocols.length > 0 ||
+                cfg.ipVersion !== "all" ||
+                cfg.splitByProtocol) && (
+                <span className="hidden lg:inline uppercase whitespace-nowrap">
+                  {[
+                    ...cfg.protocols,
+                    cfg.ipVersion !== "all" ? cfg.ipVersion : null,
+                    cfg.splitByProtocol ? "Split" : null,
+                  ]
+                    .filter(Boolean)
+                    .join("·")}
+                </span>
+              )}
             </button>
-          ) : null}
 
-          <button
-            type="button"
-            onClick={() => {
-              setPageIdx((p) => (p + 1) % totalSlides);
-              setCountdown(cfg.rotateSec);
-            }}
-            aria-label="Next TV Display slide"
-            className="flex items-center gap-1 rounded border border-border bg-elevated px-1.5 sm:px-2 xl:px-2.5 py-1 text-[11px] xl:text-xs font-mono tabular-nums text-zinc-200 hover:border-zinc-500"
-          >
-            <span>
-              {effectiveFlow === "scroll" && activeSlide.kind !== "highlight"
-                ? `SCROLL · ${partitioned.totalFiltered}`
-                : `${activeSlide.label} · ${safeSlideIdx + 1}/${totalSlides}`}
-            </span>
-            {cfg.rotateSec > 0 && totalSlides > 1 && !paused && effectiveFlow === "slides" && (
-              <span className="hidden sm:inline text-zinc-400">· {countdown}s</span>
-            )}
-          </button>
+            <button
+              type="button"
+              onClick={handleToggleFullscreen}
+              aria-label="Toggle fullscreen"
+              title="Toggle Fullscreen"
+              className="hidden sm:inline-flex h-full items-center justify-center border-l border-border px-2 text-zinc-300 hover:bg-white/5 hover:text-white transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-400"
+            >
+              <Maximize2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            </button>
 
-          <button
-            type="button"
-            onClick={() => {
-              if (cfg.rotateSec === 0) {
-                setPaused(false);
-                updateConfig((prev) => ({ ...prev, rotateSec: 15 }), false);
-              } else {
-                setPaused((p) => !p);
-              }
-            }}
-            title={
-              cfg.rotateSec === 0
-                ? "Start auto page rotation (15s)"
-                : paused
-                ? "Resume rotation"
-                : "Pause rotation"
-            }
-            aria-label={
-              cfg.rotateSec === 0
-                ? "Start rotation"
-                : paused
-                ? "Resume rotation"
-                : "Pause rotation"
-            }
-            className="hidden sm:inline-flex items-center justify-center rounded border border-border bg-elevated p-1.5 text-zinc-200 hover:border-zinc-500"
-          >
-            {cfg.rotateSec === 0 || paused ? (
-              <Play className="h-3.5 w-3.5" aria-hidden="true" />
-            ) : (
-              <Pause className="h-3.5 w-3.5" aria-hidden="true" />
-            )}
-          </button>
-
-          <button
-            type="button"
-            onClick={() => updateConfig((prev) => ({ ...prev, sound: !prev.sound }), false)}
-            aria-label={cfg.sound ? "Mute alert chime" : "Enable alert chime"}
-            className={`hidden md:inline-flex items-center justify-center rounded border p-1.5 ${
-              cfg.sound
-                ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
-                : "border-border bg-elevated text-zinc-300"
-            }`}
-          >
-            {cfg.sound ? (
-              <Volume2 className="h-3.5 w-3.5" aria-hidden="true" />
-            ) : (
-              <VolumeX className="h-3.5 w-3.5" aria-hidden="true" />
-            )}
-          </button>
-
-          <button
-            type="button"
-            data-testid="tv-probe-mode-btn"
-            aria-pressed={cfg.probeDisplayMode === "per-probe"}
-            title={
-              cfg.probeDisplayMode === "per-probe"
-                ? "Showing 1 graph card per Target × Probe (click for compact Per-Target)"
-                : "Showing 1 focal graph per Target (click to split every probe)"
-            }
-            onClick={() =>
-              updateConfig((prev) => ({
-                ...prev,
-                probeDisplayMode:
-                  prev.probeDisplayMode === "per-probe" ? "per-target" : "per-probe",
-              }))
-            }
-            className={`inline-flex items-center gap-1 rounded border px-1.5 xl:px-2 py-1 text-[11px] font-mono ${
-              cfg.probeDisplayMode === "per-probe"
-                ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-300"
-                : "border-border bg-elevated text-zinc-200 hover:border-zinc-500"
-            }`}
-          >
-            <Radio className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-            <span className="hidden sm:inline">
-              {cfg.probeDisplayMode === "per-probe" ? "Per-Probe" : "Per-Target"}
-            </span>
-          </button>
-
-          <button
-            type="button"
-            data-testid="tv-layout-toggle-btn"
-            aria-label="Configure display layout, columns, and custom width"
-            aria-expanded={showLayoutBar}
-            aria-pressed={showLayoutBar || isCustomLayoutActive}
-            onClick={() => setShowLayoutBar((prev) => !prev)}
-            className={`inline-flex items-center gap-1 rounded border px-1.5 xl:px-2 py-1 text-[11px] font-mono ${
-              showLayoutBar || isCustomLayoutActive
-                ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-300"
-                : "border-border bg-elevated text-zinc-200 hover:border-zinc-500"
-            }`}
-          >
-            <LayoutGrid className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-            <span className="hidden sm:inline">{layoutBadgeText}</span>
-          </button>
-
-          <button
-            type="button"
-            data-testid="tv-search-toggle-btn"
-            aria-label="Search and filter by protocol or host"
-            aria-pressed={
-              showSearch ||
-              Boolean(searchQuery) ||
-              impairedOnly ||
-              cfg.protocols.length > 0 ||
-              cfg.ipVersion !== "all" ||
-              cfg.splitByProtocol
-            }
-            title="Search, Protocol Focus & Filters (Shortcut: /)"
-            onClick={() => {
-              setShowSearch((prev) => {
-                const next = !prev;
-                if (next) {
-                  setTimeout(() => searchInputRef.current?.focus(), 30);
-                }
-                return next;
-              });
-            }}
-            className={`inline-flex items-center gap-1 rounded border px-1.5 py-1 text-[11px] font-mono ${
-              showSearch ||
-              searchQuery ||
-              impairedOnly ||
-              cfg.protocols.length > 0 ||
-              cfg.ipVersion !== "all" ||
-              cfg.splitByProtocol
-                ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-300"
-                : "border-border bg-elevated text-zinc-200 hover:border-zinc-500"
-            }`}
-          >
-            <Search className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-            {cfg.protocols.length > 0 || cfg.ipVersion !== "all" || cfg.splitByProtocol ? (
-              <span className="hidden lg:inline uppercase">
-                {[
-                  ...cfg.protocols,
-                  cfg.ipVersion !== "all" ? cfg.ipVersion : null,
-                  cfg.splitByProtocol ? "Split" : null,
-                ]
-                  .filter(Boolean)
-                  .join("·")}
-              </span>
-            ) : (
-              <span className="hidden xl:inline text-zinc-300">Filter</span>
-            )}
-          </button>
-
-          <button
-            type="button"
-            onClick={handleToggleFullscreen}
-            aria-label="Toggle fullscreen"
-            className="hidden lg:inline-flex items-center justify-center rounded border border-border bg-elevated p-1.5 text-zinc-200 hover:border-zinc-500"
-          >
-            <Maximize2 className="h-3.5 w-3.5" aria-hidden="true" />
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setShowDrawer(true)}
-            aria-label="Configure TV Display"
-            className="inline-flex items-center gap-1 rounded border border-border bg-elevated px-2 xl:px-2.5 py-1 text-[11px] xl:text-xs font-medium text-zinc-100 hover:border-emerald-500/50"
-          >
-            <Settings2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-            <span className="hidden sm:inline">
-              Configure<span className="hidden xl:inline"> TV</span>
-            </span>
-          </button>
+            <button
+              type="button"
+              onClick={() => setShowDrawer(true)}
+              aria-label="Configure TV Display"
+              title="Configure TV Display (Presets, Layout, Columns, Probes, Audio Chime)"
+              className="inline-flex h-full items-center justify-center border-l border-border px-2 text-zinc-200 hover:bg-white/5 hover:text-emerald-300 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-400"
+            >
+              <Settings2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            </button>
+          </div>
 
           <Link
             href="/"
-            className="hidden md:inline-flex items-center rounded border border-border bg-elevated px-2 xl:px-2.5 py-1 text-[11px] xl:text-xs font-medium text-zinc-300 hover:text-zinc-100"
+            className="hidden md:inline-flex h-7 items-center rounded-md px-2 text-xs font-medium text-zinc-400 hover:bg-elevated hover:text-zinc-100 whitespace-nowrap transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
           >
             Dashboard
           </Link>
+
+          {clockText && (
+            <div
+              data-testid="tv-header-clock"
+              className="hidden xl:block border-l border-border pl-2.5 text-xs font-mono tabular-nums text-zinc-300 whitespace-nowrap shrink-0"
+            >
+              {clockText}
+            </div>
+          )}
         </div>
       </header>
 
@@ -1739,177 +1701,6 @@ export default function NocTvWallboardPage() {
             className="shrink-0 rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300"
           >
             {error}
-          </div>
-        )}
-
-        {/* Collapsible Quick Layout, Columns & Custom Width/Height Bar */}
-        {showLayoutBar && (
-          <div
-            data-testid="tv-layout-bar"
-            className="shrink-0 rounded-md border border-border bg-surface/95 px-3 py-2.5 text-xs shadow-lg space-y-2.5"
-          >
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <LayoutPresetPills
-                  testIdPrefix="tv-layout"
-                  preset={cfg.layoutMode}
-                  customCols={cfg.customCols}
-                  onSelectPreset={(layoutMode, cols) =>
-                    updateConfig((prev) => ({
-                      ...prev,
-                      layoutMode,
-                      customCols: cols !== undefined ? cols : prev.customCols,
-                    }))
-                  }
-                />
-
-                {cfg.layoutMode === "single-row" && (
-                  <div
-                    role="group"
-                    aria-label="1-Row card columns"
-                    className="inline-flex items-center gap-1 border-l border-border pl-2"
-                  >
-                    <span className="font-mono text-[10px] text-zinc-400">Row Cols:</span>
-                    {[0, 2, 3, 4].map((cnt) => (
-                      <button
-                        key={cnt}
-                        type="button"
-                        aria-pressed={cfg.customCols === cnt}
-                        data-testid={`tv-layout-rowcols-${cnt}`}
-                        onClick={() =>
-                          updateConfig((prev) => ({ ...prev, customCols: cnt }))
-                        }
-                        className={`rounded border px-1.5 py-0.5 font-mono text-[10px] ${
-                          cfg.customCols === cnt
-                            ? "border-cyan-500 bg-cyan-500 font-semibold text-zinc-950"
-                            : "border-border bg-elevated text-zinc-300"
-                        }`}
-                      >
-                        {cnt === 0 ? "Auto" : cnt}
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                <div
-                  role="group"
-                  aria-label="Orientation"
-                  className="inline-flex items-center rounded border border-border bg-elevated p-0.5"
-                >
-                  {(["landscape", "portrait"] as TvOrientation[]).map((ori) => (
-                    <button
-                      key={ori}
-                      type="button"
-                      aria-pressed={cfg.orientation === ori}
-                      data-testid={`tv-layout-ori-${ori}`}
-                      onClick={() =>
-                        updateConfig((prev) => ({ ...prev, orientation: ori }))
-                      }
-                      className={`rounded px-2 py-0.5 font-mono text-[10px] uppercase ${
-                        cfg.orientation === ori
-                          ? "bg-emerald-500 font-semibold text-zinc-950"
-                          : "text-zinc-300 hover:text-zinc-100"
-                      }`}
-                    >
-                      {ori}
-                    </button>
-                  ))}
-                </div>
-
-                <div
-                  role="group"
-                  aria-label="Flow mode"
-                  className="inline-flex items-center rounded border border-border bg-elevated p-0.5"
-                >
-                  {(
-                    [
-                      { id: "auto", label: `Auto (${effectiveFlow})` },
-                      { id: "scroll", label: "Scroll ↓" },
-                      { id: "slides", label: "Slides" },
-                    ] as Array<{ id: FlowMode; label: string }>
-                  ).map((fm) => (
-                    <button
-                      key={fm.id}
-                      type="button"
-                      aria-pressed={cfg.flowMode === fm.id}
-                      data-testid={`tv-layout-flow-${fm.id}`}
-                      onClick={() =>
-                        updateConfig((prev) => ({ ...prev, flowMode: fm.id }))
-                      }
-                      className={`rounded px-2 py-0.5 font-mono text-[10px] ${
-                        cfg.flowMode === fm.id
-                          ? "bg-cyan-500 font-semibold text-zinc-950"
-                          : "text-zinc-300 hover:text-zinc-100"
-                      }`}
-                    >
-                      {fm.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <button
-                type="button"
-                aria-label="Close layout bar"
-                onClick={() => setShowLayoutBar(false)}
-                className="rounded p-1 text-zinc-400 hover:text-zinc-100"
-              >
-                <X className="h-3.5 w-3.5" aria-hidden="true" />
-              </button>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-1 lg:hidden border-t border-border/60 pt-2">
-              <span className="mr-1 font-mono text-[10px] uppercase text-zinc-400">
-                Range:
-              </span>
-              {TV_RANGES.map((r) => (
-                <button
-                  key={r}
-                  type="button"
-                  aria-pressed={cfg.range === r}
-                  onClick={() => updateConfig((prev) => ({ ...prev, range: r }), false)}
-                  className={`rounded border px-2 py-0.5 font-mono text-[10px] ${
-                    cfg.range === r
-                      ? "border-emerald-500 bg-emerald-500 font-semibold text-zinc-950"
-                      : "border-border bg-elevated text-zinc-300"
-                  }`}
-                >
-                  {r}
-                </button>
-              ))}
-            </div>
-
-            <div className="border-t border-border/60 pt-2">
-              <DisplaySizeControls
-                testIdPrefix="tv-layout"
-                widthSpec={cfg.widthSpec}
-                onChangeWidthSpec={(widthSpec) =>
-                  updateConfig((prev) => ({ ...prev, widthSpec }))
-                }
-                allowAutoWidth={false}
-                showRowCardWidth={cfg.layoutMode === "single-row"}
-                rowCardWidth={cfg.rowCardWidth}
-                onChangeRowCardWidth={(rowCardWidth) =>
-                  updateConfig((prev) => ({ ...prev, rowCardWidth }))
-                }
-                chartHeight={cfg.chartHeight}
-                onChangeChartHeight={(chartHeight) =>
-                  updateConfig((prev) => ({ ...prev, chartHeight }))
-                }
-                compact
-                onReset={() =>
-                  updateConfig((prev) => ({
-                    ...prev,
-                    layoutMode: DEFAULT_TV_CONFIG.layoutMode,
-                    customCols: DEFAULT_TV_CONFIG.customCols,
-                    flowMode: DEFAULT_TV_CONFIG.flowMode,
-                    widthSpec: DEFAULT_TV_CONFIG.widthSpec,
-                    rowCardWidth: DEFAULT_TV_CONFIG.rowCardWidth,
-                    chartHeight: DEFAULT_TV_CONFIG.chartHeight,
-                  }))
-                }
-              />
-            </div>
           </div>
         )}
 
@@ -2574,6 +2365,7 @@ export default function NocTvWallboardPage() {
                       key={ori}
                       type="button"
                       aria-pressed={cfg.orientation === ori}
+                      data-testid={`tv-drawer-layout-ori-${ori}`}
                       onClick={() =>
                         updateConfig((prev) => ({ ...prev, orientation: ori }))
                       }
@@ -2608,6 +2400,33 @@ export default function NocTvWallboardPage() {
                     }))
                   }
                 />
+                {cfg.layoutMode === "single-row" && (
+                  <div
+                    role="group"
+                    aria-label="1-Row card columns"
+                    className="flex items-center gap-1.5"
+                  >
+                    <span className="font-mono text-[10px] text-zinc-400">Row Cols:</span>
+                    {[0, 2, 3, 4].map((cnt) => (
+                      <button
+                        key={cnt}
+                        type="button"
+                        aria-pressed={cfg.customCols === cnt}
+                        data-testid={`tv-drawer-layout-rowcols-${cnt}`}
+                        onClick={() =>
+                          updateConfig((prev) => ({ ...prev, customCols: cnt }))
+                        }
+                        className={`rounded border px-2 py-0.5 font-mono text-[10px] ${
+                          cfg.customCols === cnt
+                            ? "border-cyan-500 bg-cyan-500 font-semibold text-zinc-950"
+                            : "border-border bg-elevated text-zinc-300"
+                        }`}
+                      >
+                        {cnt === 0 ? "Auto" : cnt}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <div className="grid grid-cols-3 gap-1.5">
                   {(
                     [
@@ -2620,6 +2439,7 @@ export default function NocTvWallboardPage() {
                       key={fm.id}
                       type="button"
                       aria-pressed={cfg.flowMode === fm.id}
+                      data-testid={`tv-drawer-layout-flow-${fm.id}`}
                       onClick={() =>
                         updateConfig((prev) => ({ ...prev, flowMode: fm.id }))
                       }

@@ -125,46 +125,46 @@ describe("NocTvWallboardPage layout controls", () => {
       expect(screen.getAllByTestId("tv-target-card").length).toBeGreaterThan(0);
     });
 
-    // Open quick Layout bar
-    await user.click(screen.getByTestId("tv-layout-toggle-btn"));
-    expect(await screen.findByTestId("tv-layout-bar")).toBeInTheDocument();
+    // Open Configure TV drawer (Option A: layout controls live inside drawer)
+    expect(screen.queryByTestId("tv-layout-toggle-btn")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Configure TV Display" }));
 
     // Switch to 1 Col Full -> 1 column & vertical scroll with all 4 targets
-    await user.click(screen.getByTestId("tv-layout-preset-single-col"));
+    await user.click(screen.getByTestId("tv-drawer-layout-preset-single-col"));
     const grid = screen.getByTestId("tv-cards-grid");
     expect(grid).toHaveAttribute("data-cols", "1");
     expect(grid).toHaveAttribute("data-flow", "scroll");
     expect(screen.getAllByTestId("tv-target-card")).toHaveLength(4);
 
     // Custom width 960px + chart height 280px
-    await user.click(screen.getByTestId("tv-layout-width-960px"));
-    await user.click(screen.getByTestId("tv-layout-height-280"));
+    await user.click(screen.getByTestId("tv-drawer-layout-width-960px"));
+    await user.click(screen.getByTestId("tv-drawer-layout-height-280"));
     expect(window.location.search).toContain("layout=single-col");
     expect(window.location.search).toContain("width=960px");
     expect(window.location.search).toContain("chartH=280");
     expect(window.localStorage.getItem("smoker.tv.config.v1")).toContain('"chartHeight":280');
 
     // Switch to 1 Row horizontal -> rows=1 & slides flow
-    await user.click(screen.getByTestId("tv-layout-preset-single-row"));
+    await user.click(screen.getByTestId("tv-drawer-layout-preset-single-row"));
     expect(screen.getByTestId("tv-cards-grid")).toHaveAttribute("data-rows", "1");
     expect(screen.getByTestId("tv-cards-grid")).toHaveAttribute("data-flow", "slides");
 
     // Set 1-Row Card Width 640px -> triggers horizontal card sizing
-    await user.click(screen.getByTestId("tv-layout-rowwidth-640px"));
+    await user.click(screen.getByTestId("tv-drawer-layout-rowwidth-640px"));
     expect(screen.getAllByTestId("tv-target-card")[0]).toHaveStyle({ width: "640px" });
 
     // Switch to Portrait + Auto preset -> updates orientation and flow cleanly
-    await user.click(screen.getByTestId("tv-layout-preset-auto"));
-    await user.click(screen.getByTestId("tv-layout-ori-portrait"));
+    await user.click(screen.getByTestId("tv-drawer-layout-preset-auto"));
+    await user.click(screen.getByTestId("tv-drawer-layout-ori-portrait"));
     expect(screen.getByTestId("noc-tv-root")).toHaveAttribute("data-orientation", "portrait");
     expect(screen.getByTestId("noc-tv-root")).toHaveAttribute("data-flow", "scroll");
 
     // Explicit Slides toggle overrides portrait auto-scroll
-    await user.click(screen.getByTestId("tv-layout-flow-slides"));
+    await user.click(screen.getByTestId("tv-drawer-layout-flow-slides"));
     expect(screen.getByTestId("noc-tv-root")).toHaveAttribute("data-flow", "slides");
 
     // Reset layout returns to auto/full/0
-    await user.click(screen.getByTestId("tv-layout-reset-btn"));
+    await user.click(screen.getByTestId("tv-drawer-layout-reset-btn"));
     expect(window.location.search).not.toContain("chartH=");
     expect(window.location.search).not.toContain("width=");
   });
@@ -286,14 +286,16 @@ describe("NocTvWallboardPage layout controls", () => {
     await user.click(runMtrBtn);
     await user.click(screen.getByTestId("tv-zoom-close-btn"));
 
-    // Toggle to Per-Target compact mode -> collapses to 1 focal card with probe switcher chips
-    await user.click(screen.getByTestId("tv-probe-mode-btn"));
+    // Toggle to Per-Target compact mode via Configure TV drawer -> collapses to 1 focal card with probe switcher chips
+    expect(screen.queryByTestId("tv-probe-mode-btn")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Configure TV Display" }));
+    await user.click(screen.getByTestId("tv-drawer-probemode-per-target"));
     expect(screen.getAllByTestId("tv-target-card")).toHaveLength(1);
     expect(screen.getAllByTestId("tv-probe-chip")).toHaveLength(2);
     expect(window.location.search).toContain("probeMode=per-target");
 
     // Toggle back to Per-Probe -> 2 cards again
-    await user.click(screen.getByTestId("tv-probe-mode-btn"));
+    await user.click(screen.getByTestId("tv-drawer-probemode-per-probe"));
     expect(screen.getAllByTestId("tv-target-card")).toHaveLength(2);
   });
 
@@ -349,19 +351,23 @@ describe("NocTvWallboardPage layout controls", () => {
     const user = userEvent.setup();
     render(<NocTvWallboardPage />);
 
-    // Default Spotlight=off: no tv-spotlight-btn, shows Alert / Warn (3) button (down + loss + degraded)
+    // Default Spotlight=off: no tv-spotlight-btn, shows Variant A1 quiet inline "3 ALERT" (down + loss + degraded)
     await waitFor(() => {
       expect(screen.getByTestId("tv-anomalies-btn")).toHaveTextContent(
-        /Alert \/ Warn\s*\(3\)/
+        /3\s+ALERT/
       );
     });
+    expect(screen.getByTestId("tv-anomalies-btn")).toHaveAttribute("data-severity", "alert");
+    expect(screen.getByTestId("tv-anomalies-btn").className).toContain("bg-transparent");
     expect(screen.queryByTestId("tv-spotlight-btn")).not.toBeInTheDocument();
     expect(screen.queryByTestId("tv-highlight-page")).not.toBeInTheDocument();
 
-    // Clicking Anomalies (3) filters the grid to all 3 impaired targets (including degraded yellow)
+    // Clicking quiet alert counter filters the grid and marks it active ("Filtered")
     await user.click(screen.getByTestId("tv-anomalies-btn"));
+    expect(screen.getByTestId("tv-anomalies-btn")).toHaveTextContent(/Filtered/);
     expect(screen.getAllByTestId("tv-target-card")).toHaveLength(3);
     await user.click(screen.getByTestId("tv-anomalies-btn"));
+    expect(screen.getByTestId("tv-anomalies-btn")).not.toHaveTextContent(/Filtered/);
     expect(screen.getAllByTestId("tv-target-card")).toHaveLength(3);
 
     // Open TV Config Drawer -> enable VIP Only spotlight & Auto-Switch
@@ -505,5 +511,107 @@ describe("NocTvWallboardPage layout controls", () => {
         }),
       });
     });
+  });
+
+  it("renders a clean SMOKER 3-zone topbar (Option A + Variant A1) without clutter, wrapping clock, or duplicate slide labels", async () => {
+    const eightTargetSnapshot: MatrixSnapshot = {
+      ...TV_SNAPSHOT,
+      targets: [1, 2, 3, 4, 5, 6, 7, 8].map((i) => ({
+        ...TV_SNAPSHOT.targets[0],
+        id: `t-${i}`,
+        name: `Host ${i}`,
+        host: `10.0.0.${i}`,
+      })),
+      cells: [1, 2, 3, 4, 5, 6, 7, 8].map((i) => ({
+        ...TV_SNAPSHOT.cells[0],
+        target_id: `t-${i}`,
+      })),
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/api/tv/matrix")) {
+          return new Response(JSON.stringify(eightTargetSnapshot), { status: 200 });
+        }
+        if (url.startsWith("/api/tv/series")) {
+          return new Response(JSON.stringify({ range: "3h", targets: {} }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      })
+    );
+    window.history.replaceState(null, "", "/tv?cards=4");
+    const { unmount } = render(<NocTvWallboardPage />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("tv-target-card")).toHaveLength(4);
+    });
+
+    // Clean brand title "SMOKER" (not "SMOKER TV DISPLAY")
+    const heading = screen.getByRole("heading", { level: 1 });
+    expect(heading).toHaveTextContent("SMOKER");
+    expect(heading.textContent?.trim()).toBe("SMOKER");
+
+    // Option A: removed noisy elements including Quick Layout icon, Per-Probe, Chime, Landscape badge
+    expect(screen.queryByText(/Landscape 16:9/i)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("tv-layout-toggle-btn")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("tv-probe-mode-btn")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /alert chime/i })
+    ).not.toBeInTheDocument();
+
+    // Only 2 core KPIs in header (PROBES & OK, no INCIDENTS)
+    const kpiBar = screen.getByTestId("tv-header-kpis");
+    expect(kpiBar).toHaveTextContent("PROBES");
+    expect(kpiBar).toHaveTextContent("OK");
+    expect(kpiBar).not.toHaveTextContent(/INCIDENTS/i);
+
+    // Alert badge hidden when all targets are healthy
+    expect(screen.queryByTestId("tv-anomalies-btn")).not.toBeInTheDocument();
+
+    // Unified slide control shows clean "1/2" without duplicate "GRID 1/2 · 1/2"
+    const slideControl = screen.getByTestId("tv-slide-control");
+    expect(slideControl).toHaveTextContent("1/2");
+    expect(slideControl).not.toHaveTextContent(/GRID\s+1\/2\s*·\s*1\/2/i);
+
+    // Single-line nowrap clock without 4-digit year
+    const clock = screen.getByTestId("tv-header-clock");
+    expect(clock.className).toContain("whitespace-nowrap");
+    expect(clock.textContent).toMatch(/^\d{2}\s+[A-Z][a-z]{2}\s+·\s+\d{2}:\d{2}:\d{2}$/);
+    unmount();
+
+    // Variant A1: degraded-only target renders quiet amber "1 WARN" (no red alert box)
+    const warnOnlySnap: MatrixSnapshot = {
+      ...TV_SNAPSHOT,
+      cells: TV_SNAPSHOT.cells.map((c, idx) =>
+        idx === 0 ? { ...c, status: "degraded", p50_ms: 190, p95_ms: 240 } : c
+      ),
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/api/tv/matrix")) {
+          return new Response(JSON.stringify(warnOnlySnap), { status: 200 });
+        }
+        if (url.startsWith("/api/tv/series")) {
+          return new Response(JSON.stringify({ range: "3h", targets: {} }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      })
+    );
+    window.history.replaceState(null, "", "/tv");
+    render(<NocTvWallboardPage />);
+    await waitFor(() => {
+      expect(screen.getByTestId("tv-anomalies-btn")).toHaveTextContent(/1\s+WARN/);
+    });
+    const warnBtn = screen.getByTestId("tv-anomalies-btn");
+    expect(warnBtn).toHaveAttribute("data-severity", "warn");
+    expect(warnBtn.className).toContain("bg-transparent");
+    expect(warnBtn.className).toContain("text-amber-400");
   });
 });
