@@ -786,5 +786,22 @@ describe("NocTvWallboardPage layout controls", () => {
     await user.click(histBadge);
     expect(screen.queryByTestId("tv-historical-badge")).not.toBeInTheDocument();
     expect(window.location.search).not.toContain("from=");
+
+    // Re-clicking the currently active preset triggers a fresh /api/tv/series fetch
+    await user.click(screen.getByRole("button", { name: "3h" }));
+    await waitFor(() => {
+      expect(
+        requestedUrls.filter((u) => u.includes("/api/tv/series?range=3h")).length
+      ).toBeGreaterThanOrEqual(1);
+    });
+    const countBeforeReclick = requestedUrls.filter((u) =>
+      u.includes("/api/tv/series?range=3h")
+    ).length;
+    await user.click(screen.getByRole("button", { name: "3h" }));
+    await waitFor(() => {
+      expect(
+        requestedUrls.filter((u) => u.includes("/api/tv/series?range=3h")).length
+      ).toBeGreaterThan(countBeforeReclick);
+    });
   });
 });

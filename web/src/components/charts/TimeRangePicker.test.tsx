@@ -124,4 +124,39 @@ describe("TimeRangePicker", () => {
     await user.keyboard("{Escape}");
     expect(screen.queryByTestId("picker-popover")).not.toBeInTheDocument();
   });
+
+  it("renders subtle loading indicator when loading=true and fires onSelectPreset when re-clicking the active preset", async () => {
+    const user = userEvent.setup();
+    const onSelectPreset = vi.fn();
+    const onApplyCustom = vi.fn();
+
+    const { rerender } = render(
+      <TimeRangePicker
+        value="3h"
+        loading
+        testId="picker"
+        onSelectPreset={onSelectPreset}
+        onApplyCustom={onApplyCustom}
+      />
+    );
+
+    expect(screen.getByTestId("picker")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByTestId("picker-loading")).toBeInTheDocument();
+
+    // Re-clicking active "3h" pill still triggers onSelectPreset (enables zoom reset + series refresh)
+    await user.click(screen.getByRole("button", { name: "3h" }));
+    expect(onSelectPreset).toHaveBeenCalledWith("3h");
+
+    rerender(
+      <TimeRangePicker
+        value="3h"
+        loading={false}
+        testId="picker"
+        onSelectPreset={onSelectPreset}
+        onApplyCustom={onApplyCustom}
+      />
+    );
+    expect(screen.getByTestId("picker")).toHaveAttribute("aria-busy", "false");
+    expect(screen.queryByTestId("picker-loading")).not.toBeInTheDocument();
+  });
 });

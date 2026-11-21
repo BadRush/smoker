@@ -48,15 +48,19 @@ export default function TargetDetailPage() {
 
   const [rangeKey, setRangeKey] = useState<string>("5m");
   const [customWindow, setCustomWindow] = useState<CustomTimeWindow | null>(null);
+  const [rangeVersion, setRangeVersion] = useState<number>(0);
   const [urlHydrated, setUrlHydrated] = useState(false);
   const [data, setData] = useState<TargetSeriesResponse | null>(null);
   const [mtrSnaps, setMtrSnaps] = useState<MTRSnapshot[]>([]);
   const [loading, setLoading] = useState(true);
+  const [rangeLoading, setRangeLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runningMtr, setRunningMtr] = useState(false);
   const [mtrError, setMtrError] = useState<string | null>(null);
 
   const mtrTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const detailReqSeqRef = useRef(0);
+  const hasLoadedOnceRef = useRef(false);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -104,6 +108,7 @@ export default function TargetDetailPage() {
     (nextRange: string) => {
       setCustomWindow(null);
       setRangeKey(nextRange);
+      setRangeVersion((v) => v + 1);
       syncUrlParams(nextRange, null);
     },
     [syncUrlParams]
@@ -112,6 +117,7 @@ export default function TargetDetailPage() {
   const handleApplyCustom = useCallback(
     (win: CustomTimeWindow) => {
       setCustomWindow(win);
+      setRangeVersion((v) => v + 1);
       syncUrlParams(rangeKey, win);
     },
     [rangeKey, syncUrlParams]
@@ -130,6 +136,12 @@ export default function TargetDetailPage() {
 
   const loadDetail = useCallback(async () => {
     if (!urlHydrated) return;
+    const reqId = ++detailReqSeqRef.current;
+    if (hasLoadedOnceRef.current) {
+      setRangeLoading(true);
+    } else {
+      setLoading(true);
+    }
     try {
       setError(null);
       const query = customWindow
@@ -141,9 +153,12 @@ export default function TargetDetailPage() {
         ),
         apiRequest<MTRSnapshot[]>(`/api/targets/${targetId}/mtr?limit=10`),
       ]);
+      if (reqId !== detailReqSeqRef.current) return;
+      hasLoadedOnceRef.current = true;
       setData(seriesRes);
       setMtrSnaps(mtrRes);
     } catch (err) {
+      if (reqId !== detailReqSeqRef.current) return;
       if (err instanceof ApiError && err.status === 401) {
         router.replace("/login");
         return;
@@ -152,15 +167,17 @@ export default function TargetDetailPage() {
         err instanceof Error ? err.message : "Failed to load target telemetry"
       );
     } finally {
-      setLoading(false);
+      if (reqId === detailReqSeqRef.current) {
+        setLoading(false);
+        setRangeLoading(false);
+      }
     }
   }, [targetId, rangeKey, customWindow, urlHydrated, router]);
 
   useEffect(() => {
     if (!urlHydrated) return;
-    setLoading(true);
     void loadDetail();
-  }, [urlHydrated, loadDetail]);
+  }, [urlHydrated, rangeVersion, loadDetail]);
 
   const handleLive = useCallback(
     (ev: LiveEventMessage) => {
@@ -330,6 +347,7 @@ export default function TargetDetailPage() {
               value={rangeKey}
               customWindow={customWindow}
               allPresets={RANGES}
+              loading={rangeLoading}
               onSelectPreset={handleSelectPreset}
               onApplyCustom={handleApplyCustom}
               ariaLabel="Time range selector"
@@ -401,6 +419,8 @@ export default function TargetDetailPage() {
                     ? [customWindow.fromSec, customWindow.toSec]
                     : null
                 }
+                rangeVersion={rangeVersion}
+                loading={rangeLoading}
                 baselineMs={s.baseline_ms ?? null}
                 warnMs={resolveEffectiveWarnMs({
                   seriesWarnMs: s.warn_ms,

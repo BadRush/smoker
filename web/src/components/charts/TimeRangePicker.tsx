@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Calendar, ChevronDown, Radio } from "lucide-react";
+import { Calendar, ChevronDown, Loader2, Radio } from "lucide-react";
 import {
   formatCustomWindowShort,
   MAX_CUSTOM_WINDOW_SPAN_SEC,
@@ -50,6 +50,7 @@ export interface TimeRangePickerProps {
   quickPresets?: readonly string[];
   allPresets?: readonly string[];
   compact?: boolean;
+  loading?: boolean;
   ariaLabel?: string;
   testId?: string;
   className?: string;
@@ -63,6 +64,7 @@ export function TimeRangePicker({
   quickPresets = DEFAULT_QUICK_PRESETS,
   allPresets = TV_RANGES,
   compact = false,
+  loading = false,
   ariaLabel = "Time range selector",
   testId = "time-range-picker",
   className = "",
@@ -433,6 +435,7 @@ export function TimeRangePicker({
       ref={groupRef}
       role="group"
       aria-label={ariaLabel}
+      aria-busy={loading}
       data-testid={testId}
       className={`inline-flex items-center rounded-md border border-border bg-canvas/80 p-0.5 shrink-0 ${className}`}
     >
@@ -492,6 +495,17 @@ export function TimeRangePicker({
           aria-hidden="true"
         />
       </button>
+
+      {loading && (
+        <span
+          data-testid={`${testId}-loading`}
+          title="Updating time range..."
+          aria-label="Loading time range"
+          className="inline-flex items-center justify-center px-1 text-emerald-400 shrink-0"
+        >
+          <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+        </span>
+      )}
 
       {popoverNode}
     </div>

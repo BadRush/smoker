@@ -131,6 +131,8 @@ interface FocalTargetCardProps {
   layout: TvGridLayout;
   range: TvRange;
   customWindow?: CustomTimeWindow | null;
+  rangeVersion?: number;
+  seriesLoading?: boolean;
   probeMap: Map<string, string>;
   groupMap: Map<string, string>;
   seriesByTarget: Record<string, ProbeSeries[]>;
@@ -145,6 +147,8 @@ function FocalTargetCard({
   layout,
   range,
   customWindow = null,
+  rangeVersion = 0,
+  seriesLoading = false,
   probeMap,
   groupMap,
   seriesByTarget,
@@ -414,6 +418,8 @@ function FocalTargetCard({
                 ? [customWindow.fromSec, customWindow.toSec]
                 : null
             }
+            rangeVersion={rangeVersion}
+            loading={seriesLoading}
             intervalSec={target.interval_sec}
             probeBadgeTestId={isPerProbeCard ? "tv-card-probe-badge" : undefined}
             baselineMs={focalCell.baseline_ms ?? focalSeries.baseline_ms ?? null}
@@ -438,8 +444,11 @@ function FocalTargetCard({
 export default function NocTvWallboardPage() {
   const [cfg, setCfg] = useState<TvWallConfig>(DEFAULT_TV_CONFIG);
   const [customWindow, setCustomWindow] = useState<CustomTimeWindow | null>(null);
+  const [rangeVersion, setRangeVersion] = useState<number>(0);
+  const [seriesLoading, setSeriesLoading] = useState<boolean>(false);
   const customWindowRef = useRef<CustomTimeWindow | null>(null);
   customWindowRef.current = customWindow;
+  const seriesReqSeqRef = useRef<number>(0);
   const [urlHydrated, setUrlHydrated] = useState(false);
   const [data, setData] = useState<MatrixSnapshot | null>(null);
   const [seriesByRange, setSeriesByRange] = useState<
@@ -640,6 +649,7 @@ export default function NocTvWallboardPage() {
     (nextRange: TvRange) => {
       customWindowRef.current = null;
       setCustomWindow(null);
+      setRangeVersion((v) => v + 1);
       updateConfig((prev) => ({ ...prev, range: nextRange }), false);
     },
     [updateConfig]
@@ -648,6 +658,7 @@ export default function NocTvWallboardPage() {
   const handleApplyCustomWindow = useCallback((win: CustomTimeWindow) => {
     customWindowRef.current = win;
     setCustomWindow(win);
+    setRangeVersion((v) => v + 1);
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       params.set("from", String(win.fromSec));
@@ -1116,8 +1127,12 @@ export default function NocTvWallboardPage() {
       .join(",");
   }, [effectiveFlow, activeSlide.kind, activeSlide.items, partitioned.allSummaries]);
 
-  const loadVisibleSeries = useCallback(async () => {
+  const loadVisibleSeries = useCallback(async (showSpinner = true) => {
     if (!urlHydrated || !visibleIdsKey) return;
+    const reqId = ++seriesReqSeqRef.current;
+    if (showSpinner) {
+      setSeriesLoading(true);
+    }
     const requestedKey = customWindow
       ? `custom:${customWindow.fromSec}:${customWindow.toSec}`
       : cfg.range;
@@ -1137,12 +1152,16 @@ export default function NocTvWallboardPage() {
       }));
     } catch {
       // Fall back gracefully to live rolling cache if batch series fetch temporarily fails
+    } finally {
+      if (reqId === seriesReqSeqRef.current) {
+        setSeriesLoading(false);
+      }
     }
   }, [urlHydrated, visibleIdsKey, cfg.range, customWindow]);
 
   useEffect(() => {
     if (!urlHydrated || !visibleIdsKey) return;
-    void loadVisibleSeries();
+    void loadVisibleSeries(true);
     if (customWindow) {
       // Historical custom windows are frozen; skip background rolling series polling
       return;
@@ -1155,10 +1174,10 @@ export default function NocTvWallboardPage() {
       cfg.range === "30d";
     const intervalMs = isLongRange ? 60_000 : 15_000;
     const poll = setInterval(() => {
-      void loadVisibleSeries();
+      void loadVisibleSeries(false);
     }, intervalMs);
     return () => clearInterval(poll);
-  }, [urlHydrated, visibleIdsKey, cfg.range, customWindow, loadVisibleSeries]);
+  }, [urlHydrated, visibleIdsKey, cfg.range, customWindow, rangeVersion, loadVisibleSeries]);
 
   async function handleSimulateAnomaly(
     mode: "high_latency" | "intermittent_loss" | "down" | "clear"
@@ -1687,6 +1706,7 @@ export default function NocTvWallboardPage() {
             compact
             value={cfg.range}
             customWindow={customWindow}
+            loading={seriesLoading}
             onSelectPreset={(r) => handleSelectPresetRange(r as TvRange)}
             onApplyCustom={handleApplyCustomWindow}
             ariaLabel="TV Graph time range"
@@ -2070,6 +2090,8 @@ export default function NocTvWallboardPage() {
                   layout={spotlightLayout}
                   range={cfg.range}
                   customWindow={customWindow}
+                  rangeVersion={rangeVersion}
+                  seriesLoading={seriesLoading}
                   probeMap={probeMap}
                   groupMap={groupMap}
                   seriesByTarget={seriesByTarget}
@@ -2173,6 +2195,8 @@ export default function NocTvWallboardPage() {
                           layout={gridLayout}
                           range={cfg.range}
                           customWindow={customWindow}
+                          rangeVersion={rangeVersion}
+                          seriesLoading={seriesLoading}
                           probeMap={probeMap}
                           groupMap={groupMap}
                           seriesByTarget={seriesByTarget}
@@ -2224,6 +2248,8 @@ export default function NocTvWallboardPage() {
                           layout={gridLayout}
                           range={cfg.range}
                           customWindow={customWindow}
+                          rangeVersion={rangeVersion}
+                          seriesLoading={seriesLoading}
                           probeMap={probeMap}
                           groupMap={groupMap}
                           seriesByTarget={seriesByTarget}
@@ -2268,6 +2294,8 @@ export default function NocTvWallboardPage() {
                   layout={gridLayout}
                   range={cfg.range}
                   customWindow={customWindow}
+                  rangeVersion={rangeVersion}
+                  seriesLoading={seriesLoading}
                   probeMap={probeMap}
                   groupMap={groupMap}
                   seriesByTarget={seriesByTarget}

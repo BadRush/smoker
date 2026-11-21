@@ -57,15 +57,18 @@ export function TargetZoomModal({
   const [customWindow, setCustomWindow] = useState<CustomTimeWindow | null>(
     initialCustomWindow
   );
+  const [rangeVersion, setRangeVersion] = useState<number>(0);
   const [zoomProbeFilter, setZoomProbeFilter] = useState<string>("");
   const [zoomSeries, setZoomSeries] = useState<ProbeSeries[]>([]);
   const [zoomMtrSnaps, setZoomMtrSnaps] = useState<MTRSnapshot[]>([]);
   const [zoomLoading, setZoomLoading] = useState<boolean>(true);
+  const [hasLoadedSeries, setHasLoadedSeries] = useState<boolean>(false);
   const [runningMtr, setRunningMtr] = useState<boolean>(false);
   const [mtrErr, setMtrErr] = useState<string | null>(null);
 
   useEffect(() => {
     setZoomProbeFilter("");
+    setHasLoadedSeries(false);
   }, [target.id]);
 
   useEffect(() => {
@@ -98,13 +101,14 @@ export function TargetZoomModal({
       if (cancelled) return;
       setZoomSeries(Array.isArray(serList) ? serList : []);
       setZoomMtrSnaps(Array.isArray(mtrList) ? mtrList : []);
+      setHasLoadedSeries(true);
       setZoomLoading(false);
     });
 
     return () => {
       cancelled = true;
     };
-  }, [mode, target.id, zoomRange, customWindow]);
+  }, [mode, target.id, zoomRange, customWindow, rangeVersion]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -125,8 +129,15 @@ export function TargetZoomModal({
 
   const mergedList = useMemo(() => {
     const isHistorical = Boolean(customWindow);
+    const canUseFallback =
+      !hasLoadedSeries &&
+      !isHistorical &&
+      zoomRange === initialRange &&
+      fallbackSeries.length > 0;
     const rawList =
-      zoomSeries.length > 0 || isHistorical ? zoomSeries : fallbackSeries;
+      zoomSeries.length > 0 || isHistorical || !canUseFallback
+        ? zoomSeries
+        : fallbackSeries;
     const rawByProbe = new Map(rawList.map((s) => [s.probe_id, s]));
     const items: Array<{ cell: MatrixCell; series: ProbeSeriesInput }> = targetCells.map(
       (cell) => ({
@@ -163,7 +174,17 @@ export function TargetZoomModal({
       });
     }
     return items;
-  }, [zoomSeries, fallbackSeries, targetCells, probeMap, zoomRange, customWindow, target.id]);
+  }, [
+    zoomSeries,
+    fallbackSeries,
+    hasLoadedSeries,
+    initialRange,
+    targetCells,
+    probeMap,
+    zoomRange,
+    customWindow,
+    target.id,
+  ]);
 
   const visibleProbes = useMemo(
     () =>
@@ -330,11 +351,16 @@ export function TargetZoomModal({
             <TimeRangePicker
               value={zoomRange}
               customWindow={customWindow}
+              loading={zoomLoading}
               onSelectPreset={(r) => {
                 setCustomWindow(null);
                 setZoomRange(r as TvRange);
+                setRangeVersion((v) => v + 1);
               }}
-              onApplyCustom={(win) => setCustomWindow(win)}
+              onApplyCustom={(win) => {
+                setCustomWindow(win);
+                setRangeVersion((v) => v + 1);
+              }}
               ariaLabel="Zoom modal time range"
               testId="tv-zoom-range-selector"
             />
@@ -422,7 +448,7 @@ export function TargetZoomModal({
         )}
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4 space-y-4">
-          {zoomLoading && zoomSeries.length === 0 ? (
+          {zoomLoading && !hasLoadedSeries && zoomSeries.length === 0 ? (
             <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border bg-canvas/40 text-xs font-mono text-zinc-400">
               Loading high-resolution telemetry for {target.name}...
             </div>
@@ -445,6 +471,8 @@ export function TargetZoomModal({
                     ? [customWindow.fromSec, customWindow.toSec]
                     : null
                 }
+                rangeVersion={rangeVersion}
+                loading={zoomLoading}
                 intervalSec={target.interval_sec}
                 baselineMs={cell.baseline_ms ?? series.baseline_ms ?? null}
                 warnMs={resolveEffectiveWarnMs({

@@ -41,27 +41,121 @@ const capturedOpts: Array<{
 }> = [];
 const mockPlotInstances: Array<{
   scales: { x: { min: number; max: number }; y: { min: number; max: number } };
+  series: Array<{ idxs?: [number, number] }>;
+  data: [number[], Array<number | null>];
   opts: (typeof capturedOpts)[number];
+  simulateUserDragZoom: (min: number, max: number) => void;
 }> = [];
 
 vi.mock("uplot", () => {
   class FakeUPlot {
     scales = { x: { min: 0, max: 0 }, y: { min: 0, max: 100 } };
+    series: Array<{ idxs?: [number, number] }> = [{ idxs: [0, 0] }, {}];
+    data: [number[], Array<number | null>] = [[], []];
     opts: (typeof capturedOpts)[number];
-    constructor(opts: (typeof capturedOpts)[number]) {
+    private pendScales: Record<string, { min: number; max: number } | null> = {};
+    private queuedCommit = false;
+    constructor(
+      opts: (typeof capturedOpts)[number],
+      initData?: [number[], Array<number | null>]
+    ) {
       this.opts = opts;
+      if (initData) {
+        this.data = initData;
+        const n = initData[0]?.length ?? 0;
+        if (n > 0) {
+          this.series[0].idxs = [0, n - 1];
+          // Mirror real uPlot _init() autoScaleX queuing async commit
+          this.pendScales.x = { min: initData[0][0], max: initData[0][n - 1] };
+          this.scheduleCommit();
+        }
+      }
       capturedOpts.push(opts);
       mockPlotInstances.push(this);
     }
+    private scheduleCommit() {
+      if (!this.queuedCommit) {
+        this.queuedCommit = true;
+        Promise.resolve().then(() => this._commit());
+      }
+    }
+    private _commit() {
+      this.queuedCommit = false;
+      const px = this.pendScales.x;
+      this.pendScales.x = null;
+      if (!px) return;
+
+      const rangedX = this.opts.scales?.x?.range?.(this, px.min, px.max) ?? [
+        px.min,
+        px.max,
+      ];
+      const ts = this.data[0] ?? [];
+      if (ts.length > 0) {
+        let i0 = 0;
+        let i1 = ts.length - 1;
+        for (let i = 0; i < ts.length; i++) {
+          if (ts[i] >= rangedX[0]) {
+            i0 = i;
+            break;
+          }
+        }
+        for (let i = ts.length - 1; i >= 0; i--) {
+          if (ts[i] <= rangedX[1]) {
+            i1 = i;
+            break;
+          }
+        }
+        if (i1 < i0) {
+          i0 = 0;
+          i1 = ts.length - 1;
+        }
+        this.series[0].idxs = [i0, i1];
+      }
+
+      // Mirror real uPlot: scales.y.range runs BEFORE this.scales.x is overwritten
+      const yRange = this.opts.scales?.y?.range?.(this, 0, 100);
+      if (yRange) {
+        this.scales.y = { min: yRange[0], max: yRange[1] };
+      }
+
+      const changedX =
+        this.scales.x.min !== rangedX[0] || this.scales.x.max !== rangedX[1];
+      this.scales.x = { min: rangedX[0], max: rangedX[1] };
+      if (changedX) {
+        this.opts.hooks?.setScale?.forEach((fn) => fn(this, "x"));
+      }
+    }
+    batch(fn: (u: FakeUPlot) => void) {
+      this.queuedCommit = true;
+      fn(this);
+      this._commit();
+    }
     destroy() {}
-    setData(...args: unknown[]) {
-      setDataSpy(...args);
+    setData(data: [number[], Array<number | null>], resetScales?: boolean) {
+      setDataSpy(data, resetScales);
+      this.data = data;
+      if (resetScales !== false) {
+        // Mirror real uPlot: when scales.x.auto === false, setData(..., true) re-queues stale scaleX
+        this.setScale("x", { min: this.scales.x.min, max: this.scales.x.max });
+      }
     }
     setSize() {}
     setScale(key: string, val: { min: number; max: number }) {
       setScaleSpy(key, val);
+      this.pendScales[key] = { ...val };
+      this.scheduleCommit();
     }
-    redraw() {}
+    redraw(rebuildPaths?: boolean) {
+      // Mirror real uPlot line 4924: redraw() with rebuildPaths !== false re-queues stale scaleX!
+      if (rebuildPaths !== false) {
+        this.setScale("x", { min: this.scales.x.min, max: this.scales.x.max });
+      }
+    }
+    simulateUserDragZoom(min: number, max: number) {
+      this.batch(() => {
+        this.setScale("x", { min, max });
+      });
+    }
   }
   (FakeUPlot as unknown as { sync: (k: string) => { key: string } }).sync = (
     key: string
@@ -233,8 +327,9 @@ describe("SmokeChartPanel", () => {
     expect(onZoom).toHaveBeenCalledTimes(1);
   });
 
-  it("updates uPlot X scale bounds immediately when rangeLabel changes", async () => {
+  it("commits new X scale immediately across sequential range switches without redraw clobber or false zoom lock", async () => {
     setScaleSpy.mockClear();
+    mockPlotInstances.length = 0;
     const nowSec = Math.floor(Date.now() / 1000);
     const props = {
       compact: true,
@@ -256,20 +351,136 @@ describe("SmokeChartPanel", () => {
       },
     };
 
-    const { rerender } = render(<SmokeChartPanel {...props} rangeLabel="3h" />);
+    const { rerender } = render(<SmokeChartPanel {...props} rangeLabel="1h" />);
     await vi.waitFor(() => {
-      expect(setScaleSpy).toHaveBeenCalled();
+      expect(mockPlotInstances.length).toBeGreaterThanOrEqual(1);
     });
-    const last3h = setScaleSpy.mock.calls.at(-1)?.[1] as { min: number; max: number };
-    expect(last3h.max - last3h.min).toBe(10800);
+    const inst = mockPlotInstances.at(-1)!;
+    // Allow any stray microtasks to flush — committed scale MUST remain 1h
+    await Promise.resolve();
+    expect(inst.scales.x.max - inst.scales.x.min).toBe(3600);
 
-    setScaleSpy.mockClear();
+    // Switch 1h -> 3h -> 30d -> 15m; each switch must commit the new span without getting stuck at 1h
+    rerender(<SmokeChartPanel {...props} rangeLabel="3h" />);
+    await Promise.resolve();
+    expect(inst.scales.x.max - inst.scales.x.min).toBe(10800);
+    expect(screen.queryByTestId("reset-zoom-btn")).not.toBeInTheDocument();
+
+    rerender(<SmokeChartPanel {...props} rangeLabel="30d" />);
+    await Promise.resolve();
+    expect(inst.scales.x.max - inst.scales.x.min).toBe(30 * 86400);
+    expect(screen.queryByTestId("reset-zoom-btn")).not.toBeInTheDocument();
+
     rerender(<SmokeChartPanel {...props} rangeLabel="15m" />);
+    await Promise.resolve();
+    expect(inst.scales.x.max - inst.scales.x.min).toBe(900);
+    expect(screen.queryByTestId("reset-zoom-btn")).not.toBeInTheDocument();
+  });
+
+  it("resets drag-zoom on rangeVersion bump (re-clicking active preset) and rescales Y using series[0].idxs on frame 1", async () => {
+    mockPlotInstances.length = 0;
+    const t0 = 1_794_800_000;
+    const spikeSeries = {
+      probe_id: "p1",
+      probe_name: "probe-local",
+      location_label: "Jakarta",
+      timestamps: [t0, t0 + 60, t0 + 120, t0 + 180, t0 + 240],
+      min_ms: [180, 10, 11, 10, 12],
+      p25_ms: [190, 11, 12, 11, 13],
+      p50_ms: [200, 12, 13, 12, 14],
+      p75_ms: [210, 13, 14, 13, 15],
+      p95_ms: [250, 15, 16, 15, 17],
+      max_ms: [260, 16, 17, 16, 18],
+      jitter_ms: [5, 0.5, 0.5, 0.5, 0.5],
+      loss_pct: [0, 0, 0, 0, 0],
+    };
+
+    const { rerender } = render(
+      <SmokeChartPanel
+        syncKey="reclick-reset-sync"
+        rangeLabel="3h"
+        rangeVersion={0}
+        series={spikeSeries}
+      />
+    );
     await vi.waitFor(() => {
-      expect(setScaleSpy).toHaveBeenCalled();
+      expect(mockPlotInstances.length).toBeGreaterThanOrEqual(1);
     });
-    const last15m = setScaleSpy.mock.calls.at(-1)?.[1] as { min: number; max: number };
-    expect(last15m.max - last15m.min).toBe(900);
+    const inst = mockPlotInstances.at(-1)!;
+    // Initial full window includes 250ms spike at index 0
+    expect(inst.scales.y.max).toBeGreaterThan(200);
+
+    // User drags horizontally to calm [t0+60, t0+180] slice -> Y rescales down immediately on frame 1!
+    inst.simulateUserDragZoom(t0 + 60, t0 + 180);
+    expect(inst.scales.x).toEqual({ min: t0 + 60, max: t0 + 180 });
+    expect(inst.scales.y.max).toBeLessThan(40);
+    expect(await screen.findByTestId("reset-zoom-btn")).toBeInTheDocument();
+
+    // Re-clicking active 3h preset bumps rangeVersion (0 -> 1) -> resets zoom to full 3h & restores Y scale
+    rerender(
+      <SmokeChartPanel
+        syncKey="reclick-reset-sync"
+        rangeLabel="3h"
+        rangeVersion={1}
+        series={spikeSeries}
+      />
+    );
+    await Promise.resolve();
+    expect(screen.queryByTestId("reset-zoom-btn")).not.toBeInTheDocument();
+    expect(inst.scales.x.max - inst.scales.x.min).toBe(10800);
+    expect(inst.scales.y.max).toBeGreaterThan(200);
+  });
+
+  it("distinguishes loading, empty custom historical range, and live waiting empty states", () => {
+    const emptySeries = {
+      probe_id: "p1",
+      probe_name: "probe-local",
+      location_label: "Jakarta",
+      timestamps: [],
+      min_ms: [],
+      p25_ms: [],
+      p50_ms: [],
+      p75_ms: [],
+      p95_ms: [],
+      max_ms: [],
+      jitter_ms: [],
+      loss_pct: [],
+    };
+
+    const { rerender } = render(
+      <SmokeChartPanel
+        syncKey="empty-states"
+        loading
+        fixedBounds={[1_794_800_000, 1_794_803_600]}
+        series={emptySeries}
+      />
+    );
+    expect(screen.getByTestId("smoke-chart-empty-state")).toHaveTextContent(
+      "Loading telemetry for selected time range..."
+    );
+
+    rerender(
+      <SmokeChartPanel
+        syncKey="empty-states"
+        loading={false}
+        fixedBounds={[1_794_800_000, 1_794_803_600]}
+        series={emptySeries}
+      />
+    );
+    expect(screen.getByTestId("smoke-chart-empty-state")).toHaveTextContent(
+      "No samples in selected time range."
+    );
+
+    rerender(
+      <SmokeChartPanel
+        syncKey="empty-states"
+        loading={false}
+        series={emptySeries}
+      />
+    );
+    expect(screen.getByTestId("smoke-chart-empty-state")).toHaveTextContent(
+      "Waiting for telemetry samples from this probe..."
+    );
   });
 
   it("configures a right-hand 0%..100% loss Y-axis in both zoomed and compact modes and shows zoom window loss", async () => {
@@ -406,12 +617,8 @@ describe("SmokeChartPanel", () => {
     expect(opts.scales?.x?.range?.(inst, dragMin, dragMax)).toEqual([dragMin, dragMax]);
 
     // When zoomed to [t0+60, t0+180] (calm ~16ms slice), Y-axis rescales down ignoring the 250ms spike at t0
-    inst.scales.x = { min: dragMin, max: dragMax };
-    const yRangeZoomed = opts.scales?.y?.range?.(inst, 0, 250);
-    expect(yRangeZoomed?.[1]).toBeLessThan(40);
-
-    // Fire uPlot setScale hook -> activates zoomed state and Reset Zoom button
-    inst.opts.hooks?.setScale?.[0]?.(inst, "x");
+    inst.simulateUserDragZoom(dragMin, dragMax);
+    expect(inst.scales.y.max).toBeLessThan(40);
     expect(await screen.findByTestId("reset-zoom-btn")).toBeInTheDocument();
 
     // Live tick update while zoomed MUST preserve [dragMin, dragMax] and pass resetScales=false

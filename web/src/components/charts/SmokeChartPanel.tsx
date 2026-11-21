@@ -2,6 +2,7 @@
 
 import React, {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
   useMemo,
@@ -73,6 +74,8 @@ interface SmokeChartPanelProps {
   rangeLabel?: string;
   windowSec?: number | null;
   fixedBounds?: readonly [number, number] | null;
+  rangeVersion?: number;
+  loading?: boolean;
   intervalSec?: number | null;
   baselineMs?: number | null;
   warnMs?: number | null;
@@ -109,6 +112,8 @@ export const SmokeChartPanel = forwardRef<
     rangeLabel,
     windowSec,
     fixedBounds,
+    rangeVersion = 0,
+    loading = false,
     intervalSec,
     baselineMs,
     warnMs,
@@ -154,10 +159,12 @@ export const SmokeChartPanel = forwardRef<
   const isZoomedRef = useRef(false);
   const zoomedXRangeRef = useRef<[number, number] | null>(null);
   const programmaticScaleRef = useRef(false);
-  const prevWindowKeyRef = useRef<string | number | null>(
-    fixedFromSec !== null && fixedToSec !== null
-      ? `fixed:${fixedFromSec}:${fixedToSec}`
-      : effectiveWindowSec ?? rangeLabel ?? null
+  const prevWindowKeyRef = useRef<string>(
+    `${
+      fixedFromSec !== null && fixedToSec !== null
+        ? `fixed:${fixedFromSec}:${fixedToSec}`
+        : effectiveWindowSec ?? rangeLabel ?? ""
+    }:${rangeVersion}`
   );
   const pointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
   const suppressNextClickRef = useRef(false);
@@ -210,17 +217,27 @@ export const SmokeChartPanel = forwardRef<
 
   const hasData = series.timestamps.length > 0;
 
+  const runProgrammaticScale = useCallback((plot: uPlot, fn: () => void) => {
+    programmaticScaleRef.current = true;
+    try {
+      if (typeof plot.batch === "function") {
+        plot.batch(fn);
+      } else {
+        fn();
+      }
+    } finally {
+      programmaticScaleRef.current = false;
+    }
+  }, []);
+
   function resetThisChartZoom() {
     const plot = plotRef.current;
     const bounds = getCanonicalBounds();
     if (!plot || !bounds) return;
     updateZoomState(false);
-    programmaticScaleRef.current = true;
-    try {
+    runProgrammaticScale(plot, () => {
       plot.setScale?.("x", { min: bounds[0], max: bounds[1] });
-    } finally {
-      programmaticScaleRef.current = false;
-    }
+    });
   }
 
   function handleResetZoom() {
@@ -363,23 +380,47 @@ export const SmokeChartPanel = forwardRef<
             auto: true,
             range: (u, _min, dataMax) => {
               const s = seriesRef.current;
-              const xMin = u.scales.x?.min;
-              const xMax = u.scales.x?.max;
-              const hasXWindow =
-                xMin !== undefined &&
-                xMax !== undefined &&
-                Number.isFinite(xMin) &&
-                Number.isFinite(xMax) &&
-                xMax > xMin;
+              // uPlot calls scales.y.range BEFORE committing wipScales.x to u.scales.x,
+              // whereas u.series[0].idxs already reflects the new visible X slice.
+              const idxs = u.series?.[0]?.idxs;
+              const idx0 =
+                Array.isArray(idxs) && typeof idxs[0] === "number" ? idxs[0] : null;
+              const idx1 =
+                Array.isArray(idxs) && typeof idxs[1] === "number" ? idxs[1] : null;
+
               let top = 0;
               let matched = 0;
-              for (let i = 0; i < s.timestamps.length; i++) {
-                const ts = s.timestamps[i];
-                if (hasXWindow && (ts < xMin || ts > xMax)) continue;
-                const candidate = s.p95_ms[i] ?? s.max_ms[i] ?? s.p50_ms[i] ?? 0;
-                if (candidate > 0) {
-                  matched++;
-                  if (candidate > top) top = candidate;
+              if (
+                idx0 !== null &&
+                idx1 !== null &&
+                idx0 >= 0 &&
+                idx1 >= idx0 &&
+                idx1 < s.timestamps.length
+              ) {
+                for (let i = idx0; i <= idx1; i++) {
+                  const candidate = s.p95_ms[i] ?? s.max_ms[i] ?? s.p50_ms[i] ?? 0;
+                  if (candidate > 0) {
+                    matched++;
+                    if (candidate > top) top = candidate;
+                  }
+                }
+              } else {
+                const xMin = u.scales.x?.min;
+                const xMax = u.scales.x?.max;
+                const hasXWindow =
+                  xMin !== undefined &&
+                  xMax !== undefined &&
+                  Number.isFinite(xMin) &&
+                  Number.isFinite(xMax) &&
+                  xMax > xMin;
+                for (let i = 0; i < s.timestamps.length; i++) {
+                  const ts = s.timestamps[i];
+                  if (hasXWindow && (ts < xMin || ts > xMax)) continue;
+                  const candidate = s.p95_ms[i] ?? s.max_ms[i] ?? s.p50_ms[i] ?? 0;
+                  if (candidate > 0) {
+                    matched++;
+                    if (candidate > top) top = candidate;
+                  }
                 }
               }
               if (matched === 0) {
@@ -484,7 +525,14 @@ export const SmokeChartPanel = forwardRef<
         plotRef.current = plot;
         const initBounds = getCanonicalBounds();
         if (initBounds) {
-          plot.setScale?.("x", { min: initBounds[0], max: initBounds[1] });
+          const createdPlot = plot;
+          if (typeof createdPlot.batch === "function") {
+            createdPlot.batch(() => {
+              createdPlot.setScale?.("x", { min: initBounds[0], max: initBounds[1] });
+            });
+          } else {
+            createdPlot.setScale?.("x", { min: initBounds[0], max: initBounds[1] });
+          }
         }
       } finally {
         programmaticScaleRef.current = false;
@@ -541,7 +589,7 @@ export const SmokeChartPanel = forwardRef<
       fixedFromSec !== null && fixedToSec !== null
         ? `fixed:${fixedFromSec}:${fixedToSec}`
         : null;
-    const nextRangeKey = fixedKey ?? effectiveWindowSec ?? rangeLabel ?? null;
+    const nextRangeKey = `${fixedKey ?? effectiveWindowSec ?? rangeLabel ?? ""}:${rangeVersion}`;
     const rangeChanged = prevWindowKeyRef.current !== nextRangeKey;
     prevWindowKeyRef.current = nextRangeKey;
 
@@ -549,37 +597,44 @@ export const SmokeChartPanel = forwardRef<
       updateZoomState(false);
     }
 
-    if (plotRef.current && series.timestamps.length > 0) {
+    const plot = plotRef.current;
+    if (plot && series.timestamps.length > 0) {
       const shouldResetScale = rangeChanged || !isZoomedRef.current;
-      programmaticScaleRef.current = true;
-      try {
-        plotRef.current.setData(
+      const targetBounds = shouldResetScale
+        ? getCanonicalBounds()
+        : zoomedXRangeRef.current;
+
+      // IMPORTANT: Use plot.batch() so uPlot executes _commit() synchronously while
+      // programmaticScaleRef is true, and never call plot.redraw() after setScale("x", ...)
+      // because uPlot's redraw() re-queues _setScale("x", staleScaleX.min, staleScaleX.max).
+      runProgrammaticScale(plot, () => {
+        plot.setData(
           [
             series.timestamps,
             series.p50_ms,
           ] as unknown as uPlot.AlignedData,
-          shouldResetScale
+          false
         );
-        if (shouldResetScale) {
-          const bounds = getCanonicalBounds();
-          if (bounds) {
-            plotRef.current.setScale?.("x", {
-              min: bounds[0],
-              max: bounds[1],
-            });
-          }
-        } else if (zoomedXRangeRef.current) {
-          plotRef.current.setScale?.("x", {
-            min: zoomedXRangeRef.current[0],
-            max: zoomedXRangeRef.current[1],
+        if (targetBounds) {
+          plot.setScale?.("x", {
+            min: targetBounds[0],
+            max: targetBounds[1],
           });
+        } else {
+          plot.redraw?.(false, false);
         }
-        plotRef.current.redraw?.();
-      } finally {
-        programmaticScaleRef.current = false;
-      }
+      });
     }
-  }, [series, effectiveWarnMs, effectiveWindowSec, rangeLabel, fixedFromSec, fixedToSec]);
+  }, [
+    series,
+    effectiveWarnMs,
+    effectiveWindowSec,
+    rangeLabel,
+    fixedFromSec,
+    fixedToSec,
+    rangeVersion,
+    runProgrammaticScale,
+  ]);
 
   const zoomWindowLoss = useMemo(() => {
     if (compact || !zoomedXRange) return null;
@@ -729,7 +784,13 @@ export const SmokeChartPanel = forwardRef<
                 effectiveFillHeight ? "flex-1 min-h-[72px]" : ""
               } flex w-full flex-col items-center justify-center rounded border border-dashed border-border bg-canvas/50 px-2 text-center text-xs font-mono text-zinc-400 cursor-zoom-in transition-colors hover:border-emerald-500/40 hover:text-zinc-200`}
             >
-              <span>Waiting for telemetry samples from this probe...</span>
+              <span>
+                {loading
+                  ? "Loading telemetry for selected time range..."
+                  : fixedBounds
+                  ? "No samples in selected time range."
+                  : "Waiting for telemetry samples from this probe..."}
+              </span>
               <span className="mt-1 inline-flex items-center gap-1 text-[10px] text-emerald-400">
                 <Maximize2 className="h-3 w-3" aria-hidden="true" />
                 Click to zoom &amp; inspect MTR
@@ -737,6 +798,7 @@ export const SmokeChartPanel = forwardRef<
             </button>
           ) : (
             <div
+              data-testid="smoke-chart-empty-state"
               style={effectiveFillHeight ? undefined : { height: defaultHeight }}
               className={
                 effectiveFillHeight
@@ -744,7 +806,11 @@ export const SmokeChartPanel = forwardRef<
                   : "flex items-center justify-center rounded border border-dashed border-border bg-canvas/50 text-xs font-mono text-zinc-400"
               }
             >
-              Waiting for telemetry samples from this probe...
+              {loading
+                ? "Loading telemetry for selected time range..."
+                : fixedBounds
+                ? "No samples in selected time range."
+                : "Waiting for telemetry samples from this probe..."}
             </div>
           )
         ) : (
